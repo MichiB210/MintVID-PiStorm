@@ -21,6 +21,15 @@ by Darren "boingball" Banfi**, the modern 68k video player for AmigaOS, and
 includes it in full (MIT licence). MintVID's own README is in
 [`docs/MintVID-README.md`](docs/MintVID-README.md).
 
+> [!IMPORTANT]
+> **Requires the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** Playback only
+> works with it: the unmodified Emu68 kernel has no BerryCore service on CPU1,
+> so nothing will play.
+>
+> **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
+> Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
+> models, other PiStorm boards and newer Emu68 versions are not supported yet.
+
 ## What it plays
 
 | | Format | Decoded by | Output |
@@ -32,7 +41,8 @@ includes it in full (MIT licence). MintVID's own README is in
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
 
 Multichannel E-AC3 (5.1) is refused, because the CPU1 decoder is not fast
-enough for it in real time yet. Tested on a Raspberry Pi 3A+ PiStorm.
+enough for it in real time yet. Tested on PiStorm Classic with a Raspberry Pi 3A+
+and the patched Emu68 1.0.7 kernel.
 
 ## How to use it
 
@@ -48,8 +58,10 @@ as in upstream MintVID.
 
 1. Copy `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the same drawer.
    - Add `MintVID` too if you want the GUI.
-2. Use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the PiStorm's SD card, instead of `Emu68-pistorm`.
-   - This is Emu68 1.0.7 with the BerryCore service on CPU1, which runs the audio decoders.
+2. **Required:** replace the Emu68 kernel on the PiStorm's SD card (`Emu68-pistorm`) with the patched `Emu68-pistorm-BerryCore`.
+   - This is Emu68 1.0.7 for PiStorm Classic / Raspberry Pi 3A+, with the BerryCore service on CPU1.
+   - Without it, nothing plays.
+   - It only exists for this Emu68 version and this hardware.
 
 Ready-made files are under **Releases**.
 
@@ -105,6 +117,8 @@ synchron auf einem Amiga mit PiStorm ab:
 
 - Das Bild entschlüsselt die VideoCore des Raspberry Pi. Es erscheint als Vollbild am HDMI-Ausgang des Pi oder im P96-Fenster.
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
+
+**Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
 Start aus der Shell mit `mrberry film.mkv` oder bequem über MintVID mit
 „PiStorm / VC Hard Fullscreen“. Grundlage ist MintVID von Darren Banfi.

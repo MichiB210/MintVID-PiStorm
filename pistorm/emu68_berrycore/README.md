@@ -1,5 +1,12 @@
 # Emu68 1.0.7 BerryCore kernel
 
+> [!IMPORTANT]
+> MintVID-PiStorm only works with this patched kernel. It is made for the
+> Emu68 1.0.7 PiStorm kernel only, as used on PiStorm Classic with a
+> Raspberry Pi 3A+. The patch writes into fixed file offsets, so it cannot be
+> applied to any other Emu68 version or build. `build_berrycore.py` refuses
+> any other input file.
+
 `berrycore_patch.S` is the complete, commented source of the BerryCore change to Emu68 1.0.7 (PiStorm build, git 305f686). On CPU1, Emu68 normally runs only `serial_writer()` (boot argument `async_log`). BerryCore uses CPU1 for a native AArch64 service instead. That service loads the CPU1 decoder modules (AAC, AC3, E-AC3) and calls them.
 
     python3 build_berrycore.py Emu68-pistorm-BerryCore

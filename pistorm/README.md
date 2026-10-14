@@ -7,6 +7,15 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
 - **AAC, AC3 and E-AC3 audio**, decoded on the second ARM core (CPU1) of the Pi.
   - Output as PCM over the Pi's HDMI audio.
 
+> [!IMPORTANT]
+> **Requires the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** Playback only
+> works with it: the unmodified Emu68 kernel has no BerryCore service on CPU1,
+> so nothing will play.
+>
+> **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
+> Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
+> models, other PiStorm boards and newer Emu68 versions are not supported yet.
+
 This directory holds the complete source of all PiStorm parts of the P32 release. The MintVID GUI changes themselves live in `player/` (see the commit history of this fork).
 
 > Deutsch: siehe [unten](#deutsch).
@@ -54,7 +63,7 @@ Everything ends up in `pistorm/out/P32/`, and each file is compared against `P32
 ## Installation (Amiga side)
 
 1. Copy `MintVID`, `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the MintVID drawer.
-2. Use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the SD card, instead of `Emu68-pistorm`.
+2. **Required:** use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the SD card, instead of `Emu68-pistorm`. It is only available for Emu68 1.0.7 on PiStorm Classic / Raspberry Pi 3A+.
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
 
@@ -87,6 +96,8 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 **Ergebnis der Neubauten:**
 - exakt gleich (bytegleich) zu P32: MintVID, mrberry, berryvp.library und der Emu68-BerryCore-Kern
 - Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Sie sollten vor dem Einsatz auf der Hardware getestet werden.
+
+**Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` geht nichts. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
 **Installation:**
 1. Die sechs Dateien `MintVID`, `mrberry`, `berryvp.library` und die drei `.module`-Dateien in die MintVID-Schublade kopieren.
