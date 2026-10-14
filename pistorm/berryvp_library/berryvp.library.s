@@ -54241,7 +54241,20 @@ v41b_renderer_visibility_ready:
         ; now; the Audio-Master clock is armed later, only after the first real
         ; PCM block has been published (N79 prime-2 startup).
         tst.l   bvp_library_mode
+        beq.s   n80_c_standalone
+        ; N80 (MintVID): the scheduler only shows a frame once the
+        ; Audio-Master clock runs, and only ConfigAudio arms that clock.  A
+        ; stream without HDMI audio (mrberry --no-audio, or --paula where the
+        ; Amiga plays the sound) never calls ConfigAudio, so its first AU was
+        ; deferred forever.  Such streams take the direct decoder -> renderer
+        ; tunnel instead; n66_service_pending_video then paces them with the
+        ; host frame grid (n70_*), as standalone C mode does for MP4 input.
+        tst.l   n73_clock_armed
         bne.w   n73_library_scheduler_enable
+        lea     n80_msg_direct_no_audio,a1
+        jsr     n12_log
+        bra.w   vpv166_c_direct_legacy
+n80_c_standalone:
 
         ; R5: normal C keeps decoder -> scheduler -> renderer.  A successful
         ; compressed IDR seek is already positioned at the target, therefore
@@ -70175,6 +70188,7 @@ n73_pfx_pts_unknown: dc.b "N79 VIDEO PTS_UNKNOWN=",0
 n73_msg_sched_graph_ready: dc.b "N79_SCHED_GRAPH_READY",0
 n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
+n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
         even
 
         section bvp_n9_audio_data,data

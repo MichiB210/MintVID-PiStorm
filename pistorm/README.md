@@ -45,7 +45,7 @@ MintVID (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 | MintVID GUI | `../player/amiga/mrgui*.c` | C (68k) | changed since P35 (starts mrberry as "MintVID player") |
 | mrberry | `mrberry/` | C (68k) | changed since P35 (controls, Amiga sound) |
 | VPberry (VPr8 P48, window player) | `vpberry/` | 68k assembler (vasm) | byte-identical to P35 |
-| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to P32/P35 |
+| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | changed since P35 (N80, see below) |
 | berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | padded to P32 size, codegen differs, hardware-tested * |
 | berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
@@ -75,6 +75,17 @@ Everything ends up in `pistorm/out/P35/`, and each file is compared against `P35
 3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64` (add the line if it is missing).
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
+
+**N80 (berryvp.library): video without HDMI audio.** The library shows
+frames through the VideoCore scheduler, which waits for the Pi's
+Audio-Master clock, and only `ConfigAudio` (HDMI audio, BerryCore kernel)
+starts that clock. With `--no-audio` or `--paula` the first frame therefore
+waited forever. Such streams now use the direct decoder-to-renderer tunnel,
+timed by the library's own frame grid, the same path standalone C mode uses
+for MP4 files. Streams with HDMI audio are unchanged. The trace shows
+`N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when it is taken. CI builds the library
+with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy it to
+`LIBS:`.
 
 ## Playing and controls
 
@@ -149,7 +160,7 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 **Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/P35/`.
 
 **Ergebnis der Neubauten:**
-- exakt gleich (bytegleich) zum Release: VPberry, berryvp.library und der Emu68-BerryCore-Kern
+- exakt gleich (bytegleich) zum Release: VPberry und der Emu68-BerryCore-Kern (berryvp.library hat die Änderung N80, siehe oben)
 - MintVID und mrberry sind seit P35 geändert (Steuerung, Ton über den Amiga)
 - Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
