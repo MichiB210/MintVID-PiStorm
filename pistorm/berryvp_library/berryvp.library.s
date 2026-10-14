@@ -1385,7 +1385,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79I DIRECT-LEGACY RENDERER TEST (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -53344,7 +53344,7 @@ v41b_renderer_visibility_ready:
         ; now; the Audio-Master clock is armed later, only after the first real
         ; PCM block has been published (N79 prime-2 startup).
         tst.l   bvp_library_mode
-        bne.w   n73_library_scheduler_enable
+        bne.w   vpv166_c_direct_legacy  ; N79I: library uses direct legacy renderer
 
         ; R5: normal C keeps decoder -> scheduler -> renderer.  A successful
         ; compressed IDR seek is already positioned at the target, therefore
