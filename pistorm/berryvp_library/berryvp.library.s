@@ -49728,7 +49728,7 @@ v12a_req_done:
 ; output_port_handle/output_component_handle. Host output geometry is small.
 ; ====================================================================
 ; N79P full-path router.  Library C mode with a 128-aligned decoder width
-; uses the original direct N79 graph (decoder -> scheduler -> renderer);
+; (N79Q: aligned width % 64 == 0) uses the original direct N79 graph (decoder -> scheduler -> renderer);
 ; every other case uses the N79K ISP graph below.
 ; ====================================================================
 n79p_setup_graph_router:
@@ -49736,8 +49736,10 @@ n79p_setup_graph_router:
         beq.s   n79p_router_k
         cmpi.l  #3,v41_display_style
         bne.s   n79p_router_k
-        move.l  v12a_dec_crop_w,d0
-        andi.l  #127,d0
+        ; N79Q aligned64 fix: use the SPS-derived aligned width (valid here,
+        ; unlike the late/zero v12a_dec_crop_w) and a 64-pixel rule.
+        move.l  v6_src_aligned_w,d0
+        andi.l  #63,d0
         bne.s   n79p_router_k
         jmp     n79p_direct_setup_graph
 n79p_router_k:
