@@ -1385,7 +1385,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79N K-BASE ISP ASPECT DISPLAY (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -47999,6 +47999,7 @@ n79j_out_par_den:          ds.l 1
 n79j_out_colorspace:       ds.l 1
 n79j_save_dec_handle:      ds.l 1
 n79j_save_dec_output:      ds.l 1
+n79n_isp_aspect_active:    ds.l 1  ; N79N: ISP path -> aspect-fit display region
 v12a_dec_buf_num:          ds.l 1
 v12a_dec_buf_size:         ds.l 1
 v12a_dec_w:                ds.l 1
@@ -49429,19 +49430,58 @@ hdmi_v40o_param_clear:
         jsr     store_le32
         lea     56(a2),a0
         moveq   #1,d0                   ; renderer owns full HDMI display region
+        tst.l   n79n_isp_aspect_active
+        beq.s   n79n_fullscreen_ready
+        moveq   #0,d0                   ; N79N: ISP path uses an explicit rect
+n79n_fullscreen_ready:
         jsr     store_le32
-        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen.
+        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen,
+        ; or (N79N, ISP path) the largest aspect-correct rect, centred.
+        move.l  hdmi_v40o_wb_width,d4
+        move.l  hdmi_v40o_wb_height,d5
+        moveq   #0,d6
+        moveq   #0,d7
+        tst.l   n79n_isp_aspect_active
+        beq.s   n79n_rect_ready
+        move.l  v12a_dec_crop_w,d1
+        move.l  v12a_dec_crop_h,d2
+        tst.l   d1
+        beq.s   n79n_rect_ready
+        tst.l   d2
+        beq.s   n79n_rect_ready
+        move.l  hdmi_v40o_wb_height,d0  ; width needed at full screen height
+        mulu.w  d1,d0
+        divu.w  d2,d0
+        andi.l  #$0000FFFF,d0
+        cmp.l   hdmi_v40o_wb_width,d0
+        bhi.s   n79n_fit_width
+        move.l  d0,d4                   ; pillarbox
+        move.l  hdmi_v40o_wb_width,d6
+        sub.l   d4,d6
+        lsr.l   #1,d6
+        bra.s   n79n_rect_ready
+n79n_fit_width:
+        move.l  hdmi_v40o_wb_width,d4   ; letterbox
+        move.l  hdmi_v40o_wb_width,d0
+        mulu.w  d2,d0
+        divu.w  d1,d0
+        andi.l  #$0000FFFF,d0
+        move.l  d0,d5
+        move.l  hdmi_v40o_wb_height,d7
+        sub.l   d5,d7
+        lsr.l   #1,d7
+n79n_rect_ready:
         lea     64(a2),a0
-        moveq   #0,d0
+        move.l  d6,d0
         jsr     store_le32
         lea     68(a2),a0
-        moveq   #0,d0
+        move.l  d7,d0
         jsr     store_le32
         lea     72(a2),a0
-        move.l  hdmi_v40o_wb_width,d0
+        move.l  d4,d0
         jsr     store_le32
         lea     76(a2),a0
-        move.l  hdmi_v40o_wb_height,d0
+        move.l  d5,d0
         jsr     store_le32
         lea     112(a2),a0
         move.l  #HDMI_V14_LAYER,d0
@@ -50090,11 +50130,6 @@ v12b_dec_size_nonzero:
         beq.s   n79j_create_normal
         cmpi.l  #3,v41_display_style
         bne.s   n79j_create_normal
-        ; N79L: a 128-aligned width needs no padding -> keep the direct
-        ; decoder -> scheduler -> renderer path; only pad through the ISP.
-        move.l  v12a_dec_crop_w,d0
-        andi.l  #127,d0
-        beq.s   n79j_create_normal      ; N79M: no mid-setup log lines
         clr.l   v41_display_style
         bsr     v12a_create_isp
         move.l  #3,v41_display_style
@@ -50506,7 +50541,8 @@ n79j_rin_num_ok:
         bne.w   n79j_fail
         cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
         bne.w   n79j_fail
-        ; Renderer visible, display region as for the direct C path.
+        ; Renderer visible; N79N: aspect-correct display region for ISP path.
+        move.l  #1,n79n_isp_aspect_active
         clr.l   v41b_renderer_reveal_pending
         move.l  #1,v41b_renderer_visible
         bsr     hdmi_v40o_set_displayregion
