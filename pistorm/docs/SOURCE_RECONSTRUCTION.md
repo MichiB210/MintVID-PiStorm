@@ -34,6 +34,14 @@ The test packages N79AA … N79P96G were only intermediate steps on the way to N
 
 The historical P32 binary was assembled from a byte image, so its relocation tables are sorted by address. vasm writes the relocations of real code in operand order. `tools/hunk_sort_relocs.py` restores the historical order and makes the file identical. The loaded program is the same either way.
 
+## VPberry (P35)
+- **Source:** `VPr8_P48_AC3` from the MintVID PiStorm35 package, real assembler of the same line as berryvp.library.
+- **Check:** the version with branch sizes normalised to `.l` assembles with vasm (`-m68030`) byte-identical to the released VPberry.
+
+## MintVID GUI (P35)
+- **Source:** `mrgui.c` and `mr_play_options.h` from the PiStorm35 package (new display mode "PiStorm / VC Hard Fenster").
+- **Check:** builds byte-identical to the P35 `MintVID`.
+
 ## CPU1 modules
 - **berry_ac3** (liba52) and **berry_faad03** (FAAD2): the sources were complete.
 - **berry_eac3**: shipped with the prebuilt object `core_eac302b.o` and no build recipe.
