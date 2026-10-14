@@ -212,6 +212,11 @@ int mr_build_player_arguments(char *output, size_t output_size,
                               const char *user_agent, const char *referer);
 int mr_build_mrberry_arguments(char *output, size_t output_size,
                                const char *path);
+/* mrberry fullscreen launch, including the GUI's No audio choice.
+ * Keep the filename-only helper above for VPberry's separate CLI grammar. */
+int mr_build_mrberry_play_arguments(char *output, size_t output_size,
+                                    const mr_play_options *options,
+                                    const char *path);
 int mr_build_iptv_arguments(char *output, size_t output_size,
                             const mr_play_options *options);
 void mr_play_options_summary(const mr_play_options *options, char *output,

@@ -78,6 +78,17 @@ The modules must have the exact sizes that berryvp.library P32 expects. The buil
 
 ## Playing and controls
 
+The fullscreen mrberry launch now forwards the GUI's **No audio** checkbox
+as `--no-audio` in both ReAction and GadTools. Video-only playback bypasses
+BerryCore audio setup; previously the checkbox was ignored by these fork
+launchers. This does not establish compatibility with every Pi/Emu68 version.
+
+Startup output from GUI-launched mrberry is saved to
+`T:MintVID-mrberry.log`, overwritten on the next launch. Both controllers
+also display the player's saved terminal status after a quick exit. If no
+status is published, the controller points to the log after an early exit
+or roughly 60 seconds, without terminating the process.
+
 In MintVID, choose the display **PiStorm / VC Hard Fullscreen** and press
 Play. MintVID's **Pause** and **Stop** buttons work, like with the normal
 player.

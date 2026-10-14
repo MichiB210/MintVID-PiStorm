@@ -809,6 +809,9 @@ static struct timerequest *status_timer_io;
 static int status_timer_device_open;
 static int status_timer_running;
 static ULONG player_status_seq;
+static int player_status_live;
+static int external_launch_pending;
+static unsigned external_launch_ticks;
 
 static int status_timer_open(void)
 {
@@ -855,50 +858,32 @@ static void status_timer_close(void)
     }
 }
 
-/* PiStorm06: terminal player state must survive the child task disappearing.
- * mrplay already writes this atomic T: snapshot; mrberry now does the same. */
-static void clear_player_status_snapshot(void)
-{
-    DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_FILE);
-    DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_TMP);
-}
-
-static int read_player_status_snapshot(mr_player_status *out)
-{
-    mr_player_status_snapshot snapshot;
-    BPTR file = Open((CONST_STRPTR)MR_PLAYER_STATUS_FILE, MODE_OLDFILE);
-    LONG got;
-
-    if (!file)
-        return 0;
-    got = Read(file, &snapshot, (LONG)sizeof snapshot);
-    Close(file);
-    if (got != (LONG)sizeof snapshot ||
-        !mr_player_status_snapshot_valid(&snapshot))
-        return 0;
-    *out = snapshot.status;
-    out->codec[sizeof(out->codec) - 1] = 0;
-    out->text[sizeof(out->text) - 1] = 0;
-    return 1;
-}
-
 static void poll_player_status(Object *info, struct Window *window)
 {
     mr_player_status ps;
     char line[300];
     int live = mr_player_status_read(&ps);
 
-    if (!live && !read_player_status_snapshot(&ps)) {
+    if (!live && !mr_player_status_read_final(&ps)) {
         player_status_seq = 0;
+        if (external_launch_pending) {
+            ++external_launch_ticks;
+            if ((external_launch_ticks >= 8 && !find_player()) ||
+                external_launch_ticks >= 240) {
+                set_info(info, window, "mrberry gave no status; see "
+                         MR_EXTERNAL_PLAYER_LOG);
+                external_launch_pending = 0;
+            }
+        }
         return;
     }
-    if (ps.seq == player_status_seq) return;
+    external_launch_pending = 0;
+    /* Port and file have independent sequence counters. */
+    if (ps.seq == player_status_seq && live == player_status_live) return;
     player_status_seq = ps.seq;
+    player_status_live = live;
 
-    if (ps.state == MR_PLAYER_STATE_OPENING)
-        snprintf(line, sizeof(line), "%s",
-                 ps.text[0] ? ps.text : "Opening player...");
-    else if (ps.state == MR_PLAYER_STATE_PLAYING)
+    if (ps.state == MR_PLAYER_STATE_PLAYING)
         snprintf(line, sizeof(line), "Playing%s%s%s%s", ps.codec[0] ? " (" : "",
                  ps.codec, ps.codec[0] ? "): " : "", ps.text);
     else if (ps.state == MR_PLAYER_STATE_UNSUPPORTED)
@@ -908,6 +893,9 @@ static void poll_player_status(Object *info, struct Window *window)
     else if (ps.state == MR_PLAYER_STATE_ENDED)
         snprintf(line, sizeof(line), "Playback ended%s%s",
                  ps.text[0] ? ": " : "", ps.text);
+    else if (ps.state == MR_PLAYER_STATE_OPENING)
+        snprintf(line, sizeof(line), "%s",
+                 ps.text[0] ? ps.text : "Opening player...");
     else
         return;
     set_info(info, window, line);
@@ -966,6 +954,7 @@ static void start_player_path(const char *full_file, Object *mode,
     char args[1600];
     mr_play_options options;
     BPTR seglist;
+    BPTR log = 0;
     struct Process *process;
 
     if (!full_file || !*full_file) {
@@ -985,13 +974,12 @@ static void start_player_path(const char *full_file, Object *mode,
     path[sizeof(path) - 1] = 0;
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+    mr_player_status_clear_snapshot();
+    player_status_seq = 0;
+    external_launch_pending = 0;
 
     if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
-        /* PiStorm06: discard the previous child's terminal snapshot before
-         * launching a new one and reset the GUI sequence latch. */
-        clear_player_status_snapshot();
-        player_status_seq = 0;
-        if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
+        if (!mr_build_mrberry_play_arguments(args, sizeof(args), &options, path)) {
             set_info(info, window, "Could not build PiStorm player arguments.");
             return;
         }
@@ -1003,15 +991,25 @@ static void start_player_path(const char *full_file, Object *mode,
                      "Could not load mrberry (keep it beside MintVID).");
             return;
         }
+        log = Open((CONST_STRPTR)MR_EXTERNAL_PLAYER_LOG, MODE_NEWFILE);
+        if (!log) {
+            UnLoadSeg(seglist);
+            set_info(info, window, "Could not open " MR_EXTERNAL_PLAYER_LOG);
+            return;
+        }
         process = CreateNewProcTags(
             NP_Seglist, seglist, NP_FreeSeglist, TRUE,
             NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
+            NP_Output, (ULONG)log, NP_CloseOutput, TRUE,
             NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
             NP_Name, (ULONG)"MintVID player", TAG_END);
         if (!process) {
+            Close(log);
             UnLoadSeg(seglist);
             set_info(info, window, "Could not create the mrberry process.");
         } else {
+            external_launch_pending = 1;
+            external_launch_ticks = 0;
             set_info(info, window, "Starting PiStorm VideoCore playback...");
         }
         return;
@@ -1020,8 +1018,6 @@ static void start_player_path(const char *full_file, Object *mode,
     /* PiStorm window player: keep fullscreen mrberry/berryvp.library untouched.
      * VPr8 expects <movie> W:25; it does not accept mrplay's --flags. */
     if (options.display == MR_DISPLAY_PISTORM_HARD_WINDOW) {
-        clear_player_status_snapshot();
-        player_status_seq = 0;
         if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
             set_info(info, window, "Could not build VPberry arguments.");
             return;
