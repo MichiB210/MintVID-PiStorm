@@ -343,6 +343,8 @@ static struct Task *find_player(void)
     task = FindTask((STRPTR)"MintVID player");
     if (!task)
         task = FindTask((STRPTR)"MintVID Berry player");
+    if (!task)
+        task = FindTask((STRPTR)"MintVID VPberry player");
     Permit();
     return task;
 }
@@ -372,9 +374,13 @@ static void stop_player_and_wait(void)
     if (task)
         Signal(task, SIGBREAKF_CTRL_C);
     else {
-        task = FindTask((STRPTR)"MintVID player");
+        task = FindTask((STRPTR)"MintVID VPberry player");
         if (task)
-            Signal(task, SIGBREAKF_CTRL_F);
+            Signal(task, SIGBREAKF_CTRL_C);
+        else {
+            task = FindTask((STRPTR)"MintVID player");
+            if (task) Signal(task, SIGBREAKF_CTRL_F);
+        }
     }
     Permit();
     for (guard = 0; guard < 250 && find_player(); guard++)
@@ -443,7 +449,8 @@ static void read_play_options(Object *mode, Object *c2p, Object *h264,
     /* PiStorm hard-fullscreen is local-playback-only for this first
      * integration. Do not persist it into the shared settings consumed by
      * the untouched IPTV/YouTube/mrplay paths. */
-    if (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+    if (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+        options->display != MR_DISPLAY_PISTORM_HARD_WINDOW)
         mr_saved_options_save(options);
 }
 
@@ -481,10 +488,12 @@ static void use_classic_browser_display(mr_play_options *options)
 {
     mr_play_options saved;
     if (!options ||
-        options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+        (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+         options->display != MR_DISPLAY_PISTORM_HARD_WINDOW))
         return;
     if (mr_saved_options_load(&saved) &&
         saved.display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+        saved.display != MR_DISPLAY_PISTORM_HARD_WINDOW &&
         saved.display <= MR_DISPLAY_HAM8_DITHER)
         options->display = saved.display;
     else
@@ -1004,6 +1013,45 @@ static void start_player_path(const char *full_file, Object *mode,
             set_info(info, window, "Could not create the mrberry process.");
         } else {
             set_info(info, window, "Starting PiStorm VideoCore playback...");
+        }
+        return;
+    }
+
+    /* PiStorm window player: keep fullscreen mrberry/berryvp.library untouched.
+     * VPr8 expects <movie> W:25; it does not accept mrplay's --flags. */
+    if (options.display == MR_DISPLAY_PISTORM_HARD_WINDOW) {
+        clear_player_status_snapshot();
+        player_status_seq = 0;
+        if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
+            set_info(info, window, "Could not build VPberry arguments.");
+            return;
+        }
+        /* Strip the newline before appending the VPr8 window selector. */
+        {
+            size_t len = strlen(args);
+            if (len && args[len - 1] == '\n') args[len - 1] = 0;
+            if (strlen(args) + sizeof(" W:25\n") > sizeof(args)) {
+                set_info(info, window, "VPberry arguments too long.");
+                return;
+            }
+            strcat(args, " W:25\n");
+        }
+        seglist = LoadSeg((CONST_STRPTR)"PROGDIR:VPberry");
+        if (!seglist) seglist = LoadSeg((CONST_STRPTR)"VPberry");
+        if (!seglist) {
+            set_info(info, window, "Could not load VPberry (keep it beside MintVID).");
+            return;
+        }
+        process = CreateNewProcTags(
+            NP_Seglist, seglist, NP_FreeSeglist, TRUE,
+            NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
+            NP_Cli, TRUE, NP_CommandName, (ULONG)"VPberry",
+            NP_Name, (ULONG)"MintVID VPberry player", TAG_END);
+        if (!process) {
+            UnLoadSeg(seglist);
+            set_info(info, window, "Could not create VPberry process.");
+        } else {
+            set_info(info, window, "Starting VPberry P96 window playback...");
         }
         return;
     }
@@ -1597,7 +1645,9 @@ int main(void)
     /* Dedicated PiStorm/VideoCore output. All original display entries
      * continue to use mrplay unchanged. */
     if (!add_mode_node(&modes, "PiStorm / VC Hard Fullscreen",
-                       MR_DISPLAY_PISTORM_HARD_FULLSCREEN))
+                       MR_DISPLAY_PISTORM_HARD_FULLSCREEN) ||
+        !add_mode_node(&modes, "PiStorm / VC Hard Fenster",
+                       MR_DISPLAY_PISTORM_HARD_WINDOW))
         goto cleanup;
     /* Audio only, listed last so it never becomes the hardware default.
      * It sits here rather than under Video so it is easy to find; Video,

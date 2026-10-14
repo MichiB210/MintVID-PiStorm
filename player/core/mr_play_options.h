@@ -71,7 +71,8 @@ typedef enum {
     /* PiStorm/Emu68 VideoCore backend. Appended so every existing saved
      * MintVID display value keeps its numeric meaning. The classic mrplay
      * executable never receives this selector. */
-    MR_DISPLAY_PISTORM_HARD_FULLSCREEN
+    MR_DISPLAY_PISTORM_HARD_FULLSCREEN,
+    MR_DISPLAY_PISTORM_HARD_WINDOW
 } mr_display_mode;
 
 typedef enum {
