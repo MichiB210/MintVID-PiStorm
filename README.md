@@ -13,8 +13,8 @@
 The video is decoded by the Raspberry Pi's VideoCore hardware decoder. The
 audio is decoded on the Pi's second ARM core. The Amiga only reads the file
 and feeds both. This is how a PiStorm Amiga plays 1080p H.264 in real time
-with synchronised sound, either as a hard full-screen picture on the Pi's HDMI
-output or in a P96 window on the Workbench.
+with synchronised sound, as a hard full-screen picture on the Pi's HDMI
+output (a P96 window on the Workbench is planned).
 
 This project is built on **[MintVID](https://github.com/boingball/MintVID)
 by Darren "boingball" Banfi**, the modern 68k video player for AmigaOS, and
@@ -34,7 +34,7 @@ includes it in full (MIT licence). MintVID's own README is in
 
 | | Format | Decoded by | Output |
 |---|---|---|---|
-| Video | **H.264 / AVC up to 1920x1080** | Raspberry Pi VideoCore (MMAL) | HDMI hard full screen ("PiStorm / VC Hard Fullscreen") or P96 window, real time, A/V sync |
+| Video | **H.264 / AVC up to 1920x1080** | Raspberry Pi VideoCore (MMAL) | HDMI hard full screen ("PiStorm / VC Hard Fullscreen"), real time, A/V sync; P96 window planned |
 | Audio | **AAC-LC** | FAAD2 on CPU1 of the Pi | stereo PCM over the Pi's HDMI |
 | Audio | **AC3 (Dolby Digital)**, up to 5.1 | liba52 on CPU1 | stereo downmix over HDMI |
 | Audio | **E-AC3 (Dolby Digital Plus)**, stereo | FFmpeg on CPU1 | stereo PCM over HDMI |
@@ -70,7 +70,7 @@ Ready-made files are under **Releases**.
 ```
 MintVID GUI (optional) ──starts──> mrberry ──uses──> berryvp.library
                                   (reads MKV/MP4/TS)     │
-                                                         ├─ H.264 ──> VideoCore ──> HDMI / P96 window
+                                                         ├─ H.264 ──> VideoCore ──> HDMI
                                                          └─ audio ──> BerryCore mailbox
                                                                          │
                                          Emu68 BerryCore kernel, CPU1: berry_faad03 / berry_ac3 / berry_eac3.module
@@ -115,7 +115,7 @@ Details are in [`pistorm/LICENSES.md`](pistorm/LICENSES.md) and
 **Deutsch:** MintVID-PiStorm spielt H.264-Videos bis 1080p in Echtzeit und
 synchron auf einem Amiga mit PiStorm ab:
 
-- Das Bild entschlüsselt die VideoCore des Raspberry Pi. Es erscheint als Vollbild am HDMI-Ausgang des Pi oder im P96-Fenster.
+- Das Bild entschlüsselt die VideoCore des Raspberry Pi. Es erscheint als Vollbild am HDMI-Ausgang des Pi (P96-Fenster in Planung).
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
 
 **Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.

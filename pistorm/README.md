@@ -3,7 +3,7 @@
 Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry Pi 3A+ / BCM2837):
 
 - **H.264 up to 1080p**, decoded by the VideoCore of the Raspberry Pi (MMAL/VCHIQ).
-  - Output either as a hard full-screen picture on the Pi's HDMI output, or in a P96 window.
+  - Output as a hard full-screen picture on the Pi's HDMI output (P96 window planned).
 - **AAC, AC3 and E-AC3 audio**, decoded on the second ARM core (CPU1) of the Pi.
   - Output as PCM over the Pi's HDMI audio.
 
@@ -87,7 +87,7 @@ See [`LICENSES.md`](LICENSES.md). In short:
 Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 
 - H.264 bis 1080p über die VideoCore des Raspberry Pi
-  - Bild als Vollbild am HDMI-Ausgang des Pi oder im P96-Fenster
+  - Bild als Vollbild am HDMI-Ausgang des Pi (P96-Fenster in Planung)
 - Ton in AAC, AC3 und E-AC3 auf dem zweiten ARM-Kern (CPU1)
   - Ausgabe über HDMI-Audio
 
