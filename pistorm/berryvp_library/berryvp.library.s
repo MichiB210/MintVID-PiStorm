@@ -50172,7 +50172,7 @@ v12a_in_num_ok:
         bne.w   v12a_setup_fail
         move.l  port_last_handle,v12a_isp_output
         ; N79J: library C mode -> ISP OUTPUT 0 = I420 with the width rounded
-        ; up to 128 and the height to 16; crop = decoder visible size.
+        ; up to 128 and the height to 16; crop = full widened width (N79K), decoder height.
         tst.l   bvp_library_mode
         beq.w   n79j_out_bgr24
         cmpi.l  #3,v41_display_style
@@ -50193,7 +50193,7 @@ v12a_in_num_ok:
         move.l  d0,port_video_height
         clr.l   port_crop_x
         clr.l   port_crop_y
-        move.l  v12a_dec_crop_w,port_crop_width
+        move.l  port_video_width,port_crop_width ; N79K: full 128-aligned width visible
         move.l  v12a_dec_crop_h,port_crop_height
         move.l  v12a_dec_fps_num,port_fps_num
         move.l  v12a_dec_fps_den,port_fps_den
