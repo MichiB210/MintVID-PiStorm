@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds all PiStorm/BerryCore runtime files of MintVID P32 into pistorm/out/P32
-# and compares them with the released P32 binaries (pistorm/P32_SHA256SUMS).
+# Builds all PiStorm/BerryCore runtime files of MintVID P35 into pistorm/out/P35
+# and compares them with the released P35 binaries (pistorm/P35_SHA256SUMS).
 #
 # Tools (in PATH):
 #   m68k-amigaos-gcc (bebbo, 16.2)      MintVID, mrberry
@@ -10,7 +10,7 @@
 #   python3, tar, patch, make
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT="$HERE/out"; DIST="$OUT/P32"
+OUT="$HERE/out"; DIST="$OUT/P35"
 rm -rf "$OUT"; mkdir -p "$DIST"
 
 echo "== MintVID (GUI)"
@@ -21,6 +21,10 @@ mv "$HERE/../player/MintVID" "$DIST/MintVID"
 echo "== mrberry"
 sh "$HERE/mrberry/build.sh" "$OUT/mrberry" >/dev/null 2>&1
 cp "$OUT/mrberry/mrberry" "$DIST/"
+
+echo "== VPberry"
+sh "$HERE/vpberry/build.sh" "$OUT/vpberry" >/dev/null
+cp "$OUT/vpberry/VPberry" "$DIST/"
 
 echo "== berryvp.library"
 sh "$HERE/berryvp_library/build.sh" "$OUT/library" >/dev/null
@@ -48,5 +52,5 @@ while read -r sum name; do
   [ -f "$name" ] || { echo "  MISSING     $name"; continue; }
   now=$(sha256sum "$name" | cut -d' ' -f1)
   if [ "$now" = "$sum" ]; then echo "  IDENTICAL   $name"
-  else echo "  REBUILT     $name ($(wc -c < "$name") bytes, compiler differs from P32)"; fi
-done < "$HERE/P32_SHA256SUMS"
+  else echo "  REBUILT     $name ($(wc -c < "$name") bytes, compiler differs from the release)"; fi
+done < "$HERE/P35_SHA256SUMS"
