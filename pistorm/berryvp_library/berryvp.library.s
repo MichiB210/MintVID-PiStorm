@@ -225,6 +225,7 @@ BVP_OS_Open:
         clr.l   n70_early_lead_max_us
         clr.l   n73_scheduler_graph_ready
         clr.l   n73_clock_armed
+        clr.l   n80_last_defer
         clr.l   n73_first_pcm_published
         clr.l   n73_prime_flushes
         clr.l   n73_clock_arm_attempts
@@ -68745,7 +68746,7 @@ n66_vsvc_have:
         tst.l   n73_scheduler_graph_ready
         beq.s   n73_vsvc_host_pacer
         tst.l   n73_clock_armed
-        beq.w   n66_vsvc_defer
+        beq.w   n80_defer_clock
         cmpi.l  #1,n79_first_video_trace_state
         bne.s   n79_no_v08
         lea     n79_v08,a1
@@ -68765,7 +68766,7 @@ n73_vsvc_host_pacer:
         ; decode lead while retaining the same absolute 23.976-fps deadline grid.
         jsr     n70_video_due_with_lead
         tst.l   d0
-        beq.w   n66_vsvc_defer
+        beq.w   n80_defer_pacer
 
         ; Advance the established absolute timeline without waiting away the
         ; deliberate N79 lead. Late arrivals still use the proven pacer path.
@@ -68788,10 +68789,10 @@ n66_vsvc_due:
         ; Do not introduce a new wait merely because all four decoder inputs are
         ; currently VideoCore-owned. Defer to a later API service opportunity.
         tst.l   input_bulk_pending
-        bne.w   n66_vsvc_defer
+        bne.w   n80_defer_bulk
         move.l  input_in_use_count,d0
         cmpi.l  #INPUT_POOL_COUNT,d0
-        bcc.w   n66_vsvc_defer
+        bcc.w   n80_defer_pool
 
         lea     n66_video_buffer,a0
         move.l  a0,bvp_pending_ptr
@@ -68833,7 +68834,7 @@ n66_vsvc_submit_max_ok:
         ; block, yield this Video turn once.  N69 immediately calls Audio first
         ; on the next dispatcher pass.  No RX/TX overlap is introduced.
         tst.l   n65_audio_pending
-        bne.w   n66_vsvc_defer
+        bne.w   n80_defer_audio
 
 n66_vsvc_feed_retry:
         cmpi.l  #1,n79_first_video_trace_state
@@ -68902,6 +68903,56 @@ n66_vsvc_bulk_max_ok:
         moveq   #0,d0
         bra.s   n66_vsvc_done
 
+; N80 diagnostics: say WHY the first AU is held back (logged on change).
+n80_defer_clock:
+        moveq   #1,d0
+        bra.s   n80_defer_note
+n80_defer_pacer:
+        moveq   #2,d0
+        bra.s   n80_defer_note
+n80_defer_bulk:
+        moveq   #3,d0
+        bra.s   n80_defer_note
+n80_defer_pool:
+        moveq   #4,d0
+        bra.s   n80_defer_note
+n80_defer_audio:
+        moveq   #5,d0
+n80_defer_note:
+        cmpi.l  #1,n79_first_video_trace_state
+        bne.s   n66_vsvc_defer
+        cmp.l   n80_last_defer,d0
+        beq.s   n66_vsvc_defer
+        move.l  d0,n80_last_defer
+        lea     n80_pfx_reason,a1
+        jsr     n15_log_hex32
+        move.l  n73_scheduler_graph_ready,d0
+        lea     n80_pfx_graph,a1
+        jsr     n15_log_hex32
+        move.l  n73_clock_armed,d0
+        lea     n80_pfx_clock,a1
+        jsr     n15_log_hex32
+        move.l  input_bulk_pending,d0
+        lea     n80_pfx_bulk,a1
+        jsr     n15_log_hex32
+        move.l  input_in_use_count,d0
+        lea     n80_pfx_inuse,a1
+        jsr     n15_log_hex32
+        move.l  v32r_fastforward,d0
+        lea     n80_pfx_ff,a1
+        jsr     n15_log_hex32
+        move.l  v41_display_style,d0
+        lea     n80_pfx_style,a1
+        jsr     n15_log_hex32
+        move.l  v41e_hr_started,d0
+        lea     n80_pfx_hrs,a1
+        jsr     n15_log_hex32
+        move.l  v41e_hr_target,d0
+        lea     n80_pfx_hrt,a1
+        jsr     n15_log_hex32
+        jsr     v41e_hr_clock_poll
+        lea     n80_pfx_hrn,a1
+        jsr     n15_log_hex32
 n66_vsvc_defer:
         addq.l  #1,n66_video_service_defers
         moveq   #0,d0
@@ -70189,6 +70240,16 @@ n73_msg_sched_graph_ready: dc.b "N79_SCHED_GRAPH_READY",0
 n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
+n80_pfx_reason: dc.b "N80 DEFER REASON (1=CLOCK 2=PACER 3=BULK 4=POOL 5=AUDIO)=",0
+n80_pfx_graph:  dc.b "N80 STATE SCHED_GRAPH=",0
+n80_pfx_clock:  dc.b "N80 STATE CLOCK_ARMED=",0
+n80_pfx_bulk:   dc.b "N80 STATE INPUT_BULK_PENDING=",0
+n80_pfx_inuse:  dc.b "N80 STATE INPUT_IN_USE=",0
+n80_pfx_ff:     dc.b "N80 STATE FASTFORWARD=",0
+n80_pfx_style:  dc.b "N80 STATE STYLE=",0
+n80_pfx_hrs:    dc.b "N80 STATE HR_STARTED=",0
+n80_pfx_hrt:    dc.b "N80 STATE HR_TARGET=",0
+n80_pfx_hrn:    dc.b "N80 STATE HR_NOW=",0
         even
 
         section bvp_n9_audio_data,data
@@ -70400,6 +70461,7 @@ n70_late_due_count:          ds.l 1
 n70_early_lead_max_us:       ds.l 1
 ; N79 exact VPr8 scheduler startup state (library mode only).
 n73_scheduler_graph_ready:   ds.l 1
+n80_last_defer:              ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
