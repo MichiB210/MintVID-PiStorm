@@ -73,7 +73,7 @@ The PiStorm parts were developed by Michael with AI assistance (ChatGPT) between
 
 ## Licences
 
-See [`LICENSES.md`](LICENSES.md). In short:
+See [`LICENSES.md`](LICENSES.md) and [`LICENSE`](LICENSE) (MIT, © Michael / MichiB210). In short:
 
 - MintVID and the PiStorm 68k parts: MIT
 - berry_ac3.module (liba52) and berry_faad03.module (FAAD2): GPL-2.0-or-later
