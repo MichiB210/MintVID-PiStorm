@@ -100,6 +100,14 @@ binaries. Tools needed:
 
 ## Credits and licences
 
+This project would not exist without:
+
+- **[MintVID](https://github.com/boingball/MintVID)** by Darren "boingball" Banfi: the player this project is built on.
+- **[Emu68](https://github.com/michalsc/Emu68)** by Michal Schulz ([michalsc](https://github.com/michalsc)): the 68k JIT emulator for the Raspberry Pi that the PiStorm runs. BerryCore is a small patch to Emu68 1.0.7 that uses the Pi's second core.
+- **[PiStorm](https://github.com/captain-amygdala/pistorm)** by Claude Schwarz ([captain-amygdala](https://github.com/captain-amygdala)): the accelerator board that puts a Raspberry Pi into the Amiga's CPU socket.
+
+Licences:
+
 - **MintVID** © Darren "boingball" Banfi, MIT: the GUI, and the file readers inside mrberry.
 - **PiStorm parts** (mrberry, berryvp.library, BerryCore) © Michael (MichiB210), MIT.
 - **CPU1 audio modules:**
@@ -121,4 +129,4 @@ synchron auf einem Amiga mit PiStorm ab:
 **Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
 Start aus der Shell mit `mrberry film.mkv` oder bequem über MintVID mit
-„PiStorm / VC Hard Fullscreen“. Grundlage ist MintVID von Darren Banfi.
+„PiStorm / VC Hard Fullscreen“. Grundlage ist MintVID von Darren Banfi. Der PiStorm läuft mit Emu68 von Michal Schulz (michalsc). Die PiStorm-Hardware stammt von Claude Schwarz.
