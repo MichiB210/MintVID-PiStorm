@@ -38,12 +38,12 @@ MintVID (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 | MintVID GUI | `../player/amiga/mrgui*.c` | C (68k) | byte-identical to P32 |
 | mrberry | `mrberry/` | C (68k) | byte-identical to P32 |
 | berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to P32 |
-| berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs * |
-| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | padded to P32 size, codegen differs * |
-| berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs * |
+| berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
+| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | padded to P32 size, codegen differs, hardware-tested * |
+| berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | Emu68 BerryCore kernel | `emu68_berrycore/` | AArch64 assembler patch | byte-identical to P32 |
 
-\* The historical CPU1 modules were built with clang 17. With clang 18 the machine code differs slightly. The rebuilt modules should be tested on the hardware before they replace the P32 binaries.
+\* The historical CPU1 modules were built with clang 17. With clang 18 the machine code differs slightly. The rebuilt modules (clang 18) were tested on the hardware on 2026-10-14 (PiStorm Classic, Pi 3A+): AAC, AC3 and E-AC3 all play the same as the P32 originals.
 
 ## Building
 
@@ -95,7 +95,7 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 
 **Ergebnis der Neubauten:**
 - exakt gleich (bytegleich) zu P32: MintVID, mrberry, berryvp.library und der Emu68-BerryCore-Kern
-- Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Sie sollten vor dem Einsatz auf der Hardware getestet werden.
+- Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
 **Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` geht nichts. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
