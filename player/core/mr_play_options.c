@@ -78,7 +78,8 @@ int mr_display_is_rtg(mr_display_mode display)
 {
     return display == MR_DISPLAY_CGX || display == MR_DISPLAY_P96 ||
            display == MR_DISPLAY_P96_FULLSCREEN ||
-           display == MR_DISPLAY_RTG_HALF;
+           display == MR_DISPLAY_RTG_HALF ||
+           display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN;
 }
 
 int mr_display_has_screen_options(mr_display_mode display)
@@ -201,6 +202,9 @@ static int append_playback_flags(char *out, size_t cap,
                                  const mr_play_options *o, int explicit)
 {
     char number[32];
+    /* This selector belongs to the separate mrberry backend. Never silently
+     * translate it into a classic mrplay display mode. */
+    if (o && o->display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) return 0;
     const char *fast_buffer;
     if (explicit) {
         if (!append_option(out, cap, "--display") ||
@@ -327,6 +331,13 @@ static int append_playback_flags(char *out, size_t cap,
     if (mr_play_options_no_video(o) &&
         !append_option(out, cap, "--no-video")) return 0;
     return 1;
+}
+
+int mr_build_mrberry_arguments(char *out, size_t cap, const char *path)
+{
+    if (!out || !cap || !path || !*path) return 0;
+    out[0] = 0;
+    return append_quoted(out, cap, path) && append_text(out, cap, "\n");
 }
 
 int mr_build_player_arguments(char *out, size_t cap,
@@ -575,6 +586,10 @@ void mr_play_options_summary(const mr_play_options *o, char *out, size_t cap)
                  "Playback: No Video (audio only) / %s / Audio %s / Fast buffer %s%s",
                  hls, audio, fast_buffer_text(o),
                  o->live_resync ? " / Live-resync" : "");
+        return;
+    }
+    if (o->display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
+        snprintf(out, cap, "Playback: PiStorm VideoCore Hard Fullscreen");
         return;
     }
     if (o->throughput)

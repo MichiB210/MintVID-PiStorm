@@ -341,6 +341,8 @@ static struct Task *find_player(void)
 
     Forbid();
     task = FindTask((STRPTR)"MintVID player");
+    if (!task)
+        task = FindTask((STRPTR)"MintVID Berry player");
     Permit();
     return task;
 }
@@ -358,9 +360,23 @@ static void signal_player(ULONG mask)
 
 static void stop_player_and_wait(void)
 {
+    struct Task *task;
     int guard;
 
-    signal_player(SIGBREAKF_CTRL_F);
+    /* mrplay deliberately uses Ctrl-F so AmigaDOS cannot abort it before
+     * cleanup.  The hardware-confirmed AC309J mrberry already handles
+     * Ctrl-C, so give the two backends distinct task names and stop each
+     * with its native signal.  This avoids changing the tested backend. */
+    Forbid();
+    task = FindTask((STRPTR)"MintVID Berry player");
+    if (task)
+        Signal(task, SIGBREAKF_CTRL_C);
+    else {
+        task = FindTask((STRPTR)"MintVID player");
+        if (task)
+            Signal(task, SIGBREAKF_CTRL_F);
+    }
+    Permit();
     for (guard = 0; guard < 250 && find_player(); guard++)
         Delay(1);
 }
@@ -424,7 +440,11 @@ static void read_play_options(Object *mode, Object *c2p, Object *h264,
                                  ? skip_after_ms[row]
                                  : MR_SKIP_TRIGGER_DEFAULT_MS;
     }
-    mr_saved_options_save(options);
+    /* PiStorm hard-fullscreen is local-playback-only for this first
+     * integration. Do not persist it into the shared settings consumed by
+     * the untouched IPTV/YouTube/mrplay paths. */
+    if (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+        mr_saved_options_save(options);
 }
 
 /* "Skip after" only matters under Video: Skip Frames, and Video/VQ/Skip
@@ -452,6 +472,26 @@ static void update_skip_after(Object *mode, Object *h264, Object *video_mode,
                    TAG_DONE);
 }
 
+/* The PiStorm backend is currently local-file playback only.  Browser
+ * windows still launch the untouched mrplay engine, so when the controller
+ * is sitting on the PiStorm selector give IPTV/YouTube the last saved
+ * classic MintVID display instead.  This keeps the new selector from
+ * changing any existing browser behaviour. */
+static void use_classic_browser_display(mr_play_options *options)
+{
+    mr_play_options saved;
+    if (!options ||
+        options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+        return;
+    if (mr_saved_options_load(&saved) &&
+        saved.display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+        saved.display <= MR_DISPLAY_HAM8_DITHER)
+        options->display = saved.display;
+    else
+        options->display = MR_DISPLAY_AGA;
+    options->no_video = options->display == MR_DISPLAY_NONE;
+}
+
 static void publish_play_options(mr_master_options_port *master_options,
                                  Object *mode, Object *c2p, Object *h264,
                                  Object *lace, Object *scale,
@@ -463,6 +503,7 @@ static void publish_play_options(mr_master_options_port *master_options,
 
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+    use_classic_browser_display(&options);
     mr_master_options_publish(master_options, &options);
 }
 
@@ -481,6 +522,7 @@ static void open_iptv_browser(Object *mode, Object *c2p, Object *h264,
 
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+    use_classic_browser_display(&options);
     if (!mr_build_iptv_arguments(arguments, sizeof(arguments), &options)) {
         set_info(info, window, "Could not build IPTV playback options.");
         return;
@@ -525,6 +567,7 @@ static void open_youtube_browser(Object *mode, Object *c2p, Object *h264,
 
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+    use_classic_browser_display(&options);
     if (!mr_build_iptv_arguments(arguments, sizeof(arguments), &options)) {
         set_info(info, window, "Could not build YouTube playback options.");
         return;
@@ -803,16 +846,50 @@ static void status_timer_close(void)
     }
 }
 
+/* PiStorm06: terminal player state must survive the child task disappearing.
+ * mrplay already writes this atomic T: snapshot; mrberry now does the same. */
+static void clear_player_status_snapshot(void)
+{
+    DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_FILE);
+    DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_TMP);
+}
+
+static int read_player_status_snapshot(mr_player_status *out)
+{
+    mr_player_status_snapshot snapshot;
+    BPTR file = Open((CONST_STRPTR)MR_PLAYER_STATUS_FILE, MODE_OLDFILE);
+    LONG got;
+
+    if (!file)
+        return 0;
+    got = Read(file, &snapshot, (LONG)sizeof snapshot);
+    Close(file);
+    if (got != (LONG)sizeof snapshot ||
+        !mr_player_status_snapshot_valid(&snapshot))
+        return 0;
+    *out = snapshot.status;
+    out->codec[sizeof(out->codec) - 1] = 0;
+    out->text[sizeof(out->text) - 1] = 0;
+    return 1;
+}
+
 static void poll_player_status(Object *info, struct Window *window)
 {
     mr_player_status ps;
     char line[300];
+    int live = mr_player_status_read(&ps);
 
-    if (!mr_player_status_read(&ps)) { player_status_seq = 0; return; }
+    if (!live && !read_player_status_snapshot(&ps)) {
+        player_status_seq = 0;
+        return;
+    }
     if (ps.seq == player_status_seq) return;
     player_status_seq = ps.seq;
 
-    if (ps.state == MR_PLAYER_STATE_PLAYING)
+    if (ps.state == MR_PLAYER_STATE_OPENING)
+        snprintf(line, sizeof(line), "%s",
+                 ps.text[0] ? ps.text : "Opening player...");
+    else if (ps.state == MR_PLAYER_STATE_PLAYING)
         snprintf(line, sizeof(line), "Playing%s%s%s%s", ps.codec[0] ? " (" : "",
                  ps.codec, ps.codec[0] ? "): " : "", ps.text);
     else if (ps.state == MR_PLAYER_STATE_UNSUPPORTED)
@@ -820,7 +897,8 @@ static void poll_player_status(Object *info, struct Window *window)
     else if (ps.state == MR_PLAYER_STATE_ERROR)
         snprintf(line, sizeof(line), "Player error: %s", ps.text);
     else if (ps.state == MR_PLAYER_STATE_ENDED)
-        snprintf(line, sizeof(line), "Playback ended");
+        snprintf(line, sizeof(line), "Playback ended%s%s",
+                 ps.text[0] ? ": " : "", ps.text);
     else
         return;
     set_info(info, window, line);
@@ -898,6 +976,38 @@ static void start_player_path(const char *full_file, Object *mode,
     path[sizeof(path) - 1] = 0;
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+
+    if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
+        /* PiStorm06: discard the previous child's terminal snapshot before
+         * launching a new one and reset the GUI sequence latch. */
+        clear_player_status_snapshot();
+        player_status_seq = 0;
+        if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
+            set_info(info, window, "Could not build PiStorm player arguments.");
+            return;
+        }
+        seglist = LoadSeg((CONST_STRPTR)"PROGDIR:mrberry");
+        if (!seglist)
+            seglist = LoadSeg((CONST_STRPTR)"mrberry");
+        if (!seglist) {
+            set_info(info, window,
+                     "Could not load mrberry (keep it beside MintVID).");
+            return;
+        }
+        process = CreateNewProcTags(
+            NP_Seglist, seglist, NP_FreeSeglist, TRUE,
+            NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
+            NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
+            NP_Name, (ULONG)"MintVID Berry player", TAG_END);
+        if (!process) {
+            UnLoadSeg(seglist);
+            set_info(info, window, "Could not create the mrberry process.");
+        } else {
+            set_info(info, window, "Starting PiStorm VideoCore playback...");
+        }
+        return;
+    }
+
     if (!mr_build_player_arguments(args, sizeof(args), &options, path,
                                    NULL, NULL)) {
         set_info(info, window, "Could not build player arguments.");
@@ -1484,6 +1594,11 @@ int main(void)
      * of plain WritePixel and AGA/HAM - default to it rather than
      * WritePixel. */
     if (have_rtg) default_mode = (int)mode_count - 1;
+    /* Dedicated PiStorm/VideoCore output. All original display entries
+     * continue to use mrplay unchanged. */
+    if (!add_mode_node(&modes, "PiStorm / VC Hard Fullscreen",
+                       MR_DISPLAY_PISTORM_HARD_FULLSCREEN))
+        goto cleanup;
     /* Audio only, listed last so it never becomes the hardware default.
      * It sits here rather than under Video so it is easy to find; Video,
      * Skip after and VQ grey out under it (update_skip_after()). */

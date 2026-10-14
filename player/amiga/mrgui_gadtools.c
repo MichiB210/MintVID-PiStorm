@@ -383,7 +383,10 @@ static void read_options(gt_app *app, mr_play_options *options)
                                  ? skip_after_ms[row]
                                  : MR_SKIP_TRIGGER_DEFAULT_MS;
     }
-    mr_saved_options_save(options);
+    /* Keep the shared classic-player settings free of the PiStorm-only
+     * selector until IPTV/YouTube can route through that backend too. */
+    if (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+        mr_saved_options_save(options);
 }
 
 /* "Skip after" only changes anything under Video: Skip Frames - All Frames
@@ -407,10 +410,29 @@ static void update_skip_after(gt_app *app)
                      TAG_DONE);
 }
 
+/* PiStorm VideoCore is local-file-only in this first integration.
+ * IPTV/YouTube remain on the original mrplay backend and therefore inherit
+ * the last saved classic display instead of the PiStorm-only selector. */
+static void use_classic_browser_display(mr_play_options *options)
+{
+    mr_play_options saved;
+    if (!options ||
+        options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+        return;
+    if (mr_saved_options_load(&saved) &&
+        saved.display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+        saved.display <= MR_DISPLAY_HAM8_DITHER)
+        options->display = saved.display;
+    else
+        options->display = MR_DISPLAY_AGA;
+    options->no_video = options->display == MR_DISPLAY_NONE;
+}
+
 static void publish_options(gt_app *app)
 {
     mr_play_options options;
     read_options(app, &options);
+    use_classic_browser_display(&options);
     mr_master_options_publish(app->master, &options);
 }
 
@@ -539,6 +561,8 @@ static struct Task *find_player(void)
     struct Task *task;
     Forbid();
     task = FindTask((STRPTR)"MintVID player");
+    if (!task)
+        task = FindTask((STRPTR)"MintVID Berry player");
     Permit();
     return task;
 }
@@ -555,8 +579,18 @@ static void signal_player(ULONG mask)
 
 static void stop_player(void)
 {
+    struct Task *task;
     unsigned guard;
-    signal_player(SIGBREAKF_CTRL_F);
+    Forbid();
+    task = FindTask((STRPTR)"MintVID Berry player");
+    if (task)
+        Signal(task, SIGBREAKF_CTRL_C);
+    else {
+        task = FindTask((STRPTR)"MintVID player");
+        if (task)
+            Signal(task, SIGBREAKF_CTRL_F);
+    }
+    Permit();
     for (guard = 0; guard < 250 && find_player(); guard++)
         Delay(1);
 }
@@ -606,6 +640,14 @@ static void play_file(gt_app *app)
         return;
     }
     read_options(app, &options);
+    if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
+        if (!mr_build_mrberry_arguments(args, sizeof(args), app->path) ||
+            !launch("mrberry", "MintVID Berry player", args))
+            set_info(app, "Could not start mrberry (keep it beside MintVID-GT).");
+        else
+            set_info(app, "Starting PiStorm VideoCore playback...");
+        return;
+    }
     if (!mr_build_player_arguments(args, sizeof(args), &options, app->path,
                                    NULL, NULL) ||
         !launch("mrplay", "MintVID player", args))
@@ -982,6 +1024,7 @@ static void open_browser(gt_app *app, int youtube)
     const char *program = youtube ? "ytgui-GT" : "iptvgui-GT";
     const char *task = youtube ? "MintVID YouTube GT" : "MintVID IPTV GT";
     read_options(app, &options);
+    use_classic_browser_display(&options);
     publish_options(app);
     if (!youtube)
         start_iptv_launch(app);
@@ -1116,6 +1159,9 @@ static int build_window(gt_app *app)
          * than WritePixel. */
         default_mode = (int)app->mode_count - 1;
     }
+    app->mode_labels[app->mode_count] =
+        (STRPTR)"Display: PiStorm VC Hard FS";
+    app->modes[app->mode_count++] = MR_DISPLAY_PISTORM_HARD_FULLSCREEN;
     /* Audio only, listed last so it never becomes the hardware default.
      * It sits here rather than under Video so it is easy to find; Video,
      * Skip after and VQ grey out under it (update_skip_after()). */

@@ -67,7 +67,11 @@ typedef enum {
      * core/mr_ham.h's mr_ham_encode_ex()). --ham6/--ham plus --ham-dither;
      * appended to keep saved display values. */
     MR_DISPLAY_HAM6_DITHER,
-    MR_DISPLAY_HAM8_DITHER
+    MR_DISPLAY_HAM8_DITHER,
+    /* PiStorm/Emu68 VideoCore backend. Appended so every existing saved
+     * MintVID display value keeps its numeric meaning. The classic mrplay
+     * executable never receives this selector. */
+    MR_DISPLAY_PISTORM_HARD_FULLSCREEN
 } mr_display_mode;
 
 typedef enum {
@@ -205,6 +209,8 @@ int mr_play_options_parse(mr_play_options *options, int argc, char **argv,
 int mr_build_player_arguments(char *output, size_t output_size,
                               const mr_play_options *options, const char *url,
                               const char *user_agent, const char *referer);
+int mr_build_mrberry_arguments(char *output, size_t output_size,
+                               const char *path);
 int mr_build_iptv_arguments(char *output, size_t output_size,
                             const mr_play_options *options);
 void mr_play_options_summary(const mr_play_options *options, char *output,
