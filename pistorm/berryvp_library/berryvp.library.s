@@ -1385,7 +1385,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79I DIRECT-LEGACY RENDERER TEST (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -47979,6 +47979,26 @@ v12a_decoder_output:       ds.l 1
 v12a_isp_handle:           ds.l 1
 v12a_isp_input:            ds.l 1
 v12a_isp_output:           ds.l 1
+; N79J: real ISP stage (decoder -> scheduler -> ISP -> renderer) state.
+n79j_isp_handle:           ds.l 1
+n79j_isp_input:            ds.l 1
+n79j_isp_output:           ds.l 1
+n79j_out_buf_num:          ds.l 1
+n79j_out_buf_size:         ds.l 1
+n79j_out_variant:          ds.l 1
+n79j_out_w:                ds.l 1
+n79j_out_h:                ds.l 1
+n79j_out_crop_x:           ds.l 1
+n79j_out_crop_y:           ds.l 1
+n79j_out_crop_w:           ds.l 1
+n79j_out_crop_h:           ds.l 1
+n79j_out_fps_num:          ds.l 1
+n79j_out_fps_den:          ds.l 1
+n79j_out_par_num:          ds.l 1
+n79j_out_par_den:          ds.l 1
+n79j_out_colorspace:       ds.l 1
+n79j_save_dec_handle:      ds.l 1
+n79j_save_dec_output:      ds.l 1
 v12a_dec_buf_num:          ds.l 1
 v12a_dec_buf_size:         ds.l 1
 v12a_dec_w:                ds.l 1
@@ -49401,37 +49421,27 @@ hdmi_v40o_param_clear:
         move.l  #84,d0
         jsr     store_le32
         lea     48(a2),a0
-        move.l  #HDMI_V14_DISPLAY_SET-2,d0 ; N79H: no FULLSCREEN in set mask
+        move.l  #HDMI_V14_DISPLAY_SET,d0
         jsr     store_le32
         ; +52 display_num = 1, explicitly selected by DISPLAY_SET_NUM.
         lea     52(a2),a0
         move.l  #HDMI_V18_DISPLAY_NUM,d0
         jsr     store_le32
         lea     56(a2),a0
-        moveq   #0,d0                   ; N79H: fullscreen = FALSE
+        moveq   #1,d0                   ; renderer owns full HDMI display region
         jsr     store_le32
-        ; N79H: dest_rect = native visible video size, centred on the screen.
+        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen.
         lea     64(a2),a0
-        move.l  hdmi_v40o_wb_width,d0
-        sub.l   v12a_dec_crop_w,d0
-        bpl.s   n79h_dest_x_ok
         moveq   #0,d0
-n79h_dest_x_ok:
-        lsr.l   #1,d0
         jsr     store_le32
         lea     68(a2),a0
-        move.l  hdmi_v40o_wb_height,d0
-        sub.l   v12a_dec_crop_h,d0
-        bpl.s   n79h_dest_y_ok
         moveq   #0,d0
-n79h_dest_y_ok:
-        lsr.l   #1,d0
         jsr     store_le32
         lea     72(a2),a0
-        move.l  v12a_dec_crop_w,d0
+        move.l  hdmi_v40o_wb_width,d0
         jsr     store_le32
         lea     76(a2),a0
-        move.l  v12a_dec_crop_h,d0
+        move.l  hdmi_v40o_wb_height,d0
         jsr     store_le32
         lea     112(a2),a0
         move.l  #HDMI_V14_LAYER,d0
@@ -50074,6 +50084,19 @@ v12b_dec_size_nonzero:
         jsr     print_hex32
         jsr     newline
 
+        ; N79J: in library C mode the first component is a REAL ril.isp;
+        ; v12a_create_isp picks the component name from v41_display_style.
+        tst.l   bvp_library_mode
+        beq.s   n79j_create_normal
+        cmpi.l  #3,v41_display_style
+        bne.s   n79j_create_normal
+        clr.l   v41_display_style
+        bsr     v12a_create_isp
+        move.l  #3,v41_display_style
+        tst.l   d0
+        bne.w   v12a_setup_fail
+        bra.s   v41b_setup_continue_isp
+n79j_create_normal:
         bsr     v12a_create_isp
         tst.l   d0
         bne.w   v12a_setup_fail
@@ -50148,6 +50171,47 @@ v12a_in_num_ok:
         tst.l   d0
         bne.w   v12a_setup_fail
         move.l  port_last_handle,v12a_isp_output
+        ; N79J: library C mode -> ISP OUTPUT 0 = I420 with the width rounded
+        ; up to 128 and the height to 16; crop = decoder visible size.
+        tst.l   bvp_library_mode
+        beq.w   n79j_out_bgr24
+        cmpi.l  #3,v41_display_style
+        bne.w   n79j_out_bgr24
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_I420,port_fmt_encoding
+        clr.l   port_fmt_variant
+        clr.l   port_fmt_bitrate
+        clr.l   port_fmt_flags
+        clr.l   port_fmt_extra
+        move.l  v12a_dec_crop_w,d0
+        add.l   #127,d0
+        and.l   #$FFFFFF80,d0
+        move.l  d0,port_video_width
+        move.l  v12a_dec_crop_h,d0
+        add.l   #15,d0
+        and.l   #$FFFFFFF0,d0
+        move.l  d0,port_video_height
+        clr.l   port_crop_x
+        clr.l   port_crop_y
+        move.l  v12a_dec_crop_w,port_crop_width
+        move.l  v12a_dec_crop_h,port_crop_height
+        move.l  v12a_dec_fps_num,port_fps_num
+        move.l  v12a_dec_fps_den,port_fps_den
+        moveq   #1,d0
+        move.l  d0,port_par_num
+        move.l  d0,port_par_den
+        move.l  v12a_dec_colorspace,port_color_space
+        moveq   #3,d0
+        move.l  d0,port_buf_num
+        move.l  port_video_width,d0
+        move.l  port_video_height,d1
+        mulu.w  d1,d0
+        move.l  d0,d1
+        lsr.l   #1,d1
+        add.l   d1,d0                    ; I420: width*height*3/2
+        move.l  d0,port_buf_size
+        bra.w   n79j_out_set
+n79j_out_bgr24:
         move.l  #MMAL_ES_VIDEO,port_fmt_type
         move.l  #MMAL_ENCODING_BGR24,port_fmt_encoding
         clr.l   port_fmt_variant
@@ -50175,6 +50239,7 @@ v12a_in_num_ok:
         add.l   d0,d0
         add.l   d1,d0                    ; BGR24: 3 bytes/pixel
         move.l  d0,port_buf_size
+n79j_out_set:
         move.l  #1,v12c_local_set_active
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
@@ -50188,8 +50253,36 @@ v12a_in_num_ok:
         move.l  port_last_handle,d0
         cmp.l   v12a_isp_output,d0
         bne.w   v12a_setup_fail
-        move.l  port_fmt_encoding,d0
-        cmp.l   #MMAL_ENCODING_BGR24,d0
+        tst.l   bvp_library_mode
+        beq.w   n79j_check_bgr24
+        cmpi.l  #3,v41_display_style
+        bne.w   n79j_check_bgr24
+        cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
+        bne.w   v12a_setup_fail
+        move.l  v12a_isp_handle,n79j_isp_handle
+        move.l  v12a_isp_input,n79j_isp_input
+        move.l  v12a_isp_output,n79j_isp_output
+        move.l  port_buf_num,n79j_out_buf_num
+        move.l  port_buf_size,n79j_out_buf_size
+        move.l  port_fmt_variant,n79j_out_variant
+        move.l  port_video_width,n79j_out_w
+        move.l  port_video_height,n79j_out_h
+        move.l  port_crop_x,n79j_out_crop_x
+        move.l  port_crop_y,n79j_out_crop_y
+        move.l  port_crop_width,n79j_out_crop_w
+        move.l  port_crop_height,n79j_out_crop_h
+        move.l  port_fps_num,n79j_out_fps_num
+        move.l  port_fps_den,n79j_out_fps_den
+        move.l  port_par_num,n79j_out_par_num
+        move.l  port_par_den,n79j_out_par_den
+        move.l  port_color_space,n79j_out_colorspace
+        bsr     n79j_setup_sched_isp_renderer
+        tst.l   d0
+        bne.w   v12a_setup_fail
+        moveq   #0,d0
+        bra.w   v12a_setup_done
+n79j_check_bgr24:
+        cmpi.l  #MMAL_ENCODING_BGR24,port_fmt_encoding
         bne.w   v12a_setup_fail
 
         ; mkvr7 SAFE RESTORE:
@@ -50334,6 +50427,169 @@ v12a_setup_fail:
         moveq   #1,d0
 v12a_setup_done:
         clr.l   v12a_local_get_active
+        movem.l (sp)+,d1-d7/a0-a3
+        rts
+
+; ====================================================================
+; N79J - decoder -> video_scheduler -> ISP(I420, 128-aligned) -> renderer
+; Entry: the real ISP is configured (n79j_* holds its output format).
+; ====================================================================
+n79j_setup_sched_isp_renderer:
+        movem.l d1-d7/a0-a3,-(sp)
+        ; Preserve the exact Workbench HVS list before video_render owns it.
+        move.l  #HDMI_V14_HVS_DLIST_PTR,a0
+        jsr     load_le32
+        move.l  d0,hdmi_v40o_hvs_saved
+        ; Proven N79 graph helper: decoder -> scheduler -> ISP.
+        jsr     vpv126_setup_scheduler_data_graph
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  #1,n73_scheduler_graph_ready
+        move.l  #1,vpv166_c_sched_feedahead
+        move.l  v12a_isp_handle,n79j_isp_handle
+        move.l  v12a_isp_input,n79j_isp_input
+        move.l  v12a_isp_output,n79j_isp_output
+        ; Create the video_render component (style 3 selects it).
+        move.l  #3,v41_display_style
+        bsr     v12a_create_isp
+        tst.l   d0
+        bne.w   n79j_fail
+        ; Renderer INPUT 0 = the ISP I420 surface.
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  port_last_handle,v12a_isp_input
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_I420,port_fmt_encoding
+        move.l  n79j_out_variant,port_fmt_variant
+        clr.l   port_fmt_bitrate
+        clr.l   port_fmt_flags
+        clr.l   port_fmt_extra
+        move.l  n79j_out_w,port_video_width
+        move.l  n79j_out_h,port_video_height
+        move.l  n79j_out_crop_x,port_crop_x
+        move.l  n79j_out_crop_y,port_crop_y
+        move.l  n79j_out_crop_w,port_crop_width
+        move.l  n79j_out_crop_h,port_crop_height
+        move.l  n79j_out_fps_num,port_fps_num
+        move.l  n79j_out_fps_den,port_fps_den
+        move.l  n79j_out_par_num,port_par_num
+        move.l  n79j_out_par_den,port_par_den
+        move.l  n79j_out_colorspace,port_color_space
+        move.l  n79j_out_buf_size,port_buf_size
+        move.l  n79j_out_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n79j_rin_num_ok
+        moveq   #2,d0
+n79j_rin_num_ok:
+        move.l  d0,port_buf_num
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        clr.l   v12c_local_set_active
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_isp_input,d0
+        bne.w   n79j_fail
+        cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
+        bne.w   n79j_fail
+        ; Renderer visible, display region as for the direct C path.
+        clr.l   v41b_renderer_reveal_pending
+        move.l  #1,v41b_renderer_visible
+        bsr     hdmi_v40o_set_displayregion
+        tst.l   d0
+        bne.w   n79j_fail
+        ; ISP.output -> renderer.input through the proven connector.
+        move.l  v12a_decoder_handle,n79j_save_dec_handle
+        move.l  v12a_decoder_output,n79j_save_dec_output
+        move.l  n79j_isp_handle,v12a_decoder_handle
+        move.l  n79j_isp_output,v12a_decoder_output
+        bsr     v12a_connect_ports
+        move.l  n79j_save_dec_handle,v12a_decoder_handle
+        move.l  n79j_save_dec_output,v12a_decoder_output
+        tst.l   d0
+        bne.w   n79j_fail
+        ; Renderer peer requirements before ISP output is enabled.
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79j_fail
+        bsr     v12a_set_isp_requirements
+        tst.l   d0
+        bne.w   n79j_fail
+        ; Enable ISP OUTPUT; connected renderer input comes up with it.
+        move.l  n79j_isp_handle,component_handle
+        move.l  n79j_isp_output,output_port_handle
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  port_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n79j_iout_num_ok
+        moveq   #2,d0
+n79j_iout_num_ok:
+        move.l  d0,port_buf_num
+        jsr     port_enable_output_current
+        tst.l   d0
+        bne.w   n79j_fail
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79j_fail
+        cmpi.l  #1,port_enabled
+        bne.w   n79j_fail
+        ; Enable renderer, then the ISP component.
+        jsr     component_enable_worker
+        tst.l   d0
+        bne.s   n79j_fail
+        move.l  n79j_isp_handle,component_handle
+        jsr     component_enable_worker
+        tst.l   d0
+        bne.s   n79j_fail
+        ; No host-facing output buffers on this path.
+        clr.l   output_component_handle
+        clr.l   output_port_handle
+        clr.l   output_buf_size_saved
+        clr.l   output_width_saved
+        clr.l   output_height_saved
+        clr.l   output_crop_x_saved
+        clr.l   output_crop_y_saved
+        clr.l   output_crop_w_saved
+        clr.l   output_crop_h_saved
+        clr.l   output_frame_bytes_expected
+        clr.l   v10j_output_req_count
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_saved_input_handle,input_port_handle
+        lea     n79j_msg_graph_ready,a1
+        jsr     n12_log
+        moveq   #0,d0
+        bra.s   n79j_done
+n79j_fail:
+        tst.l   n79j_save_dec_handle
+        beq.s   n79j_fail_no_dec
+        move.l  n79j_save_dec_handle,v12a_decoder_handle
+        move.l  n79j_save_dec_output,v12a_decoder_output
+n79j_fail_no_dec:
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_saved_input_handle,input_port_handle
+        lea     n79j_msg_graph_fail,a1
+        jsr     n12_log
+        moveq   #1,d0
+n79j_done:
         movem.l (sp)+,d1-d7/a0-a3
         rts
 
@@ -53344,7 +53600,7 @@ v41b_renderer_visibility_ready:
         ; now; the Audio-Master clock is armed later, only after the first real
         ; PCM block has been published (N79 prime-2 startup).
         tst.l   bvp_library_mode
-        bne.w   vpv166_c_direct_legacy  ; N79I: library uses direct legacy renderer
+        bne.w   n73_library_scheduler_enable
 
         ; R5: normal C keeps decoder -> scheduler -> renderer.  A successful
         ; compressed IDR seek is already positioned at the target, therefore
@@ -66087,6 +66343,10 @@ mkvr7_cwait_not_owned:
 msg_mkvr7_cwait_expired:
         dc.b "[mkvr7fix][C-WATCH] 5s ohne H264 send/return Fortschritt; alter Detail-Watchdog uebernimmt.",10
 msg_mkvr7_cwait_expired_end:
+n79j_msg_graph_ready:
+        dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_READY",0
+n79j_msg_graph_fail:
+        dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_FAIL",0
         even
 
         section bss,bss
