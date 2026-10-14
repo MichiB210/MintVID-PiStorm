@@ -1385,7 +1385,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79N K-BASE ISP ASPECT DISPLAY (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79O K-BASE POST-AUDIO ASPECT (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -50541,8 +50541,9 @@ n79j_rin_num_ok:
         bne.w   n79j_fail
         cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
         bne.w   n79j_fail
-        ; Renderer visible; N79N: aspect-correct display region for ISP path.
-        move.l  #1,n79n_isp_aspect_active
+        ; Renderer visible; N79O: the aspect region is applied only after the
+        ; audio clock is armed (see n74_ca_clock_ready), so start full-screen.
+        clr.l   n79n_isp_aspect_active
         clr.l   v41b_renderer_reveal_pending
         move.l  #1,v41b_renderer_visible
         bsr     hdmi_v40o_set_displayregion
@@ -67169,6 +67170,15 @@ n74_ca_clock_ready:
         jsr     n12_log
         lea     n11_name_ready,a1
         jsr     n12_log
+        ; N79O: once audio runs, re-apply the display region with the
+        ; aspect-correct rect if the ISP widened the visible surface.
+        move.l  n79j_out_crop_w,d0
+        cmp.l   v12a_dec_crop_w,d0
+        beq.s   n79o_aspect_done
+        move.l  #1,n79n_isp_aspect_active
+        jsr     hdmi_v40o_set_displayregion
+        clr.l   n79n_isp_aspect_active
+n79o_aspect_done:
         lea     n19_msg_quiet_live,a1
         jsr     n12_log
         lea     n9_msg_ca_ready,a1
