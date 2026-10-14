@@ -8,6 +8,7 @@
  * jump (or --start=) restarts the stream at a keyframe. */
 #include "../core/mr_demux.h"
 #include "mr_berryvp.h"
+#include "mrb_paula.h"
 #include "mr_player_status.h"
 #include <exec/types.h>
 #include <exec/memory.h>
@@ -587,6 +588,9 @@ typedef struct {
     const mr_video_info *vi;
     const mr_audio_info *ai;
     int use_audio;            /* in: wanted; cleared if the track is refused */
+    int paula;                /* sound through the Amiga, not the Pi's HDMI */
+    int low_rate, mono;       /* Paula only, as in mrplay                  */
+    int32_t av_offset_us;     /* Paula only: delay the sound by this much  */
     int is_mov;
     int can_seek;
     uint64_t base_us;         /* media time this session starts at          */
@@ -652,6 +656,7 @@ static int play_session(session *s)
     play_clock clk;
     uint32_t last_status_us = 0;
     const mr_audio_info *ai = s->ai;
+    mrb_paula *paula = NULL;
 
     memset(&clk, 0, sizeof clk);
     s->seek_delta_us = 0;
@@ -668,7 +673,26 @@ static int play_session(session *s)
         n76_hlog("AC309I_MP4_128K_FRAGMENT_CAP");
     }
 
-    if (s->use_audio) {
+    if (s->use_audio && s->paula) {
+        /* MintVID's own decoders and Paula. The VideoCore plays the picture
+         * alone, exactly as with --no-audio, so the BerryCore kernel is not
+         * needed. */
+        static char why[96];
+        char reason[64];
+        paula = mrb_paula_open(ai, s->low_rate, s->mono, s->av_offset_us,
+                               reason, sizeof reason);
+        if (paula) {
+            snprintf(why, sizeof why, "%s", mrb_paula_describe(paula));
+            printf("Audio: %s\n", why);
+        } else {
+            printf("Warning: Amiga audio: %s; playing video without sound.\n",
+                   reason);
+            snprintf(why, sizeof why, "no sound (%s)", reason);
+            s->use_audio = 0;   /* do not try again after a jump */
+        }
+        s->audio_note = why;
+        n73_prime_ready = 1;
+    } else if (s->use_audio) {
         st = mr_berryvp_config_audio(bvp, ai);
         if (st == MR_OK) {
             audio_enabled = 1;
@@ -704,9 +728,11 @@ static int play_session(session *s)
              * picture stops once what is already queued has played. */
             uint32_t paused_at = (uint32_t)ac309i_read_sys_us(), dt;
             status_playing(s, &clk, 1);
+            mrb_paula_pause(paula, 1);
             n76_hlog("PAUSE_ON");
             for (;;) {
                 Delay(2);
+                mrb_paula_service(paula);
                 delta = 0;
                 ev = poll_event(&delta);
                 if (ev == EV_PAUSE || ev == EV_STOP ||
@@ -717,6 +743,7 @@ static int play_session(session *s)
             ac309i_pace.base_us += dt;
             eac3_first_wall_us += dt;
             clk.paused_us += dt;
+            mrb_paula_pause(paula, 0);
             n76_hlog("PAUSE_OFF");
             if (ev == EV_PAUSE) { status_playing(s, &clk, 0); ev = EV_NONE; }
         }
@@ -741,12 +768,23 @@ static int play_session(session *s)
             }
         }
 
+        mrb_paula_service(paula);
         st = mr_demux_next_packet(s->d, &pkt);
         if (st != MR_OK) break;
         if (!pkt.len) continue;
         if (!rebase_packet(s, &pkt)) continue;
         if (!pkt.is_video) {
             audio_seen++;
+            if (paula) {
+                if (!mrb_paula_feed(paula, &pkt)) {
+                    snprintf(s->error, sizeof s->error,
+                             "Cannot buffer audio (out of memory)");
+                    result = SESSION_ERROR;
+                    break;
+                }
+                audio_sent++;
+                continue;
+            }
             if (!audio_enabled) continue;
 
             /* PiStorm04: retain compressed startup audio until one real
@@ -844,6 +882,10 @@ static int play_session(session *s)
             clk.started = 1;
             clk.start_us = (uint32_t)ac309i_read_sys_us();
             n76_hlog("P04_FIRST_VIDEO_SENT_BEFORE_PCM");
+            /* The first frame Paula sound lines up with. Paula mode never
+             * uses the MP4 pacer, so this is the packet just sent. */
+            mrb_paula_anchor(paula, clk.start_us,
+                             pkt.has_pts ? pkt.pts_us : 0);
             if (ai && ai->format_tag == MR_AUDIO_FORMAT_EAC3 && !eac3_pts_clock_valid &&
                 p04_ahead && p04_ahead->has_pts) {
                 eac3_first_pts_us = p04_ahead->pts_us;
@@ -885,6 +927,27 @@ static int play_session(session *s)
     n73_free_video_queue();
     p04_free_audio_queue();
 
+    /* Paula still holds a few seconds of sound at the end of the file. */
+    if (result == SESSION_END && paula) {
+        uint32_t drain_start = (uint32_t)ac309i_read_sys_us();
+        while (!mrb_paula_idle(paula)) {
+            int64_t delta;
+            int ev;
+            Delay(1);
+            ev = poll_event(&delta);
+            if (ev == EV_STOP) { result = SESSION_STOP; break; }
+            if ((uint32_t)(ac309i_read_sys_us() - drain_start) >= 10000000u) break;
+        }
+    }
+    if (paula) {
+        unsigned long sil, drop, fixes;
+        mrb_paula_stats(paula, &sil, &drop, &fixes);
+        DBG_PRINTF("Amiga audio sync: %lu corrections, %lu ms silence added, "
+                   "%lu ms dropped\n", fixes, sil, drop);
+        mrb_paula_close(paula);
+        paula = NULL;
+    }
+
     /* P32/FAST06: at natural E-AC3 EOF, keep the graph alive until the final
      * scheduled PCM tail has had time to present. ESC remains active here. */
     if (result == SESSION_END && eac3_pts_clock_valid && ai && ai->sample_rate) {
@@ -923,6 +986,8 @@ static void usage(void)
 {
     printf("mrberry - H.264 hardware A/V player for PiStorm (Emu68 BerryCore)\n"
            "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [--start=H:MM:SS] [--no-audio]\n"
+           "               [--paula [--audio-rate=low] [--audio-mono] [--av-offset=MS]]\n"
+           "  --paula  sound through the Amiga (MintVID's decoders), not the Pi's HDMI\n"
            "Keys: ESC stop, Space pause, Left/Right -/+10 s, Down/Up -/+60 s\n");
 }
 
@@ -931,7 +996,9 @@ int main(int argc, char **argv)
     session s;
     const char *path = NULL;
     uint64_t start_us = 0;
-    int no_audio = 0, i, result = SESSION_ERROR, rc = 20;
+    int no_audio = 0, paula = 0, low_rate = 0, mono = 0, i;
+    int result = SESSION_ERROR, rc = 20;
+    long av_offset_ms = 0;
     const char *final_text = NULL;
     LONG final_state = MR_PLAYER_STATE_ERROR;
 
@@ -946,6 +1013,20 @@ int main(int argc, char **argv)
             if (!parse_time(argv[i] + 8, &start_us)) { usage(); return 5; }
         } else if (!strcmp(argv[i], "--no-audio")) {
             no_audio = 1;
+        } else if (!strcmp(argv[i], "--paula")) {
+            paula = 1;
+        } else if (!strcmp(argv[i], "--audio-rate=low")) {
+            low_rate = 1;
+        } else if (!strcmp(argv[i], "--audio-rate=normal")) {
+            low_rate = 0;
+        } else if (!strcmp(argv[i], "--audio-mono")) {
+            mono = 1;
+        } else if (!strncmp(argv[i], "--av-offset=", 12)) {
+            char *end;
+            av_offset_ms = strtol(argv[i] + 12, &end, 10);
+            if (*end || av_offset_ms < -5000 || av_offset_ms > 5000) {
+                usage(); return 5;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
             usage(); return 5;
         } else if (!path) {
@@ -981,8 +1062,16 @@ int main(int argc, char **argv)
     s.is_mov = !strcmp(mr_demux_container_name(s.d), "MOV");
     s.can_seek = mr_demux_can_seek(s.d);
     s.ai = mr_demux_audio(s.d);
+    s.paula = paula;
+    s.low_rate = low_rate;
+    s.mono = mono;
+    s.av_offset_us = (int32_t)av_offset_ms * 1000;
     if (no_audio) {
         s.audio_note = "sound off";
+    } else if (paula) {
+        /* Whatever MintVID can decode; mrb_paula_open() says if not. */
+        if (s.ai && s.ai->valid) s.use_audio = 1;
+        else s.audio_note = "no sound (no audio track)";
     } else if (!s.ai || !s.ai->valid ||
                (s.ai->format_tag != MR_AUDIO_FORMAT_AAC &&
                 s.ai->format_tag != MR_AUDIO_FORMAT_AC3 &&
