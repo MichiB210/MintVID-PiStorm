@@ -15,6 +15,9 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
 > **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
 > Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
 > models, other PiStorm boards and newer Emu68 versions are not supported yet.
+>
+> **`config.txt` on the SD card must contain `gpu_mem=64`.** The VideoCore
+> needs this memory for hardware decoding. Add the line if it is not there.
 
 This directory holds the complete source of all PiStorm parts of the P32 release. The MintVID GUI changes themselves live in `player/` (see the commit history of this fork).
 
@@ -64,6 +67,7 @@ Everything ends up in `pistorm/out/P32/`, and each file is compared against `P32
 
 1. Copy `MintVID`, `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the MintVID drawer.
 2. **Required:** use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the SD card, instead of `Emu68-pistorm`. It is only available for Emu68 1.0.7 on PiStorm Classic / Raspberry Pi 3A+.
+3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64` (add the line if it is missing).
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
 
@@ -102,3 +106,4 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 **Installation:**
 1. Die sechs Dateien `MintVID`, `mrberry`, `berryvp.library` und die drei `.module`-Dateien in die MintVID-Schublade kopieren.
 2. `Emu68-pistorm-BerryCore` als Emu68-Kern auf die SD-Karte legen.
+3. In der `config.txt` auf der SD-Karte `gpu_mem=64` eintragen (die Zeile ergänzen, falls sie fehlt).

@@ -29,6 +29,9 @@ includes it in full (MIT licence). MintVID's own README is in
 > **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
 > Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
 > models, other PiStorm boards and newer Emu68 versions are not supported yet.
+>
+> **`config.txt` on the SD card must contain `gpu_mem=64`.** The VideoCore
+> needs this memory for hardware decoding. Add the line if it is not there.
 
 ## What it plays
 
@@ -62,6 +65,7 @@ as in upstream MintVID.
    - This is Emu68 1.0.7 for PiStorm Classic / Raspberry Pi 3A+, with the BerryCore service on CPU1.
    - Without it, nothing plays.
    - It only exists for this Emu68 version and this hardware.
+3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64`. If the line is missing, add it.
 
 Ready-made files are under **Releases**.
 
@@ -127,6 +131,8 @@ synchron auf einem Amiga mit PiStorm ab:
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
 
 **Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+
+Außerdem muss in der `config.txt` auf der SD-Karte `gpu_mem=64` stehen. Fehlt die Zeile, bitte ergänzen.
 
 Start aus der Shell mit `mrberry film.mkv` oder bequem über MintVID mit
 „PiStorm / VC Hard Fullscreen“. Grundlage ist MintVID von Darren Banfi. Der PiStorm läuft mit Emu68 von Michal Schulz (michalsc). Die PiStorm-Hardware stammt von Claude Schwarz.
