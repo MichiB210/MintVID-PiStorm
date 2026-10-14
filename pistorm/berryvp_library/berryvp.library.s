@@ -117,7 +117,7 @@ BVPL_FuncTable:
         dc.l    BVP_OpenStream
         dc.l    BVP_CloseStreamN9
         dc.l    BVP_ConfigVideo
-        dc.l    BVP_ConfigAudioN9
+        dc.l    ac307_ConfigAudio
         dc.l    BVP_SendVideo
         dc.l    BVP_SendAudioN9
         dc.l    BVP_Control
@@ -64830,9 +64830,11 @@ vpv47_send_clear:
 vpv177_audio_submit_pts_ready:
 
         ; Bind the exact MMAL-submitted PTS to the renderer slot.
-        move.l  d7,d0
-        lsl.l   #2,d0
-        lea     vpv135_slot_pts_lo,a0
+        ; FAST13: exact same 10-byte diagnostic hook footprint as FAST12.
+        bsr.w   fast13_h0_trampoline
+        nop
+        nop
+        nop
         adda.l  d0,a0
         move.l  d2,(a0)
         lea     vpv135_slot_pts_hi,a0
@@ -66989,6 +66991,21 @@ n79j_msg_graph_ready:
 n79j_msg_graph_fail:
         dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_FAIL",0
         even
+        cnop    0,4
+
+; AC307A external CPU1 AC3 module paths.
+ac307_ac3_modulename_progdir:
+        dc.b    "PROGDIR:berry_ac3.module",0
+ac307_ac3_modulename:
+        dc.b    "berry_ac3.module",0
+        even
+
+; AC308 external CPU1 E-AC3 module paths.
+ac308_eac3_modulename_progdir:
+        dc.b    "PROGDIR:berry_eac3.module",0
+ac308_eac3_modulename:
+        dc.b    "berry_eac3.module",0
+        even
 
         section bss,bss
 mkvr7_cwait_active:         ds.l 1
@@ -67039,6 +67056,9 @@ BVP4H_AttachExitLegacy:
 bvp4h_abort_sp:       ds.l 1
 bvp4h_abort_reason:   ds.l 1
         even
+        cnop    0,4
+ac307_decoder_kind:
+        ds.l    1                       ; 0=AAC/FAAD, 1=AC3/liba52, 2=E-AC3/FFmpeg fixed
 
 BVPL_Stage4KEnd:
 
@@ -67163,6 +67183,318 @@ n15_hex_digit_store:
         jsr     n12_log
         movem.l (sp)+,d0-d7/a0-a3
         rts
+
+        cnop    0,4
+
+; ============================================================================
+; AC307A - AC3 source integration on exact reconstructed N79Q
+; Existing N79Q FAAD/AAC code remains in place. AC3 gets a separate loader.
+; ============================================================================
+ac307_prepare_dispatch:
+        move.l  ac307_decoder_kind,d0
+        beq.s   ac308_prepare_aac
+        cmpi.l  #1,d0
+        beq.s   ac307_prepare_ac3
+        jmp     ac308_eac3_prepare
+ac308_prepare_aac:
+        jmp     vpv48_faad_prepare       ; exact N79Q vpv48_faad_prepare
+ac307_prepare_ac3:
+        jmp     ac307_ac3_prepare
+
+; Load/init the hardware-confirmed AC305 berry_ac3.module using the same
+; BerryCore mailbox and buffer geometry already proven by N79Q/FAAD.
+; D0=0 success, D0=1 failure.
+ac307_ac3_prepare:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        tst.l   vpv48_faad_ready       ; vpv48_faad_ready
+        bne.w   ac307_ap_ok
+
+        clr.l   vpv48_faad_module_loaded       ; module_loaded
+        clr.l   vpv48_sequence       ; sequence
+        clr.b   vpv48_module_dma_active       ; module_dma_active
+        clr.b   vpv48_input_dma_active       ; input_dma_active
+        clr.b   vpv48_output_dma_active       ; output_dma_active
+        clr.b   vpv48_work_dma_active       ; work_dma_active
+
+        move.l  #$00002000,d0              ; mail alloc
+        jsr     vpv48_alloc_aligned       ; vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac307_ap_fail
+        move.l  d0,vpv48_mail_raw
+        move.l  d1,vpv48_mail_ptr
+
+        move.l  #$00023109,d0              ; existing module allocation (143625)
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac307_ap_fail
+        move.l  d0,vpv48_module_raw
+        move.l  d1,vpv48_module_ptr
+
+        move.l  #$00021000,d0              ; input alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac307_ap_fail
+        move.l  d0,vpv48_input_raw
+        move.l  d1,vpv48_input_ptr
+
+        move.l  #$00012000,d0              ; output alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac307_ap_fail
+        move.l  d0,vpv48_output_raw
+        move.l  d1,vpv48_output_ptr
+
+        move.l  #$00041000,d0              ; work alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac307_ap_fail
+        move.l  d0,vpv48_work_raw
+        move.l  d1,vpv48_work_ptr
+
+        ; DOS Open/Read/Close. a5 is the DOS base established by bvp_engine_env.
+        move.l  a5,a6
+        lea     ac307_ac3_modulename_progdir,a0
+        move.l  a0,d1
+        move.l  #1005,d2                   ; MODE_OLDFILE
+        jsr     -30(a6)                    ; Open()
+        tst.l   d0
+        bne.s   ac307_ap_have_file
+        lea     ac307_ac3_modulename,a0
+        move.l  a0,d1
+        move.l  #1005,d2
+        jsr     -30(a6)
+        tst.l   d0
+        beq.w   ac307_ap_fail
+ac307_ap_have_file:
+        move.l  d0,vpv48_module_file    ; module_file
+        move.l  d0,d1
+        move.l  vpv48_module_ptr,d2    ; module_ptr
+        move.l  #$00008360,d3              ; exact AC305 module size 33632
+        jsr     -42(a6)                    ; Read()
+        move.l  d0,d7
+        move.l  vpv48_module_file,d1
+        jsr     -36(a6)                    ; Close()
+        clr.l   vpv48_module_file
+        cmpi.l  #$00008360,d7
+        bne.w   ac307_ap_fail
+
+        ; Publish module to CPU1.
+        move.l  #$00008360,vpv48_dma_module_len ; dma_module_len
+        move.l  vpv48_module_ptr,a0
+        lea     vpv48_dma_module_len,a1
+        moveq   #8,d0                      ; DMA_ReadFromRAM
+        move.l  4.w,a6
+        jsr     -762(a6)                   ; CachePreDMA
+        move.l  d0,vpv48_module_phys    ; module_phys
+        move.b  #1,vpv48_module_dma_active
+        cmpi.l  #$00008360,vpv48_dma_module_len
+        bne.w   ac307_ap_fail
+        jsr     vpv48_check_phys       ; vpv48_check_phys
+        tst.l   d0
+        bne.w   ac307_ap_fail
+
+        jsr     vpv48_map_output_work       ; map output/work
+        tst.l   d0
+        bne.w   ac307_ap_fail
+        jsr     vpv48_setup_mail       ; setup mailbox
+        tst.l   d0
+        bne.w   ac307_ap_fail
+
+        ; LOAD_MODULE
+        move.l  vpv48_module_phys,vpv48_req_in_phys
+        move.l  #$00008360,vpv48_req_in_len
+        clr.l   vpv48_req_out_phys
+        clr.l   vpv48_req_out_len
+        clr.l   vpv48_req_param0
+        clr.l   vpv48_req_param1
+        clr.l   vpv48_req_work_phys
+        clr.l   vpv48_req_work_len
+        moveq   #3,d0                      ; LOAD_MODULE
+        jsr     vpv48_send_request       ; vpv48_send_request
+        tst.l   d0
+        bne.w   ac307_ap_fail
+        cmpi.l  #2,d1                      ; codec module
+        bne.w   ac307_ap_fail
+        cmpi.l  #$00008360,d2
+        bne.w   ac307_ap_fail
+        move.l  #1,vpv48_faad_module_loaded
+
+        ; CALL_MODULE param0=0 -> AC3 decoder persistent init.
+        clr.l   vpv48_req_in_phys
+        clr.l   vpv48_req_in_len
+        move.l  vpv48_output_phys,vpv48_req_out_phys
+        move.l  #$00011000,vpv48_req_out_len
+        clr.l   vpv48_req_param0
+        clr.l   vpv48_req_param1
+        move.l  vpv48_work_phys,vpv48_req_work_phys
+        move.l  #$00040000,vpv48_req_work_len
+        moveq   #4,d0                      ; CALL_MODULE
+        jsr     vpv48_send_request
+        tst.l   d0
+        bne.w   ac307_ap_fail
+        cmpi.l  #1,d1                      ; module returns ret.a=1
+        bne.w   ac307_ap_fail
+
+        move.l  #1,vpv48_faad_ready
+ac307_ap_ok:
+        moveq   #0,d0
+        bra.s   ac307_ap_done
+ac307_ap_fail:
+        jsr     vpv48_faad_cleanup       ; existing generic cleanup
+        moveq   #1,d0
+ac307_ap_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+; AC308N2: load/init compact E-AC3 module; downmix layout is armed only at first decode, not during ConfigAudio/init.
+; It exports the same AC305-style streaming result block as the AC3 module,
+; so the proven AC307 batch->PCM->MMAL path below is shared unchanged.
+ac308_eac3_prepare:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        tst.l   vpv48_faad_ready       ; decoder ready
+        bne.w   ac308_ep_ok
+
+        clr.l   vpv48_faad_module_loaded       ; module_loaded
+        clr.l   vpv48_sequence       ; sequence
+        clr.b   vpv48_module_dma_active       ; module_dma_active
+        clr.b   vpv48_input_dma_active       ; input_dma_active
+        clr.b   vpv48_output_dma_active       ; output_dma_active
+        clr.b   vpv48_work_dma_active       ; work_dma_active
+
+        move.l  #$00002000,d0              ; mail alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac308_ep_fail
+        move.l  d0,vpv48_mail_raw
+        move.l  d1,vpv48_mail_ptr
+
+        move.l  #$00023109,d0              ; module allocation, same proven geometry
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac308_ep_fail
+        move.l  d0,vpv48_module_raw
+        move.l  d1,vpv48_module_ptr
+
+        move.l  #$00021000,d0              ; input alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac308_ep_fail
+        move.l  d0,vpv48_input_raw
+        move.l  d1,vpv48_input_ptr
+
+        move.l  #$00012000,d0              ; output alloc
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac308_ep_fail
+        move.l  d0,vpv48_output_raw
+        move.l  d1,vpv48_output_ptr
+
+        move.l  #$00041000,d0              ; physical work buffer; E302F proved stable
+        jsr     vpv48_alloc_aligned
+        tst.l   d0
+        beq.w   ac308_ep_fail
+        move.l  d0,vpv48_work_raw
+        move.l  d1,vpv48_work_ptr
+
+        move.l  a5,a6
+        lea     ac308_eac3_modulename_progdir,a0
+        move.l  a0,d1
+        move.l  #1005,d2
+        jsr     -30(a6)
+        tst.l   d0
+        bne.s   ac308_ep_have_file
+        lea     ac308_eac3_modulename,a0
+        move.l  a0,d1
+        move.l  #1005,d2
+        jsr     -30(a6)
+        tst.l   d0
+        beq.w   ac308_ep_fail
+ac308_ep_have_file:
+        move.l  d0,vpv48_module_file
+        move.l  d0,d1
+        move.l  vpv48_module_ptr,d2
+        move.l  #$0001C3CC,d3              ; AC308N2 compact berry_eac3.module exact build size
+        jsr     -42(a6)
+        move.l  d0,d7
+        move.l  vpv48_module_file,d1
+        jsr     -36(a6)
+        clr.l   vpv48_module_file
+        cmpi.l  #$0001C3CC,d7
+        bne.w   ac308_ep_fail
+
+        move.l  #$0001C3CC,vpv48_dma_module_len
+        move.l  vpv48_module_ptr,a0
+        lea     vpv48_dma_module_len,a1
+        moveq   #8,d0
+        move.l  4.w,a6
+        jsr     -762(a6)                   ; CachePreDMA
+        move.l  d0,vpv48_module_phys
+        move.b  #1,vpv48_module_dma_active
+        cmpi.l  #$0001C3CC,vpv48_dma_module_len
+        bne.w   ac308_ep_fail
+        jsr     vpv48_check_phys
+        tst.l   d0
+        bne.w   ac308_ep_fail
+
+        jsr     vpv48_map_output_work       ; map output/work
+        tst.l   d0
+        bne.w   ac308_ep_fail
+        jsr     vpv48_setup_mail       ; setup mailbox
+        tst.l   d0
+        bne.w   ac308_ep_fail
+
+        move.l  vpv48_module_phys,vpv48_req_in_phys
+        move.l  #$0001C3CC,vpv48_req_in_len
+        clr.l   vpv48_req_out_phys
+        clr.l   vpv48_req_out_len
+        clr.l   vpv48_req_param0
+        clr.l   vpv48_req_param1
+        clr.l   vpv48_req_work_phys
+        clr.l   vpv48_req_work_len
+        moveq   #3,d0                      ; LOAD_MODULE
+        jsr     vpv48_send_request
+        tst.l   d0
+        bne.w   ac308_ep_fail
+        cmpi.l  #2,d1
+        bne.w   ac308_ep_fail
+        cmpi.l  #$0001C3CC,d2
+        bne.w   ac308_ep_fail
+        move.l  #1,vpv48_faad_module_loaded
+
+        ; E302F compatibility entry param0=0 performs all seven init stages.
+        clr.l   vpv48_req_in_phys
+        clr.l   vpv48_req_in_len
+        move.l  vpv48_output_phys,vpv48_req_out_phys
+        move.l  #$00011000,vpv48_req_out_len
+        clr.l   vpv48_req_param0
+        clr.l   vpv48_req_param1
+        move.l  vpv48_work_phys,vpv48_req_work_phys
+        move.l  #$00040000,vpv48_req_work_len
+        moveq   #4,d0
+        jsr     vpv48_send_request
+        tst.l   d0
+        bne.w   ac308_ep_fail
+        cmpi.l  #1,d1
+        bne.w   ac308_ep_fail
+
+        move.l  #1,vpv48_faad_ready
+ac308_ep_ok:
+        moveq   #0,d0
+        bra.s   ac308_ep_done
+ac308_ep_fail:
+        jsr     vpv48_faad_cleanup
+        moveq   #1,d0
+ac308_ep_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+        even
+
+; FAST13 HUNK0-local trampoline. Kept at the end of HUNK0 so no existing
+; HUNK0 instruction address changes. Diagnostic-only jump into HUNK4.
+fast13_h0_trampoline:
+        jmp     fast13_submit_trace_hook
+        even
 
         section n10d_trace_data,data
 n12_trace_name: dc.b "N79_TRACE.TXT",0
@@ -67715,7 +68047,7 @@ N9_CA_StateOK:
         bsr     n9_audio_alloc_pcm
         tst.l   d0
         bne.w   N9_CA_Backend
-        jsr     vpv48_faad_prepare
+        jsr     ac307_prepare_dispatch
         tst.l   d0
         bne.w   N9_CA_BackendFree
 
@@ -68011,15 +68343,15 @@ n30_sa_copy_done:
         ; a tiny two-AAC prefix.  Frame 1 is FAAD priming; frame 2 yields real
         ; PCM on the tested trailer.  After the first PCM publish has armed the
         ; Audio-Master clock, return to the proven 16-frame / 64-KiB cadence.
-        tst.l   n73_first_pcm_published
-        bne.s   n73_sa_normal_batch
-        cmpi.l  #2,n30_batch_frames
-        bcs.s   N9_SA_OK
-        addq.l  #1,n73_prime_flushes
-        bra.s   n73_sa_flush_batch
-n73_sa_normal_batch:
-        cmpi.l  #16,n30_batch_frames
-        bcs.s   N9_SA_OK
+        ; AC307A: codec-aware batch threshold. This replaces exactly the old
+        ; N79Q 2/16-frame decision block; AAC behavior is preserved by helper.
+        jsr     ac307_should_flush
+        tst.l   d0
+        beq.s   ac307_threshold_no_flush
+        rept    16
+        nop
+        endr
+        ; Existing N79Q flush sequence starts here (same original offset).
 n73_sa_flush_batch:
 
         jsr     bvp_engine_env
@@ -68027,6 +68359,7 @@ n73_sa_flush_batch:
         tst.l   d0
         bne.w   N9_SA_Backend
 N9_SA_OK:
+ac307_threshold_no_flush:
         jsr     bvp_engine_env
         jsr     n66_service_pending_video
         tst.l   d0
@@ -68102,7 +68435,7 @@ n65_fab_previous_clear:
         move.l  n30_batch_bytes,n9_audio_pending_len
         jsr     vpv98_read_sys_us
         move.l  d0,n54_phase_start_us
-        bsr     n9_faad_decode_direct
+        bsr.w   ac307_decode_dispatch
         move.l  d0,n54_saved_result
         jsr     vpv98_read_sys_us
         sub.l   n54_phase_start_us,d0
@@ -68501,7 +68834,9 @@ n79_no_v11:
         move.l  v12a_decoder_handle,component_handle
         move.l  v12a_saved_input_handle,input_port_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
-        clr.l   port_query_index
+        ; P32/P31: retain active VCHIQ local service for external SendVideo.
+        ; First run v12f_local_bits=0; persistent second run=$00001000.
+        jsr     (p32_restore_vchiq_local_bits).l
         cmpi.l  #1,n79_first_video_trace_state
         bne.s   n79_no_v18
         lea     n79_v18,a1
@@ -69330,6 +69665,448 @@ n9_fdd_done:
         movem.l (sp)+,d1-d7/a0-a3/a6
         rts
 
+
+; ============================================================================
+; AC307A public ConfigAudio wrapper.
+; AAC jumps to exact N79Q. AC3 (codec 3) and E-AC3 (codec 4) select
+; separate CPU1 modules, then reuse the common N79Q stereo renderer.
+; ============================================================================
+ac307_ConfigAudio:
+        cmpi.l  #4,d0
+        beq.s   ac308_ca_eac3
+        cmpi.l  #3,d0
+        beq.s   ac307_ca_ac3
+        clr.l   ac307_decoder_kind
+        jmp     BVP_ConfigAudioN9
+ac308_ca_eac3:
+        clr.l   e4d_frame_counter          ; FAST04: new E-AC3 PCM diagnostic run
+        ; AC308N3: keep the AC308N2 instruction geometry/relocations intact,
+        ; but narrow the accepted E-AC3 input range from 2..6 to exactly 2.
+        cmpi.l  #2,d2
+        bcs.s   ac307_ca_bad_channels
+        cmpi.l  #2,d2
+        bhi.s   ac307_ca_bad_channels
+        move.l  #2,ac307_decoder_kind
+        moveq   #2,d0                     ; common AAC/stereo renderer setup
+        moveq   #2,d2                     ; E-AC3 stereo remains stereo
+        jmp     BVP_ConfigAudioN9
+ac307_ca_ac3:
+        cmpi.l  #1,d2
+        bcs.s   ac307_ca_bad_channels
+        cmpi.l  #6,d2
+        bhi.s   ac307_ca_bad_channels
+        move.l  #1,ac307_decoder_kind
+        moveq   #2,d0                     ; feed common N79Q AAC/stereo setup
+        moveq   #2,d2                     ; renderer and PCM output are stereo
+        jmp     BVP_ConfigAudioN9
+ac307_ca_bad_channels:
+        ; Force the original N79Q validator to return BVPERR_BADPARAM (-3)
+        ; and update BVP_LAST_ERROR in the normal way.
+        moveq   #2,d0
+        moveq   #0,d2
+        jmp     BVP_ConfigAudioN9
+
+; Return D0=1 when current compressed batch should be decoded now.
+; AAC semantics are exactly N79Q: 2 frames before first PCM, then 16.
+; AC3 remains AC307A: first packet, then 7-packet batches.
+; AC308N E-AC3: decode every packet.  E-AC3 frames are normally 32 ms and
+; waiting for seven packets can starve the audio-master scheduler on 50/60-fps
+; material before mrberry reaches the next audio batch.
+ac307_should_flush:
+        move.l  ac307_decoder_kind,d0
+        cmpi.l  #2,d0
+        beq.s   ac308n_sf_eac3
+        tst.l   d0
+        bne.s   ac307_sf_ac3
+        tst.l   n73_first_pcm_published
+        bne.s   ac307_sf_aac_normal
+        cmpi.l  #2,n30_batch_frames
+        bcs.s   ac307_sf_no
+        addq.l  #1,n73_prime_flushes
+        moveq   #1,d0
+        rts
+ac307_sf_aac_normal:
+        cmpi.l  #16,n30_batch_frames
+        bcs.s   ac307_sf_no
+        moveq   #1,d0
+        rts
+; FASTIMDCT10: retain hardware-confirmed FAST05 STARTPRIME2 behavior.
+; First E-AC3 PCM publish contains 2 frames (64 ms), then one frame (32 ms).
+ac308n_sf_eac3:
+        tst.l   n73_first_pcm_published
+        bne.s   ac309_sf_eac3_running
+        cmpi.l  #2,n30_batch_frames
+        bcs.s   ac307_sf_no
+        addq.l  #1,n73_prime_flushes
+        moveq   #1,d0
+        rts
+ac309_sf_eac3_running:
+        cmpi.l  #1,n30_batch_frames
+        bcs.s   ac307_sf_no
+        moveq   #1,d0
+        rts
+ac307_sf_ac3:
+        tst.l   n73_first_pcm_published
+        bne.s   ac307_sf_ac3_normal
+        cmpi.l  #1,n30_batch_frames
+        bcs.s   ac307_sf_no
+        addq.l  #1,n73_prime_flushes
+        moveq   #1,d0
+        rts
+ac307_sf_ac3_normal:
+        cmpi.l  #7,n30_batch_frames
+        bcs.s   ac307_sf_no
+        moveq   #1,d0
+        rts
+ac307_sf_no:
+        moveq   #0,d0
+        rts
+
+; n30_flush_audio_batch calls here. AAC jumps straight to the original exact
+; N79Q n9_faad_decode_direct; AC3/E-AC3 share the AC305-compatible parser below.
+ac307_decode_dispatch:
+        tst.l   ac307_decoder_kind
+        bne.s   ac307_dd_ac3
+        jmp     n9_faad_decode_direct
+ac307_dd_ac3:
+        jmp     ac307_ac3_decode_direct
+
+; AC3/E-AC3 compressed batch -> selected CPU1 module -> PCM16 stereo.
+; Uses the same N79Q mailbox, map/unmap helpers and vpv38_pcm_store.
+; D0=0 success, D0=1 failure.
+ac307_ac3_decode_direct:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        clr.l   vpv48_last_consumed       ; last_consumed
+        clr.l   vpv48_last_pcm_bytes       ; last_pcm_bytes
+        clr.l   vpv48_last_samples_ch       ; last_samples_ch
+        clr.l   vpv48_last_frames       ; last_frames
+        tst.l   vpv48_faad_ready       ; decoder ready
+        beq.w   ac307_add_fail
+
+        move.l  n9_audio_pending_len,d5    ; n9_audio_pending_len
+        beq.w   ac307_add_fail
+        cmpi.l  #$00020000,d5
+        bhi.w   ac307_add_fail
+
+        move.l  n9_audio_pending_ptr,a1    ; n9_audio_pending_ptr
+        move.l  vpv48_input_ptr,a0    ; vpv48_input_ptr
+        move.l  d5,d3
+        move.l  d3,d2
+        lsr.l   #2,d2
+        beq.s   ac307_add_copy_tail
+ac307_add_copy_long:
+        move.l  (a1)+,(a0)+
+        subq.l  #1,d2
+        bne.s   ac307_add_copy_long
+ac307_add_copy_tail:
+        andi.l  #3,d3
+        beq.s   ac307_add_copy_done
+ac307_add_copy_byte:
+        move.b  (a1)+,(a0)+
+        subq.l  #1,d3
+        bne.s   ac307_add_copy_byte
+ac307_add_copy_done:
+
+        move.l  d5,d0
+        jsr     vpv48_map_input       ; map input
+        tst.l   d0
+        bne.w   ac307_add_fail
+
+        move.l  vpv48_input_phys,vpv48_req_in_phys ; input phys
+        move.l  d5,vpv48_req_in_len
+        move.l  vpv48_output_phys,vpv48_req_out_phys ; output phys
+        move.l  #$00011000,vpv48_req_out_len
+        move.l  #3,vpv48_req_param0    ; streaming decode
+        clr.l   vpv48_req_param1
+        move.l  vpv48_work_phys,vpv48_req_work_phys ; work phys
+        move.l  #$00040000,vpv48_req_work_len
+        moveq   #4,d0                      ; CALL_MODULE
+        jsr     vpv48_send_request
+        move.l  d0,d7
+        jsr     vpv48_close_input       ; close input DMA
+        jsr     vpv48_close_output_work       ; close output/work DMA
+        tst.l   d7
+        bne.w   ac307_add_reopen_fail
+
+        move.l  vpv48_output_ptr,a0    ; output ptr
+        cmpi.l  #$41433334,(a0)            ; 'AC34'
+        bne.w   ac307_add_reopen_fail
+        cmpi.l  #4,4(a0)                   ; streaming-batch status
+        bne.w   ac307_add_reopen_fail
+        move.l  8(a0),d0                   ; actual AC3 sample rate
+        tst.l   d0
+        beq.w   ac307_add_reopen_fail
+        cmpi.l  #192000,d0
+        bhi.w   ac307_add_reopen_fail
+        move.l  d0,v19_pcm_rate    ; v19_pcm_rate
+        cmpi.l  #2,12(a0)                  ; module always emits stereo
+        bne.w   ac307_add_reopen_fail
+        tst.l   72(a0)                     ; error_stage
+        bne.w   ac307_add_reopen_fail
+
+        move.l  36(a0),d4                  ; bytes_consumed
+        tst.l   d4
+        beq.w   ac307_add_reopen_fail
+        cmp.l   d5,d4
+        bhi.w   ac307_add_reopen_fail
+        move.l  d4,vpv48_last_consumed
+        move.l  24(a0),vpv48_last_frames ; frames_decoded
+        move.l  32(a0),d6                  ; pcm_bytes
+        move.l  d6,vpv48_last_pcm_bytes
+        cmpi.l  #$00010000,d6
+        bhi.w   ac307_add_reopen_fail
+        move.l  28(a0),d2                  ; samples_per_channel
+        move.l  d2,vpv48_last_samples_ch
+
+        tst.l   d6
+        beq.s   ac307_add_remap_ok
+        move.l  d2,d1
+        lsl.l   #2,d1                      ; samples/ch * 2ch * 2 bytes
+        cmp.l   d6,d1
+        bne.w   ac307_add_reopen_fail
+        lea     256(a0),a1
+        lea     vpv38_pcm_store,a2     ; vpv38_pcm_store
+        move.l  d6,d3
+        lsr.l   #1,d3
+ac307_add_pcm_loop:
+        move.w  (a1)+,d0
+        ror.w   #8,d0                      ; CPU1 BE PCM -> MMAL LE PCM
+        move.w  d0,(a2)+
+        subq.l  #1,d3
+        bne.s   ac307_add_pcm_loop
+        addq.l  #1,vpv48_batch_count    ; batch_count diagnostic
+        jsr     e4d_pcm_diag               ; FAST04: sampled E-AC3 PCM stats only
+
+ac307_add_remap_ok:
+        jsr     vpv48_map_output_work       ; remap output/work for next call
+        tst.l   d0
+        bne.s   ac307_add_fail
+        moveq   #0,d0
+        bra.s   ac307_add_done
+ac307_add_reopen_fail:
+        jsr     vpv48_map_output_work
+ac307_add_fail:
+        moveq   #1,d0
+ac307_add_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+        even
+
+; ============================================================================
+; FASTIMDCT04_DIAG
+; Sample the already-decoded AC3-compatible PCM output without changing it.
+; E-AC3 only.  Logs first 16 frames, every 32nd frame, every 8th frame from
+; frame 1600 onward, and frame 1875 of the 60 s reference clip.
+; Line format in N79_TRACE.TXT:
+;   E4D F=........ P=........ NZ=........ CL=........
+; P  = absolute PCM16 peak (0..0x8000)
+; NZ = non-zero PCM16 samples in this frame
+; CL = samples exactly +32767 or -32768 (hard clipping indicator)
+; ============================================================================
+e4d_pcm_diag:
+        movem.l d0-d7/a0-a4,-(sp)
+        ; FAST10: this routine is reachable only through the AC3/E-AC3 decoder
+        ; path.  FAST09's decoder_kind filter suppressed every diagnostic line
+        ; on hardware, so do not gate the probe on that selector here.
+        ; Accumulate the module's actual frames_decoded count: the first
+        ; STARTPRIME2 batch contains two E-AC3 frames, later batches one.
+        move.l  24(a0),d0
+        tst.l   d0
+        beq.w   e4d_done
+        add.l   d0,e4d_frame_counter
+        move.l  e4d_frame_counter,d7
+
+        cmpi.l  #16,d7
+        bls.s   e4d_sample
+        cmpi.l  #1875,d7
+        beq.s   e4d_sample
+        cmpi.l  #1600,d7
+        bcs.s   e4d_before_tail
+        move.l  d7,d0
+        andi.l  #7,d0
+        beq.s   e4d_sample
+        bra.w   e4d_done
+
+e4d_before_tail:
+        move.l  d7,d0
+        andi.l  #31,d0
+        bne.w   e4d_done
+
+e4d_sample:
+        ; a0 = AC305-compatible CPU1 output base, d6 = PCM byte count.
+        lea     256(a0),a1
+        move.l  d6,d5
+        lsr.l   #1,d5                      ; PCM16 sample count (L+R)
+        clr.l   d4                         ; absolute peak
+        clr.l   d3                         ; non-zero sample count
+        clr.l   d2                         ; hard-clip sample count
+        tst.l   d5
+        beq.s   e4d_build
+
+e4d_scan_loop:
+        moveq   #0,d0
+        move.w  (a1)+,d0
+        cmpi.w  #$7FFF,d0
+        beq.s   e4d_clip
+        cmpi.w  #$8000,d0
+        bne.s   e4d_not_clip
+
+e4d_clip:
+        addq.l  #1,d2
+
+e4d_not_clip:
+        ext.l   d0
+        beq.s   e4d_next_sample
+        addq.l  #1,d3
+        move.l  d0,d1
+        bpl.s   e4d_abs_ready
+        neg.l   d1
+
+e4d_abs_ready:
+        cmp.l   d4,d1
+        bls.s   e4d_next_sample
+        move.l  d1,d4
+
+e4d_next_sample:
+        subq.l  #1,d5
+        bne.s   e4d_scan_loop
+
+e4d_build:
+        ; Copy fixed template into writable BSS line buffer.
+        lea     e4d_line_template,a1
+        lea     e4d_line_buffer,a2
+        moveq   #49,d5                     ; 50 bytes incl. terminating NUL
+
+e4d_copy_template:
+        move.b  (a1)+,(a2)+
+        dbf     d5,e4d_copy_template
+
+        ; Fill frame, peak, nonzero and clip counters as 8-digit hex.
+        move.l  d7,d0
+        lea     e4d_line_buffer+6,a1
+        bsr.s   e4d_hex8
+        move.l  d4,d0
+        lea     e4d_line_buffer+17,a1
+        bsr.s   e4d_hex8
+        move.l  d3,d0
+        lea     e4d_line_buffer+29,a1
+        bsr.s   e4d_hex8
+        move.l  d2,d0
+        lea     e4d_line_buffer+41,a1
+        bsr.s   e4d_hex8
+
+        ; Use the proven N12 zero-terminated logger. FAST08 proved this
+        ; logger writes correctly to N79_TRACE during playback.
+        lea     e4d_line_buffer,a1
+        jsr     n12_log       ; n12_log
+
+e4d_done:
+        movem.l (sp)+,d0-d7/a0-a4
+        rts
+
+; D0=value, A1=8-byte destination. Preserves all registers.
+e4d_hex8:
+        movem.l d0-d2,-(sp)
+        moveq   #7,d2
+
+e4d_hex_loop:
+        rol.l   #4,d0
+        move.l  d0,d1
+        andi.w  #$000F,d1
+        cmpi.w  #9,d1
+        bls.s   e4d_hex_digit
+        addi.w  #7,d1
+
+e4d_hex_digit:
+        addi.w  #'0',d1
+        move.b  d1,(a1)+
+        dbf     d2,e4d_hex_loop
+        movem.l (sp)+,d0-d2
+        rts
+
+e4d_line_template:
+        dc.b    "E4D F=00000000 P=00000000 NZ=00000000 CL=00000000",0
+e4d_line_template_end:
+        even
+
+; ============================================================================
+; FASTIMDCT13_LOGUPDATE
+; Diagnostic-only tail trace. Playback code, MMAL PTS/DTS, decoder and host
+; behavior are unchanged from FAST10/FAST12.
+; Logged directly at the proven audio slot publication boundary, therefore all
+; values are live registers from the actual buffer about to be sent:
+;   F  = true cumulative decoded E-AC3 frame counter
+;   S  = audio slot (0/1)
+;   PH = submitted MMAL PTS high 32 bits
+;   PL = submitted MMAL PTS low 32 bits
+;   L  = PCM bytes in this submitted buffer
+; ============================================================================
+
+fast13_submit_trace_hook:
+        movem.l d0-d6/a1-a2,-(sp)
+        move.l  d5,d4                      ; preserve live PCM byte count for log
+        move.l  e4d_frame_counter,d6
+        cmpi.l  #1600,d6
+        bcs.w   fast13_state_done
+
+        ; One line per 16 E-AC3 frames (~512 ms), plus the true final frame.
+        cmpi.l  #1875,d6
+        beq.s   fast13_state_log
+        move.l  d6,d0
+        andi.l  #15,d0
+        bne.w   fast13_state_done
+
+fast13_state_log:
+        lea     fast13_line_template,a1
+        lea     fast13_line_buffer,a2
+        moveq   #62,d5                     ; 63 bytes incl. NUL
+fast13_copy_line:
+        move.b  (a1)+,(a2)+
+        dbf     d5,fast13_copy_line
+
+        move.l  d6,d0
+        lea     fast13_line_buffer+7,a1
+        bsr     e4d_hex8
+
+        move.l  d7,d0
+        lea     fast13_line_buffer+18,a1
+        bsr     e4d_hex8
+
+        move.l  d3,d0
+        lea     fast13_line_buffer+30,a1
+        bsr     e4d_hex8
+
+        move.l  d2,d0
+        lea     fast13_line_buffer+42,a1
+        bsr     e4d_hex8
+
+        move.l  d4,d0
+        lea     fast13_line_buffer+53,a1
+        bsr     e4d_hex8
+
+        lea     fast13_line_buffer,a1
+        jsr     n12_log       ; proven n12_log
+
+fast13_state_done:
+        movem.l (sp)+,d0-d6/a1-a2
+        move.l  d7,d0
+        lsl.l   #2,d0
+        lea     vpv135_slot_pts_lo,a0    ; original vpv135_slot_pts_lo
+        rts
+
+fast13_line_template:
+        dc.b    "R13S F=00000000 S=00000000 PH=00000000 PL=00000000 L=00000000",0
+fast13_line_template_end:
+        even
+
+; P32 carries the hardware-confirmed P31 VPr8 local-1 feed fix on top of
+; FAST13. Appended after all FAST13 HUNK4 data so existing FAST13 geometry stays fixed.
+p32_restore_vchiq_local_bits:
+        move.l  v12f_local_bits,port_query_index
+        rts
+        even
+
         section bvp_n29_audio_data,data
 n29_msg_audio_submit_timeout: dc.b "N79 AUDIO SLOT/TRANSPORT WAIT TIMEOUT",0
 n29_msg_audio_bulk_timeout:   dc.b "N79 AUDIO BULK_DONE TIMEOUT",0
@@ -69622,5 +70399,13 @@ n66_video_buffer:            ds.b $00040000
 
 BVPL_ModuleEnd:
         even
+
+; FAST04 diagnostics appended after the exact original HUNK8 footprint.
+e4d_frame_counter:
+        ds.l    1
+e4d_line_buffer:
+        ds.b    64
+fast13_line_buffer:
+        ds.b    80
 
         end

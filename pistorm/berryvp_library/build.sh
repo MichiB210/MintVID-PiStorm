@@ -16,7 +16,7 @@ vasmm68k_mot -m68000 -phxass -Fhunkexe -nosym -o "$TMP/raw.lib" "$HERE/berryvp.l
 if [ -f "$HERE/reloc_keep_order.txt" ]; then
   vasmm68k_mot -m68000 -phxass -Fhunkexe -o "$TMP/sym.lib" "$HERE/berryvp.library.s" >/dev/null 2>&1
   python3 "$HERE/tools/hunk_sort_relocs.py" "$TMP/raw.lib" "$OUT/berryvp.library" \
-    --keep-order "$TMP/sym.lib" $(grep -v '^#' "$HERE/reloc_keep_order.txt")
+    --keep-order "$TMP/sym.lib" $(grep -v "^#" "$HERE/reloc_keep_order.txt")
 else
   cp "$TMP/raw.lib" "$OUT/berryvp.library"
 fi
