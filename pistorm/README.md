@@ -67,6 +67,32 @@ Everything ends up in `pistorm/out/P32/`, and each file is compared against `P32
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
 
+## Playing and controls
+
+In MintVID, choose the display **PiStorm / VC Hard Fullscreen** and press
+Play. MintVID's **Pause** and **Stop** buttons work, like with the normal
+player.
+
+From the Shell:
+
+    mrberry <film.mkv|film.mp4|film.ts> [--start=H:MM:SS] [--no-audio]
+
+Keys while the film plays:
+
+| Key | Action |
+|---|---|
+| ESC or 0 | stop |
+| Space or P | pause / continue |
+| Cursor right / left | jump 10 s forward / back |
+| Cursor up / down | jump 60 s forward / back |
+
+- Jumps and `--start` work with MKV and MP4. TS files always play from the
+  start.
+- A jump restarts the VideoCore stream at the nearest keyframe before the
+  new time, so the picture goes away for a moment.
+- If the audio track cannot be played (not AAC, AC3 or stereo E-AC3), the
+  film plays without sound.
+
 ## Where the sources come from
 
 The PiStorm parts were developed by Michael with AI assistance (ChatGPT) between September and October 2026. For several stages only binaries were kept. Their source was reconstructed later, and every step was checked byte for byte against the binary of that time. See [`docs/SOURCE_RECONSTRUCTION.md`](docs/SOURCE_RECONSTRUCTION.md).
@@ -98,6 +124,11 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 - Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Sie sollten vor dem Einsatz auf der Hardware getestet werden.
 
 **Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` geht nichts. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+
+**Bedienung:** In MintVID die Anzeige **PiStorm / VC Hard Fullscreen** wählen.
+Pause und Stopp in MintVID funktionieren. Tasten: ESC = Stopp, Leertaste =
+Pause, Cursor rechts/links = 10 s vor/zurück, Cursor hoch/runter = 60 s.
+Springen und `--start=H:MM:SS` gehen bei MKV und MP4.
 
 **Installation:**
 1. Die sechs Dateien `MintVID`, `mrberry`, `berryvp.library` und die drei `.module`-Dateien in die MintVID-Schublade kopieren.

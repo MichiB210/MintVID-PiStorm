@@ -642,7 +642,7 @@ static void play_file(gt_app *app)
     read_options(app, &options);
     if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
         if (!mr_build_mrberry_arguments(args, sizeof(args), app->path) ||
-            !launch("mrberry", "MintVID Berry player", args))
+            !launch("mrberry", "MintVID player", args))
             set_info(app, "Could not start mrberry (keep it beside MintVID-GT).");
         else
             set_info(app, "Starting PiStorm VideoCore playback...");

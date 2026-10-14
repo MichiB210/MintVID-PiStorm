@@ -94,11 +94,16 @@ jobs:
               make -f Makefile.amiga all \
                 AMIGA_ROOT="$AMIGA_ROOT" \
                 SSL=1 SSLCERTS=1
+              # The PiStorm player. Built in its own directory so it does
+              # not touch the MintVID objects above.
+              CC="$AMIGA_GCC" DEBUG_LOGS=0 \
+                sh ../pistorm/mrberry/build.sh /tmp/mrberry
+              cp /tmp/mrberry/mrberry mrberry
             '
 
       - name: Confirm the programs were produced
         run: |
-          ls -la player/mrplay player/MintVID player/iptvgui player/ytgui \
+          ls -la player/mrplay player/MintVID player/iptvgui player/ytgui player/mrberry \
             player/MintVID-GT player/iptvgui-GT player/ytgui-GT player/mr_decode
           file player/mrplay player/MintVID player/iptvgui player/ytgui \
             player/MintVID-GT player/iptvgui-GT player/ytgui-GT player/mr_decode || true
@@ -116,6 +121,7 @@ jobs:
             player/iptvgui-GT
             player/ytgui-GT
             player/mr_decode
+            player/mrberry
           if-no-files-found: error
           retention-days: 14
 

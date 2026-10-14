@@ -364,9 +364,9 @@ static void stop_player_and_wait(void)
     int guard;
 
     /* mrplay deliberately uses Ctrl-F so AmigaDOS cannot abort it before
-     * cleanup.  The hardware-confirmed AC309J mrberry already handles
-     * Ctrl-C, so give the two backends distinct task names and stop each
-     * with its native signal.  This avoids changing the tested backend. */
+     * cleanup.  mrberry now runs as "MintVID player" too and also stops on
+     * Ctrl-F (and pauses on Ctrl-D, like mrplay).  The old task name is
+     * still checked so an older mrberry can be stopped with Ctrl-C. */
     Forbid();
     task = FindTask((STRPTR)"MintVID Berry player");
     if (task)
@@ -998,7 +998,7 @@ static void start_player_path(const char *full_file, Object *mode,
             NP_Seglist, seglist, NP_FreeSeglist, TRUE,
             NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
             NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
-            NP_Name, (ULONG)"MintVID Berry player", TAG_END);
+            NP_Name, (ULONG)"MintVID player", TAG_END);
         if (!process) {
             UnLoadSeg(seglist);
             set_info(info, window, "Could not create the mrberry process.");
