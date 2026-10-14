@@ -51082,12 +51082,25 @@ n79j_setup_sched_isp_renderer:
         move.l  #HDMI_V14_HVS_DLIST_PTR,a0
         jsr     load_le32
         move.l  d0,hdmi_v40o_hvs_saved
+        ; N80: without HDMI audio (no ConfigAudio) the Audio-Master clock
+        ; never runs, and a scheduler in the chain would hold every frame.
+        ; Tunnel decoder -> ISP directly; n66_service_pending_video then
+        ; paces AUs with the host frame grid because the graph is not
+        ; marked scheduler-ready.
+        tst.l   n73_clock_armed
+        beq.s   n80_n79j_direct
         ; Proven N79 graph helper: decoder -> scheduler -> ISP.
         jsr     vpv126_setup_scheduler_data_graph
         tst.l   d0
         bne.w   n79j_fail
         move.l  #1,n73_scheduler_graph_ready
         move.l  #1,vpv166_c_sched_feedahead
+        bra.s   n80_n79j_graph_ready
+n80_n79j_direct:
+        jsr     n80_setup_direct_isp_graph
+        tst.l   d0
+        bne.w   n79j_fail
+n80_n79j_graph_ready:
         move.l  v12a_isp_handle,n79j_isp_handle
         move.l  v12a_isp_input,n79j_isp_input
         move.l  v12a_isp_output,n79j_isp_output
@@ -66212,6 +66225,64 @@ vpv18_test_aac_end:
 ; mkvr7 - real VideoCore scheduler data path
 ; decoder OPQV -> scheduler OPQV -> ISP BGRA/P96
 ; ====================================================================
+; N80 - decoder.output -> ISP.input without a video_scheduler, for streams
+; that have no Audio-Master clock (no HDMI audio).  Same steps as
+; vpv126_setup_scheduler_data_graph minus the scheduler: connect, set the
+; ISP input peer requirements, enable decoder OUTPUT (which brings the
+; tunnelled ISP INPUT up), verify.  D0=0 ok, D0=1 failure.
+n80_setup_direct_isp_graph:
+        movem.l d1-d7/a0-a3,-(sp)
+        clr.l   vpv126_data_graph_ok
+        jsr     v12a_connect_ports
+        tst.l   d0
+        bne.w   n80_dg_fail
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n80_dg_fail
+        jsr     v12a_set_isp_requirements
+        tst.l   d0
+        bne.w   n80_dg_fail
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_decoder_output,output_port_handle
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n80_dg_fail
+        move.l  port_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n80_dg_num_ok
+        moveq   #2,d0
+n80_dg_num_ok:
+        move.l  d0,port_buf_num
+        jsr     port_enable_output_current
+        tst.l   d0
+        bne.w   n80_dg_fail
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n80_dg_fail
+        cmpi.l  #1,port_enabled
+        bne.w   n80_dg_fail
+        move.l  #1,vpv126_data_graph_ok
+        lea     n80_msg_direct_no_audio,a1
+        jsr     n12_log
+        moveq   #0,d0
+        bra.s   n80_dg_done
+n80_dg_fail:
+        lea     n80_msg_direct_fail,a1
+        jsr     n12_log
+        moveq   #1,d0
+n80_dg_done:
+        move.l  v12a_isp_handle,component_handle
+        movem.l (sp)+,d1-d7/a0-a3
+        rts
+
 vpv126_setup_scheduler_data_graph:
         movem.l d1-d7/a0-a3,-(sp)
         clr.l   vpv126_data_graph_ok
@@ -70263,6 +70334,7 @@ n73_msg_sched_graph_ready: dc.b "N79_SCHED_GRAPH_READY",0
 n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
+n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
 n80_pfx_reason: dc.b "N80 DEFER REASON (1=CLOCK 2=PACER 3=BULK 4=POOL 5=AUDIO)=",0
 n80_pfx_graph:  dc.b "N80 STATE SCHED_GRAPH=",0
 n80_pfx_clock:  dc.b "N80 STATE CLOCK_ARMED=",0
