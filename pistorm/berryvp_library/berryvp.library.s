@@ -50094,13 +50094,7 @@ v12b_dec_size_nonzero:
         ; decoder -> scheduler -> renderer path; only pad through the ISP.
         move.l  v12a_dec_crop_w,d0
         andi.l  #127,d0
-        bne.s   n79l_isp_padding
-        lea     n79l_msg_direct_aligned,a1
-        jsr     n12_log
-        bra.s   n79j_create_normal
-n79l_isp_padding:
-        lea     n79l_msg_isp_padding,a1
-        jsr     n12_log
+        beq.s   n79j_create_normal      ; N79M: no mid-setup log lines
         clr.l   v41_display_style
         bsr     v12a_create_isp
         move.l  #3,v41_display_style
@@ -66354,14 +66348,10 @@ mkvr7_cwait_not_owned:
 msg_mkvr7_cwait_expired:
         dc.b "[mkvr7fix][C-WATCH] 5s ohne H264 send/return Fortschritt; alter Detail-Watchdog uebernimmt.",10
 msg_mkvr7_cwait_expired_end:
-n79l_msg_direct_aligned:
-        dc.b "N79L_DIRECT_128ALIGNED",0
-n79l_msg_isp_padding:
-        dc.b "N79L_ISP_PADDING_PATH",0
 n79j_msg_graph_ready:
-        dc.b "N79L_ISP_FULL_VISIBLE_GRAPH_READY",0
+        dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_READY",0
 n79j_msg_graph_fail:
-        dc.b "N79L_ISP_FULL_VISIBLE_GRAPH_FAIL",0
+        dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_FAIL",0
         even
 
         section bss,bss
