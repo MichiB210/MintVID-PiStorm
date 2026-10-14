@@ -1385,7 +1385,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79O K-BASE POST-AUDIO ASPECT (02.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -6833,7 +6833,7 @@ v10g_first_verify_flags_ok:
         lea     msg_vpv21p_graph_before,a1
         move.l  #msg_vpv21p_graph_before_end-msg_vpv21p_graph_before,d3
         jsr     vpv21n_trace
-        jsr     v12a_setup_isp_graph
+        jsr     n79p_setup_graph_router
         tst.l   d0
         bne.w   vpv21p_graph_failed
         lea     msg_vpv21p_graph_after_ok,a1
@@ -43907,7 +43907,7 @@ v41g_second_verify_flags_ok:
         lea     msg_v12h_get_route,a1
         move.l  #msg_v12h_get_route_end-msg_v12h_get_route,d3
         jsr     print
-        jsr     v12a_setup_isp_graph
+        jsr     n79p_setup_graph_router
         tst.l   d0
         bne.w   v9f_fail_output_enable
         lea     msg_v12f_second_graph_ok,a1
@@ -47999,7 +47999,6 @@ n79j_out_par_den:          ds.l 1
 n79j_out_colorspace:       ds.l 1
 n79j_save_dec_handle:      ds.l 1
 n79j_save_dec_output:      ds.l 1
-n79n_isp_aspect_active:    ds.l 1  ; N79N: ISP path -> aspect-fit display region
 v12a_dec_buf_num:          ds.l 1
 v12a_dec_buf_size:         ds.l 1
 v12a_dec_w:                ds.l 1
@@ -49430,58 +49429,19 @@ hdmi_v40o_param_clear:
         jsr     store_le32
         lea     56(a2),a0
         moveq   #1,d0                   ; renderer owns full HDMI display region
-        tst.l   n79n_isp_aspect_active
-        beq.s   n79n_fullscreen_ready
-        moveq   #0,d0                   ; N79N: ISP path uses an explicit rect
-n79n_fullscreen_ready:
         jsr     store_le32
-        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen,
-        ; or (N79N, ISP path) the largest aspect-correct rect, centred.
-        move.l  hdmi_v40o_wb_width,d4
-        move.l  hdmi_v40o_wb_height,d5
-        moveq   #0,d6
-        moveq   #0,d7
-        tst.l   n79n_isp_aspect_active
-        beq.s   n79n_rect_ready
-        move.l  v12a_dec_crop_w,d1
-        move.l  v12a_dec_crop_h,d2
-        tst.l   d1
-        beq.s   n79n_rect_ready
-        tst.l   d2
-        beq.s   n79n_rect_ready
-        move.l  hdmi_v40o_wb_height,d0  ; width needed at full screen height
-        mulu.w  d1,d0
-        divu.w  d2,d0
-        andi.l  #$0000FFFF,d0
-        cmp.l   hdmi_v40o_wb_width,d0
-        bhi.s   n79n_fit_width
-        move.l  d0,d4                   ; pillarbox
-        move.l  hdmi_v40o_wb_width,d6
-        sub.l   d4,d6
-        lsr.l   #1,d6
-        bra.s   n79n_rect_ready
-n79n_fit_width:
-        move.l  hdmi_v40o_wb_width,d4   ; letterbox
-        move.l  hdmi_v40o_wb_width,d0
-        mulu.w  d2,d0
-        divu.w  d1,d0
-        andi.l  #$0000FFFF,d0
-        move.l  d0,d5
-        move.l  hdmi_v40o_wb_height,d7
-        sub.l   d5,d7
-        lsr.l   #1,d7
-n79n_rect_ready:
+        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen.
         lea     64(a2),a0
-        move.l  d6,d0
+        moveq   #0,d0
         jsr     store_le32
         lea     68(a2),a0
-        move.l  d7,d0
+        moveq   #0,d0
         jsr     store_le32
         lea     72(a2),a0
-        move.l  d4,d0
+        move.l  hdmi_v40o_wb_width,d0
         jsr     store_le32
         lea     76(a2),a0
-        move.l  d5,d0
+        move.l  hdmi_v40o_wb_height,d0
         jsr     store_le32
         lea     112(a2),a0
         move.l  #HDMI_V14_LAYER,d0
@@ -49766,6 +49726,645 @@ v12a_req_done:
 
 ; Main graph setup. Returns with decoder in component_handle and ISP output in
 ; output_port_handle/output_component_handle. Host output geometry is small.
+; ====================================================================
+; N79P full-path router.  Library C mode with a 128-aligned decoder width
+; uses the original direct N79 graph (decoder -> scheduler -> renderer);
+; every other case uses the N79K ISP graph below.
+; ====================================================================
+n79p_setup_graph_router:
+        tst.l   bvp_library_mode
+        beq.s   n79p_router_k
+        cmpi.l  #3,v41_display_style
+        bne.s   n79p_router_k
+        move.l  v12a_dec_crop_w,d0
+        andi.l  #127,d0
+        bne.s   n79p_router_k
+        jmp     n79p_direct_setup_graph
+n79p_router_k:
+        jmp     v12a_setup_isp_graph
+
+; N79P: unchanged N79 direct graph setup (copy, labels prefixed n79p_d_).
+n79p_direct_setup_graph:
+        movem.l d1-d7/a0-a3,-(sp)
+        ; VPv126: every fresh MMAL graph/service receives a fresh scheduler.
+        ; Never carry VideoCore component handles across a service restart.
+        clr.l   vpv117_sched_handle
+        clr.l   vpv117_sched_inputs
+        clr.l   vpv117_sched_outputs
+        clr.l   vpv117_sched_clocks
+        clr.l   vpv117_sched_input0
+        clr.l   vpv117_sched_output0
+        clr.l   vpv117_sched_clock0
+        clr.l   vpv126_data_graph_ok
+        clr.l   vpv166_c_sched_feedahead
+        clr.l   vpv179_mkv_c_fast_active
+        clr.l   vpv179_mkv_c_fast_fallbacks
+        clr.l   vpv179_mkv_video_pts_valid
+        clr.l   vpv179_mkv_video_pts_lo
+        clr.l   vpv179_mkv_video_pts_hi
+        clr.l   vpv179_mkv_pts_attached
+        clr.l   vpv126_sched_clock_armed
+        clr.l   vpv126_sched_component_enabled
+        clr.l   vpv128_sched_started_early
+        clr.l   vpv126_scheduler_feed_aus
+        clr.l   vpv129_audio_master_gate_uses
+        clr.l   vpv129_audio_master_start_publishes
+        clr.l   vpv129_audio_master_start_misses
+        clr.l   vpv130_stop_transport_polls
+        clr.l   vpv130_stop_transport_logged
+        clr.l   vpv130_stop_bulk_done_logged
+        ; VPv131: scheduler-output PTS vs actual P96 presentation wall-clock.
+        clr.l   vpv131_schedwall_started
+        clr.l   vpv131_schedwall_frames
+        clr.l   vpv131_schedwall_invalid
+        clr.l   vpv131_schedwall_nonmono
+        clr.l   vpv131_schedwall_first_pts
+        clr.l   vpv131_schedwall_last_pts
+        clr.l   vpv131_schedwall_first_wall
+        clr.l   vpv131_schedwall_last_wall
+        clr.l   vpv131_schedwall_wall_elapsed
+        clr.l   vpv131_schedwall_pts_elapsed
+        clr.l   vpv131_schedwall_last_drift
+        clr.l   vpv131_schedwall_min_drift
+        clr.l   vpv131_schedwall_max_drift
+        clr.l   vpv131_schedwall_step_min
+        clr.l   vpv131_schedwall_step_max
+        clr.l   vpv134_pts_immediate_snapshots
+        clr.l   vpv134_pts_deferred_snapshots
+        clr.l   vpv134_pts_deferred_restores
+        clr.l   vpv134_pts_scratch_mismatches
+        ; VPv136: video pipeline stage timing.
+        clr.l   vpv136_header_wall_now
+        clr.l   vpv136_deferred_depth_max
+        clr.l   vpv136_stage_started
+        clr.l   vpv136_stage_frames
+        clr.l   vpv136_stage_invalid
+        clr.l   vpv136_stage_first_pts
+        clr.l   vpv136_stage_first_header_wall
+        clr.l   vpv136_stage_last_header_wall
+        clr.l   vpv136_stage_header_elapsed
+        clr.l   vpv136_stage_pts_elapsed
+        clr.l   vpv136_stage_header_drift
+        clr.l   vpv136_stage_header_drift_min
+        clr.l   vpv136_stage_header_drift_max
+        clr.l   vpv136_stage_h2b_last
+        clr.l   vpv136_stage_h2b_min
+        clr.l   vpv136_stage_h2b_max
+        clr.l   vpv136_stage_b2p_last
+        clr.l   vpv136_stage_b2p_min
+        clr.l   vpv136_stage_b2p_max
+        clr.l   vpv126_saved_isp_handle
+        clr.l   vpv126_saved_isp_input
+        clr.l   vpv126_saved_dec_handle
+        clr.l   vpv126_saved_dec_output
+        move.l  #1,v12a_local_get_active
+        move.l  component_handle,v12a_decoder_handle
+        move.l  input_port_handle,v12a_saved_input_handle
+        move.l  output_port_handle,v12a_decoder_output
+
+        ; Snapshot decoder output, deliberately WITHOUT the old 640x480 DMA cap.
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_decoder_output,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_type,d0
+        cmp.l   #MMAL_ES_VIDEO,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_encoding,d0
+        cmp.l   #MMAL_ENCODING_I420,d0
+        bne.w   n79p_d_v12a_setup_fail
+        ; N16: snapshot firmware decoder OUTPUT requirements before OPQV.
+        move.l  port_fmt_encoding,d0
+        lea     n15_pfx_out_pre_enc,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num_min,d0
+        lea     n15_pfx_out_pre_min_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num_rec,d0
+        lea     n15_pfx_out_pre_rec_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num,d0
+        lea     n15_pfx_out_pre_cur_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size_min,d0
+        lea     n15_pfx_out_pre_min_size,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size_rec,d0
+        lea     n15_pfx_out_pre_rec_size,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size,d0
+        lea     n15_pfx_out_pre_cur_size,a1
+        jsr     n15_log_hex32
+
+        move.l  port_buf_num,v12a_dec_buf_num
+        move.l  port_buf_size,v12a_dec_buf_size
+        move.l  port_video_width,v12a_dec_w
+        move.l  port_video_height,v12a_dec_h
+        move.l  port_crop_x,v12a_dec_crop_x
+        move.l  port_crop_y,v12a_dec_crop_y
+        move.l  port_crop_width,v12a_dec_crop_w
+        move.l  port_crop_height,v12a_dec_crop_h
+        move.l  port_fps_num,v12a_dec_fps_num
+        move.l  port_fps_den,v12a_dec_fps_den
+        move.l  port_par_num,v12a_dec_par_num
+        move.l  port_par_den,v12a_dec_par_den
+        move.l  port_color_space,v12a_dec_colorspace
+
+        ; HDMI_v41L: no size is changed while a movie is running.  The user
+        ; chooses the fixed ISP preset in the Intuition window BEFORE the ISP
+        ; graph is created.  Until then no target geometry is committed.
+        move.l  port_buf_size,output_buf_size_saved
+        move.l  port_video_width,output_width_saved
+        move.l  port_video_height,output_height_saved
+        move.l  port_crop_x,output_crop_x_saved
+        move.l  port_crop_y,output_crop_y_saved
+        move.l  port_crop_width,output_crop_w_saved
+        move.l  port_crop_height,output_crop_h_saved
+        clr.l   v32_fixed_mode
+
+        ; HDMI_v41L: capture the live VideoCore.card/P96 framebuffer before
+        ; any video component can touch HVS. The renderer-free path writes
+        ; only into this normal Amiga/RTG framebuffer.
+        cmpi.l  #203,v40j_cli_mode
+        bne.s   n79p_d_vpv98_c_before_capture_done
+        lea     msg_vpv98_c_graph_enter,a1
+        move.l  #msg_vpv98_c_graph_enter_end-msg_vpv98_c_graph_enter,d3
+        jsr     vpv21n_trace
+n79p_d_vpv98_c_before_capture_done:
+        jsr     hdmi_v40o_capture_wb_fb
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        cmpi.l  #203,v40j_cli_mode
+        bne.s   n79p_d_vpv98_c_capture_ok_done
+        lea     msg_vpv98_c_capture_ok,a1
+        move.l  #msg_vpv98_c_capture_ok_end-msg_vpv98_c_capture_ok,d3
+        jsr     vpv21n_trace
+n79p_d_vpv98_c_capture_ok_done:
+
+        ; V41L C: choose cinema window style before the very first OpenWindow,
+        ; so direct cinema does not flash the small normal P96 window first.
+        cmpi.l  #202,v40j_cli_mode
+        beq.s   n79p_d_n79p96_preopen_fullfront_style
+        cmpi.l  #203,v40j_cli_mode
+        bne.s   n79p_d_v41l_preopen_normal_style
+        move.l  #3,v41_display_style
+        bra.s   n79p_d_v41l_preopen_style_ready
+n79p_d_n79p96_preopen_fullfront_style:
+        move.l  #2,v41_display_style
+        bra.s   n79p_d_v41l_preopen_style_ready
+n79p_d_v41l_preopen_normal_style:
+        clr.l   v41_display_style
+n79p_d_v41l_preopen_style_ready:
+        ; N65 isolation: berryvp.library has no Intuition movie/event window.
+        ; Workbench itself remains open.  video_render still receives the exact
+        ; VPr8 DISPLAYREGION (Layer 10, Alpha 0x200000FF) later in graph setup.
+        ; N79P96 diagnostic: unlike normal N79, library mode needs the real
+        ; borderless Intuition/P96 surface.  Other library display modes keep
+        ; the original no-window behaviour.
+        tst.l   bvp_library_mode
+        beq.s   n79p_d_n79p96_open_movie_window
+        cmpi.l  #202,v40j_cli_mode
+        bne.s   n79p_d_vpv98_c_window_ok_done
+n79p_d_n79p96_open_movie_window:
+        jsr     hdmi_v40o_open_window
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        cmpi.l  #203,v40j_cli_mode
+        bne.s   n79p_d_vpv98_c_window_ok_done
+        lea     msg_vpv98_c_window_ok,a1
+        move.l  #msg_vpv98_c_window_ok_end-msg_vpv98_c_window_ok,d3
+        jsr     vpv21n_trace
+n79p_d_vpv98_c_window_ok_done:
+
+        ; V40: select the fixed VideoCore-ISP size now, before decoder OUTPUT
+        ; is switched to OPQV and before ril.isp exists.  This is the core
+        ; safety difference from v25/v30: the graph never changes mid-stream.
+        jsr     v32_wait_initial_mode
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        cmpi.l  #203,v40j_cli_mode
+        bne.s   n79p_d_vpv98_c_selector_ok_done
+        lea     msg_vpv98_c_selector_ok,a1
+        move.l  #msg_vpv98_c_selector_ok_end-msg_vpv98_c_selector_ok,d3
+        jsr     vpv21n_trace
+n79p_d_vpv98_c_selector_ok_done:
+
+        lea     msg_v12a_target,a1
+        move.l  #msg_v12a_target_end-msg_v12a_target,d3
+        jsr     print
+        move.l  v12a_dec_crop_w,d0
+        jsr     print_hex32
+        lea     msg_x,a1
+        moveq   #1,d3
+        jsr     print
+        move.l  v12a_dec_crop_h,d0
+        jsr     print_hex32
+        lea     msg_v12a_arrow,a1
+        move.l  #msg_v12a_arrow_end-msg_v12a_arrow,d3
+        jsr     print
+        move.l  v12a_target_w,d0
+        jsr     print_hex32
+        lea     msg_x,a1
+        moveq   #1,d3
+        jsr     print
+        move.l  v12a_target_h,d0
+        jsr     print_hex32
+        jsr     newline
+
+        ; V12D: keep the full 1080p frame inside VideoCore.  The V12A
+        ; I420 tunnel still described each connected buffer as a 0x2FD000-byte
+        ; 1080p surface.  With only 32 MiB VC memory this can exhaust the
+        ; firmware heap as soon as the decoder allocates its reference frames.
+        ; The MMAL decoder supports OPQV output, and ril.isp supports OPQV input.
+        ; Commit OPQV first, re-read its small buffer requirements, then commit
+        ; the firmware MINIMUM header count before making the tunnel.
+        move.l  v12a_decoder_handle,component_handle
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_decoder_output,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_OPAQUE,port_fmt_encoding
+        clr.l   port_fmt_variant
+        clr.l   port_fmt_extra
+        move.l  port_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n79p_d_v12b_dec_opaque_first_num_ok
+        moveq   #2,d0
+n79p_d_v12b_dec_opaque_first_num_ok:
+        move.l  d0,port_buf_num
+        ; First format commit may still carry the old I420 buffer_size.  No
+        ; buffers are allocated yet; the following GET reveals OPQV minima.
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        clr.l   v12c_local_set_active
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_decoder_output,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_encoding,d0
+        cmp.l   #MMAL_ENCODING_OPAQUE,d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; V12D: use the decoder's MINIMUM opaque header count, not the
+        ; recommended count.  This firmware reports min=3, recommended=10 at
+        ; 1080p.  The official MMAL decoder example likewise uses buffer_num_min.
+        ; Keeping ten OPQV surfaces is a prime ENOSPC suspect with only 32 MiB
+        ; VideoCore memory.  Never go below the firmware-declared minimum.
+        move.l  port_buf_num_min,d0
+        cmpi.l  #2,d0
+        bcc.s   n79p_d_v12b_dec_num_two_ok
+        moveq   #2,d0
+n79p_d_v12b_dec_num_two_ok:
+        move.l  d0,port_buf_num
+
+        move.l  port_buf_size_min,d0
+        cmp.l   port_buf_size_rec,d0
+        bcc.s   n79p_d_v12b_dec_size_rec_ok
+        move.l  port_buf_size_rec,d0
+n79p_d_v12b_dec_size_rec_ok:
+        tst.l   d0
+        bne.s   n79p_d_v12b_dec_size_nonzero
+        move.l  #128,d0
+n79p_d_v12b_dec_size_nonzero:
+        move.l  d0,port_buf_size
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        clr.l   v12c_local_set_active
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_encoding,d0
+        cmp.l   #MMAL_ENCODING_OPAQUE,d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; N16: exact lazy-allocation contract that is live when first AU arrives.
+        move.l  port_fmt_encoding,d0
+        lea     n15_pfx_out_opq_enc,a1
+        jsr     n15_log_hex32
+        move.l  port_fmt_variant,d0
+        lea     n15_pfx_out_opq_var,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num_min,d0
+        lea     n15_pfx_out_opq_min_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num_rec,d0
+        lea     n15_pfx_out_opq_rec_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_num,d0
+        lea     n15_pfx_out_opq_cur_num,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size_min,d0
+        lea     n15_pfx_out_opq_min_size,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size_rec,d0
+        lea     n15_pfx_out_opq_rec_size,a1
+        jsr     n15_log_hex32
+        move.l  port_buf_size,d0
+        lea     n15_pfx_out_opq_cur_size,a1
+        jsr     n15_log_hex32
+
+        ; V12D: OPQV carries the underlying pixel format in variant.
+        ; Hardware returned I420 ($30323449) here; ISP input must receive
+        ; the same variant instead of zero or it rejects PORT_INFO_SET/EINVAL.
+        move.l  port_fmt_variant,v12c_dec_variant
+        move.l  port_buf_num,v12a_dec_buf_num
+        move.l  port_buf_size,v12a_dec_buf_size
+        lea     msg_v12b_decoder_opaque,a1
+        move.l  #msg_v12b_decoder_opaque_end-msg_v12b_decoder_opaque,d3
+        jsr     print
+        move.l  v12a_dec_buf_num,d0
+        jsr     print_hex32
+        lea     msg_slash,a1
+        moveq   #1,d3
+        jsr     print
+        move.l  v12a_dec_buf_size,d0
+        jsr     print_hex32
+        jsr     newline
+
+        bsr     v12a_create_isp
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        cmpi.l  #3,v41_display_style
+        bne.s   n79p_d_v41b_setup_continue_isp
+        lea     msg_vpv98_c_renderer_created,a1
+        move.l  #msg_vpv98_c_renderer_created_end-msg_vpv98_c_renderer_created,d3
+        jsr     vpv21n_trace
+        jsr     v41b_setup_renderer_after_create
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        lea     msg_vpv98_c_renderer_ready,a1
+        move.l  #msg_vpv98_c_renderer_ready_end-msg_vpv98_c_renderer_ready,d3
+        jsr     vpv21n_trace
+        moveq   #0,d0
+        bra.w   n79p_d_v12a_setup_done
+n79p_d_v41b_setup_continue_isp:
+
+        ; ISP INPUT 0 = decoder full-size OPQV (opaque VideoCore frame handle).
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,v12a_isp_input
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_OPAQUE,port_fmt_encoding
+        move.l  v12c_dec_variant,port_fmt_variant
+        clr.l   port_fmt_bitrate
+        clr.l   port_fmt_flags
+        clr.l   port_fmt_extra
+        move.l  v12a_dec_w,port_video_width
+        move.l  v12a_dec_h,port_video_height
+        move.l  v12a_dec_crop_x,port_crop_x
+        move.l  v12a_dec_crop_y,port_crop_y
+        move.l  v12a_dec_crop_w,port_crop_width
+        move.l  v12a_dec_crop_h,port_crop_height
+        move.l  v12a_dec_fps_num,port_fps_num
+        move.l  v12a_dec_fps_den,port_fps_den
+        move.l  v12a_dec_par_num,port_par_num
+        move.l  v12a_dec_par_den,port_par_den
+        move.l  v12a_dec_colorspace,port_color_space
+        move.l  v12a_dec_buf_size,port_buf_size
+        move.l  v12a_dec_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n79p_d_v12a_in_num_ok
+        moveq   #2,d0
+n79p_d_v12a_in_num_ok:
+        move.l  d0,port_buf_num
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        clr.l   v12c_local_set_active
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_isp_input,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_encoding,d0
+        cmp.l   #MMAL_ENCODING_OPAQUE,d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; HDMI_v41L: ISP OUTPUT 0 = small aspect-correct BGR24. VideoCore does YUV->RGB.
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,v12a_isp_output
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_BGR24,port_fmt_encoding
+        clr.l   port_fmt_variant
+        clr.l   port_fmt_bitrate
+        clr.l   port_fmt_flags
+        clr.l   port_fmt_extra
+        move.l  v12a_target_aw,port_video_width
+        move.l  v12a_target_ah,port_video_height
+        clr.l   port_crop_x
+        clr.l   port_crop_y
+        move.l  v12a_target_w,port_crop_width
+        move.l  v12a_target_h,port_crop_height
+        move.l  v12a_dec_fps_num,port_fps_num
+        move.l  v12a_dec_fps_den,port_fps_den
+        moveq   #1,d0
+        move.l  d0,port_par_num
+        move.l  d0,port_par_den
+        move.l  v12a_dec_colorspace,port_color_space
+        moveq   #2,d0
+        move.l  d0,port_buf_num
+        move.l  v12a_target_aw,d0
+        move.l  v12a_target_ah,d1
+        mulu.w  d1,d0
+        move.l  d0,d1
+        add.l   d0,d0
+        add.l   d1,d0                    ; BGR24: 3 bytes/pixel
+        move.l  d0,port_buf_size
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        clr.l   v12c_local_set_active
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_isp_output,d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_fmt_encoding,d0
+        cmp.l   #MMAL_ENCODING_BGR24,d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; mkvr7 SAFE RESTORE:
+        ; Matroska H264 input still uses the hardware-proven VPv102 framing and
+        ; currently carries MMAL_TIME_UNKNOWN into MMAL.  A real video_scheduler
+        ; data path must not be inserted until MKV PTS are attached to every
+        ; VIDEO AU.  Keep the proven direct decoder OPQV -> ISP tunnel here.
+        ;
+        ; This deliberately restores VPv102 P96 playback semantics while
+        ; retaining the later common-core fixes (async FAAD, cleanup/restart,
+        ; and VPv174 nonblocking P96 layer handling).
+        bsr     v12a_connect_ports
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; Apply peer input requirements before enabling connected decoder output.
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_last_handle,d0
+        cmp.l   v12a_isp_input,d0
+        bne.w   n79p_d_v12a_setup_fail
+        bsr     v12a_set_isp_requirements
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; Enable decoder OUTPUT; connected ISP INPUT comes up through the tunnel.
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_decoder_output,output_port_handle
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_buf_num,d0
+        cmpi.l  #2,d0
+        bcc.s   n79p_d_vpv176_mkv_dec_out_num_ok
+        moveq   #2,d0
+n79p_d_vpv176_mkv_dec_out_num_ok:
+        move.l  d0,port_buf_num
+        jsr     port_enable_output_current
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; Verify ISP INPUT was enabled by the direct VideoCore tunnel.
+        move.l  v12a_isp_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        cmpi.l  #1,port_enabled
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; Enable host-facing ISP output with exactly two small buffers.
+        move.l  v12a_isp_output,output_port_handle
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        moveq   #2,d0
+        move.l  d0,port_buf_num
+        move.l  d0,v10j_output_req_count
+        jsr     port_enable_output_current
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  #MMAL_PORT_OUTPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+        move.l  port_enabled,d0
+        cmpi.l  #1,d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; ISP is a real component and must be enabled too.
+        jsr     component_enable_worker
+        tst.l   d0
+        bne.w   n79p_d_v12a_setup_fail
+
+        ; Save only the SMALL ISP output for existing host/HAM6 code.
+        move.l  v12a_isp_handle,output_component_handle
+        move.l  v12a_isp_output,output_port_handle
+        move.l  port_buf_size,output_buf_size_saved
+        move.l  port_video_width,output_width_saved
+        move.l  port_video_height,output_height_saved
+        move.l  port_crop_x,output_crop_x_saved
+        move.l  port_crop_y,output_crop_y_saved
+        move.l  port_crop_width,output_crop_w_saved
+        move.l  port_crop_height,output_crop_h_saved
+        move.l  output_width_saved,d0
+        move.l  output_height_saved,d1
+        mulu.w  d1,d0
+        move.l  d0,d1
+        add.l   d0,d0
+        add.l   d1,d0                    ; BGR24: aligned width*height*3
+        move.l  d0,output_frame_bytes_expected
+        cmp.l   output_buf_size_saved,d0
+        bhi.w   n79p_d_v12a_setup_fail
+
+        ; V40: the chosen size is now final for this playback.  Resize the
+        ; Intuition window exactly once to surround the fixed ISP crop.
+        jsr     v32f_resize_window_fixed
+
+        ; Restore decoder as the input-side component for H264/EOS messages.
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_saved_input_handle,input_port_handle
+
+        lea     msg_v12a_graph_ok,a1
+        move.l  #msg_v12a_graph_ok_end-msg_v12a_graph_ok,d3
+        jsr     print
+        move.l  output_width_saved,d0
+        jsr     print_hex32
+        lea     msg_x,a1
+        moveq   #1,d3
+        jsr     print
+        move.l  output_height_saved,d0
+        jsr     print_hex32
+        lea     msg_crop,a1
+        move.l  #msg_crop_end-msg_crop,d3
+        jsr     print
+        move.l  output_crop_w_saved,d0
+        jsr     print_hex32
+        lea     msg_x,a1
+        moveq   #1,d3
+        jsr     print
+        move.l  output_crop_h_saved,d0
+        jsr     print_hex32
+        jsr     newline
+        moveq   #0,d0
+        bra.s   n79p_d_v12a_setup_done
+n79p_d_v12a_setup_fail:
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_saved_input_handle,input_port_handle
+        lea     msg_v12a_graph_fail,a1
+        move.l  #msg_v12a_graph_fail_end-msg_v12a_graph_fail,d3
+        jsr     print
+        moveq   #1,d0
+n79p_d_v12a_setup_done:
+        clr.l   v12a_local_get_active
+        movem.l (sp)+,d1-d7/a0-a3
+        rts
+
 v12a_setup_isp_graph:
         movem.l d1-d7/a0-a3,-(sp)
         ; VPv126: every fresh MMAL graph/service receives a fresh scheduler.
@@ -50541,9 +51140,7 @@ n79j_rin_num_ok:
         bne.w   n79j_fail
         cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
         bne.w   n79j_fail
-        ; Renderer visible; N79O: the aspect region is applied only after the
-        ; audio clock is armed (see n74_ca_clock_ready), so start full-screen.
-        clr.l   n79n_isp_aspect_active
+        ; Renderer visible, display region as for the direct C path.
         clr.l   v41b_renderer_reveal_pending
         move.l  #1,v41b_renderer_visible
         bsr     hdmi_v40o_set_displayregion
@@ -67170,15 +67767,6 @@ n74_ca_clock_ready:
         jsr     n12_log
         lea     n11_name_ready,a1
         jsr     n12_log
-        ; N79O: once audio runs, re-apply the display region with the
-        ; aspect-correct rect if the ISP widened the visible surface.
-        move.l  n79j_out_crop_w,d0
-        cmp.l   v12a_dec_crop_w,d0
-        beq.s   n79o_aspect_done
-        move.l  #1,n79n_isp_aspect_active
-        jsr     hdmi_v40o_set_displayregion
-        clr.l   n79n_isp_aspect_active
-n79o_aspect_done:
         lea     n19_msg_quiet_live,a1
         jsr     n12_log
         lea     n9_msg_ca_ready,a1
