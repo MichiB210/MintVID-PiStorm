@@ -219,6 +219,7 @@ BVP_OS_Open:
         clr.l   n69_dispatch_audio_calls
         clr.l   n69_dispatch_failures
         clr.l   n79_first_video_trace_state
+        clr.l   n79p96g_audio_trace_state
         clr.l   n70_early_due_count
         clr.l   n70_late_due_count
         clr.l   n70_early_lead_max_us
@@ -683,6 +684,7 @@ bvp_bi_start:
         clr.l   v10b_input_is_mkv
         clr.l   v10_timecode_scale
         clr.l   v10_first_pts_found
+        ; N79P96 diagnostic: start berryvp.library in VPr8 P96 full-front window mode.
         move.l  #203,v40j_cli_mode
         move.l  #3,v41_display_style
         move.l  #1,bvp_library_mode
@@ -918,6 +920,10 @@ bvp_wait_video_submit_ready:
 bvp_wvsr_check_now:
         tst.l   input_bulk_pending
         bne.s   bvp_wvsr_need_poll
+        ; N79P96G: direct-HVS N79 had no host BULK_RX, but P96 does.
+        ; Match the proven mkvr7 rule: active output RX blocks any new TX.
+        tst.l   output_bulk_queued
+        bne.s   bvp_wvsr_need_poll
         move.l  input_in_use_count,d0
         cmpi.l  #INPUT_POOL_COUNT,d0
         bcs.s   bvp_wvsr_ok
@@ -947,6 +953,8 @@ bvp_wvsr_poll:
         bne.w   bvp_wvsr_fail_backend
         tst.l   input_bulk_pending
         bne.s   bvp_wvsr_more
+        tst.l   output_bulk_queued
+        bne.s   bvp_wvsr_more
         move.l  input_in_use_count,d0
         cmpi.l  #INPUT_POOL_COUNT,d0
         bcs.s   bvp_wvsr_ok
@@ -955,6 +963,8 @@ bvp_wvsr_more:
         bra.s   bvp_wvsr_tick
 bvp_wvsr_no_msg:
         tst.l   input_bulk_pending
+        bne.s   bvp_wvsr_not_ready
+        tst.l   output_bulk_queued
         bne.s   bvp_wvsr_not_ready
         move.l  input_in_use_count,d0
         cmpi.l  #INPUT_POOL_COUNT,d0
@@ -1171,6 +1181,12 @@ n13_rx_bth_check_output:
         bra.w   n13_rx_bth_other
 
 n13_rx_bth_audio:
+        cmpi.l  #5,n79p96g_audio_trace_state
+        bne.s   n79p96g_bth_a06_done
+        lea     n79p96g_a06,a1
+        jsr     n12_log
+        move.l  #6,n79p96g_audio_trace_state
+n79p96g_bth_a06_done:
         lea     n13_msg_rx_bth_audio,a1
         jsr     n12_log
         bra.w   n13_rx_done
@@ -13062,7 +13078,19 @@ h19_queue_bulk_rx:
         moveq   #0,d0
         move.l  d0,VCHIQ_BELL2
 h19_after_rx_bell:
-        ; Return directly to polling. Shared VCHIQ RAM is DMA-owned.
+        ; N79P96E library P96 path: return to the bounded API dispatcher.
+        ; Standalone player retains its historical tail-enter into h19_poll.
+        tst.l   bvp_library_mode
+        beq.s   n79p96c_rx_player_poll
+        cmpi.l  #202,v40j_cli_mode
+        bne.s   n79p96c_rx_player_poll
+        ; N79P96G: h19_queue_bulk_rx called dma_pre_all before ringing VC.
+        ; Public library calls must never return with the shared VCHIQ block
+        ; still DMA-owned.  The separate output pagelist/data DMA remains live.
+        jsr     dma_post_all
+        moveq   #0,d0
+        rts
+n79p96c_rx_player_poll:
         bra.w   h19_poll
 
 ; VPv174 - central streaming watchdog reload.
@@ -13182,9 +13210,62 @@ h264rgb2_empty_terminal:
 h31s_no_empty_requeue:
 
         tst.l   bvp_library_mode
-        beq.s   bvp_h19_consume_legacy
+        beq.w   bvp_h19_consume_legacy
+        cmpi.l  #202,v40j_cli_mode
+        beq.w   n79p96c_library_output_maint
         moveq   #0,d0
         rts
+
+; N79P96G: dedicated library-mode P96 output maintenance.
+; Do not enter the standalone h19_poll/h25 feeder.  The public BerryVP API
+; owns compressed input; here we only recycle/display host-facing ISP output.
+;
+; E fairness rule: after one host P96 BULK_RX completes, do NOT immediately
+; chain the next deferred frame when MintVID already has Audio or Video work
+; waiting.  Return transport ownership to the library dispatcher for exactly
+; one TX turn.  The following TX completion may launch the next deferred RX.
+; RX/TX therefore remain fully serialized (the D/mkvr7 safety rule stays).
+n79p96c_library_output_maint:
+        tst.l   output_bulk_done
+        beq.s   n79p96c_try_deferred
+        clr.l   output_bulk_done
+        clr.l   output_buffer_seen
+        clr.l   output_bulk_queued
+
+        tst.l   output_eos_seen
+        bne.s   n79p96c_recycle_done
+        tst.l   v32_resize_pending
+        bne.s   n79p96c_hold_current
+        move.l  output_current_idx,d0
+        bsr     h61_queue_output_idx
+        tst.l   d0
+        bne.w   h22_requeue_fail
+        bra.s   n79p96c_recycle_done
+n79p96c_hold_current:
+        addq.l  #1,v32_resize_held
+n79p96c_recycle_done:
+        clr.l   output_current_eos
+
+        ; N79P96G: a completed host RX opens one serialized TX window.
+        ; Audio has first claim below in n66; otherwise pending Video may run.
+        tst.l   n65_audio_pending
+        bne.s   n79p96c_library_done
+        tst.l   n66_video_pending
+        bne.s   n79p96c_library_done
+
+n79p96c_try_deferred:
+        tst.l   output_deferred_count
+        beq.s   n79p96c_library_done
+        tst.l   input_bulk_pending
+        bne.s   n79p96c_library_done
+        tst.l   vpv39_audio_bulk_pending
+        bne.s   n79p96c_library_done
+        bra.w   vpv183_pop_deferred_output
+
+n79p96c_library_done:
+        moveq   #0,d0
+        rts
+
 bvp_h19_consume_legacy:
 
         ; mkvr7: if an MKV output header waited behind VIDEO/AUDIO BULK_TX,
@@ -49320,27 +49401,37 @@ hdmi_v40o_param_clear:
         move.l  #84,d0
         jsr     store_le32
         lea     48(a2),a0
-        move.l  #HDMI_V14_DISPLAY_SET,d0
+        move.l  #HDMI_V14_DISPLAY_SET-2,d0 ; N79H: no FULLSCREEN in set mask
         jsr     store_le32
         ; +52 display_num = 1, explicitly selected by DISPLAY_SET_NUM.
         lea     52(a2),a0
         move.l  #HDMI_V18_DISPLAY_NUM,d0
         jsr     store_le32
         lea     56(a2),a0
-        moveq   #1,d0                   ; renderer owns full HDMI display region
+        moveq   #0,d0                   ; N79H: fullscreen = FALSE
         jsr     store_le32
-        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen.
+        ; N79H: dest_rect = native visible video size, centred on the screen.
         lea     64(a2),a0
+        move.l  hdmi_v40o_wb_width,d0
+        sub.l   v12a_dec_crop_w,d0
+        bpl.s   n79h_dest_x_ok
         moveq   #0,d0
+n79h_dest_x_ok:
+        lsr.l   #1,d0
         jsr     store_le32
         lea     68(a2),a0
+        move.l  hdmi_v40o_wb_height,d0
+        sub.l   v12a_dec_crop_h,d0
+        bpl.s   n79h_dest_y_ok
         moveq   #0,d0
+n79h_dest_y_ok:
+        lsr.l   #1,d0
         jsr     store_le32
         lea     72(a2),a0
-        move.l  hdmi_v40o_wb_width,d0
+        move.l  v12a_dec_crop_w,d0
         jsr     store_le32
         lea     76(a2),a0
-        move.l  hdmi_v40o_wb_height,d0
+        move.l  v12a_dec_crop_h,d0
         jsr     store_le32
         lea     112(a2),a0
         move.l  #HDMI_V14_LAYER,d0
@@ -49788,9 +49879,14 @@ vpv98_c_capture_ok_done:
 
         ; V41L C: choose cinema window style before the very first OpenWindow,
         ; so direct cinema does not flash the small normal P96 window first.
+        cmpi.l  #202,v40j_cli_mode
+        beq.s   n79p96_preopen_fullfront_style
         cmpi.l  #203,v40j_cli_mode
         bne.s   v41l_preopen_normal_style
         move.l  #3,v41_display_style
+        bra.s   v41l_preopen_style_ready
+n79p96_preopen_fullfront_style:
+        move.l  #2,v41_display_style
         bra.s   v41l_preopen_style_ready
 v41l_preopen_normal_style:
         clr.l   v41_display_style
@@ -49798,9 +49894,14 @@ v41l_preopen_style_ready:
         ; N65 isolation: berryvp.library has no Intuition movie/event window.
         ; Workbench itself remains open.  video_render still receives the exact
         ; VPr8 DISPLAYREGION (Layer 10, Alpha 0x200000FF) later in graph setup.
+        ; N79P96 diagnostic: unlike normal N79, library mode needs the real
+        ; borderless Intuition/P96 surface.  Other library display modes keep
+        ; the original no-window behaviour.
         tst.l   bvp_library_mode
+        beq.s   n79p96_open_movie_window
+        cmpi.l  #202,v40j_cli_mode
         bne.s   vpv98_c_window_ok_done
-        ; Standalone VPr8 path keeps its original borderless Intuition surface.
+n79p96_open_movie_window:
         jsr     hdmi_v40o_open_window
         tst.l   d0
         bne.w   v12a_setup_fail
@@ -52520,12 +52621,15 @@ v40j_calc_fit:
         move.l  d2,d6
         bra.s   v40j_calc_finish
 v40j_calc_full:
-        ; V40O: gfull fills the Workbench only by downscaling. Never upscale
-        ; above the decoded source dimensions; the 640x360 -> 1256x706
-        ; hardware test produced no usable ISP output.
+        ; N79P96 diagnostic: mode 202 is the explicit full-screen P96 test.
+        ; Fit 736x416 to the complete Workbench box even when this is an
+        ; upscale.  This keeps HVS video_render out of the path completely.
         jsr     v40j_get_full_box
         tst.l   d0
         bne.w   v40j_calc_fail
+        cmpi.l  #202,d7
+        beq.w   v40j_calc_box_fit
+        ; Original VPr8 safety rule for all other full modes: downscale only.
         cmp.l   d4,d1
         bhi.s   v40j_calc_box_fit
         cmp.l   d5,d2
@@ -52556,9 +52660,11 @@ v40j_calc_finish:
         ; hardware-proven 640x360 BGRA class. 1920x1080 -> 1280x720 created
         ; 0x00384000-byte buffers and stalled before usable output. Mode 3 is
         ; pure VideoCore/HVS and is not capped here.
-        cmpi.l  #201,d7
-        beq.s   v41e_host_cap_check
+        ; N79P96: mode 202 deliberately bypasses the historical 640x360
+        ; host-facing cap so the ISP can produce the full borderless window.
         cmpi.l  #202,d7
+        beq.s   v41e_host_cap_done
+        cmpi.l  #201,d7
         bne.s   v41e_host_cap_done
 v41e_host_cap_check:
         cmpi.l  #640,d3
@@ -52671,9 +52777,14 @@ v40j_no_start_time_ff:
         move.l  v40j_cli_mode,d7
         ; C was already opened borderless/full-area before this selector.
         ; Keep display_style=3 and start video_render directly, with no restart.
+        cmpi.l  #202,d7
+        beq.s   n79p96_initial_fullfront_ready
         cmpi.l  #203,d7
         beq.s   v41l_initial_cinema_ready
         clr.l   v41_display_style
+        bra.s   v41l_initial_style_ready
+n79p96_initial_fullfront_ready:
+        move.l  #2,v41_display_style
         bra.s   v41l_initial_style_ready
 v41l_initial_cinema_ready:
         move.l  #3,v41_display_style
@@ -66173,6 +66284,12 @@ n79_v15: dc.b "N79_V15_SENDVIDEO_RETURN_OK",0
 n79_v16: dc.b "N79_V16_BEFORE_BULK_WAIT",0
 n79_v17: dc.b "N79_V17_AFTER_BULK_WAIT",0
 n79_v18: dc.b "N79_V18_VIDEO_GLOBALS_RESTORED",0
+n79p96g_a01: dc.b "P96G_A01_SEND_AUDIO_ENTER",0
+n79p96g_a02: dc.b "P96G_A02_REAL_PCM_READY",0
+n79p96g_a03: dc.b "P96G_A03_PCM_PENDING",0
+n79p96g_a04: dc.b "P96G_A04_AUDIO_BULK_TX_START",0
+n79p96g_a05: dc.b "P96G_A05_AUDIO_BULK_TX_DONE",0
+n79p96g_a06: dc.b "P96G_A06_AUDIO_BUFFER_RETURN",0
         even
 ; N65 persistent numeric prefixes.
 n15_pfx_sps_profile:      dc.b "N79 SPS PROFILE=",0
@@ -66915,6 +67032,12 @@ N9_SA_StateOK:
         beq.w   N9_SA_BadState
         tst.l   n9_audio_ready
         beq.w   N9_SA_NoBackend
+        tst.l   n79p96g_audio_trace_state
+        bne.s   n79p96g_sa_a01_done
+        lea     n79p96g_a01,a1
+        jsr     n12_log
+        move.l  #1,n79p96g_audio_trace_state
+n79p96g_sa_a01_done:
         ; N65: one nonblocking service pass on every AAC API entry.  This keeps
         ; renderer returns moving and publishes deferred PCM as soon as a slot
         ; and the single global BULK transport are immediately available.
@@ -67108,6 +67231,12 @@ n30_fab_consumed:
 n30_fab_pcmmax_done:
         tst.l   d0
         beq.w   n30_fab_reset_ok       ; FAAD priming-only batch
+        cmpi.l  #1,n79p96g_audio_trace_state
+        bne.s   n79p96g_fab_a02_done
+        lea     n79p96g_a02,a1
+        jsr     n12_log
+        move.l  #2,n79p96g_audio_trace_state
+n79p96g_fab_a02_done:
         move.l  bvp_libbase_global,a0
         move.l  BVP_AUDIO_RATE(a0),d1
         cmp.l   v19_pcm_rate,d1
@@ -67124,6 +67253,12 @@ n30_fab_pcmmax_done:
         move.l  n30_batch_pts_hi,n65_audio_pending_pts_hi
         move.l  #1,n65_audio_pending
         addq.l  #1,n65_audio_deferred_blocks
+        cmpi.l  #2,n79p96g_audio_trace_state
+        bne.s   n79p96g_fab_a03_done
+        lea     n79p96g_a03,a1
+        jsr     n12_log
+        move.l  #3,n79p96g_audio_trace_state
+n79p96g_fab_a03_done:
 
         ; One immediate nonblocking attempt is cheap when a slot is already free.
         ; A successful publish waits only for its short serialized BULK_TX_DONE;
@@ -67186,6 +67321,10 @@ n65_svc_have:
         bne.s   n65_svc_poll_once
         tst.l   vpv39_audio_bulk_pending
         bne.s   n65_svc_poll_once
+        ; N79P96G diagnostic: allow AUDIO BULK_TX while P96 output BULK_RX is
+        ; active. VIDEO BULK_TX remains blocked by bvp_wait_video_submit_ready.
+        ; This isolates whether the old striping was caused specifically by
+        ; compressed-video TX/RX overlap rather than opposite-direction audio.
         tst.l   vpv47_slot_state
         beq.s   n65_svc_slot0
         tst.l   vpv47_slot_state+4
@@ -67224,6 +67363,8 @@ n65_svc_after_rx:
         bne.w   n65_svc_defer
         tst.l   vpv39_audio_bulk_pending
         bne.w   n65_svc_defer
+        ; N79P96G: AUDIO is the one exception to P96 RX serialization.
+        ; Do not defer merely because output_bulk_queued is active.
         tst.l   vpv47_slot_state
         beq.s   n65_svc_slot0
         tst.l   vpv47_slot_state+4
@@ -67257,6 +67398,12 @@ n65_svc_publish:
 
         move.l  n65_audio_pending_pts_lo,vpv43_audio_next_pts_ticks
         move.l  n65_audio_pending_pts_hi,vpv170_audio_next_pts_hi
+        cmpi.l  #3,n79p96g_audio_trace_state
+        bne.s   n79p96g_svc_a04_done
+        lea     n79p96g_a04,a1
+        jsr     n12_log
+        move.l  #4,n79p96g_audio_trace_state
+n79p96g_svc_a04_done:
         move.l  n29_audio_selected_slot,d0
         jsr     vpv47_send_audio_slot
         tst.l   d0
@@ -67288,6 +67435,12 @@ n65_svc_bulk_time_ok:
         move.l  n54_saved_result,d0
         tst.l   d0
         bne.s   n65_svc_fail
+        cmpi.l  #4,n79p96g_audio_trace_state
+        bne.s   n79p96g_svc_a05_done
+        lea     n79p96g_a05,a1
+        jsr     n12_log
+        move.l  #5,n79p96g_audio_trace_state
+n79p96g_svc_a05_done:
 
         ; N79: the clock/scheduler was already armed during ConfigAudio while
         ; transport was quiescent.  This point now proves the first real PCM
@@ -67428,6 +67581,12 @@ n66_vsvc_submit_max_ok:
         move.l  n63_video_saved_result,d0
         tst.l   d0
         bne.w   n66_vsvc_fail
+
+        ; N79P96G: if the just-finished P96 RX exposed a waiting decoded PCM
+        ; block, yield this Video turn once.  N69 immediately calls Audio first
+        ; on the next dispatcher pass.  No RX/TX overlap is introduced.
+        tst.l   n65_audio_pending
+        bne.w   n66_vsvc_defer
 
 n66_vsvc_feed_retry:
         cmpi.l  #1,n79_first_video_trace_state
@@ -68543,6 +68702,7 @@ n69_dispatch_loops:          ds.l 1
 n69_dispatch_audio_calls:    ds.l 1
 n69_dispatch_failures:       ds.l 1
 n79_first_video_trace_state:  ds.l 1
+n79p96g_audio_trace_state:   ds.l 1
 n70_early_due_count:         ds.l 1
 n70_late_due_count:          ds.l 1
 n70_early_lead_max_us:       ds.l 1
