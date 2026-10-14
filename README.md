@@ -16,6 +16,12 @@
 ![GitHub stars](https://img.shields.io/github/stars/boingball/MintVID)
 ![GitHub last commit](https://img.shields.io/github/last-commit/boingball/MintVID)
 
+> **PiStorm / BerryCore fork.** This fork adds hardware-accelerated playback
+> for PiStorm with Emu68: H.264 up to 1080p on the Raspberry Pi's VideoCore
+> (HDMI full screen or P96 window) and AAC/AC3/E-AC3 audio decoded on the Pi's
+> second ARM core. Everything for that lives in [`pistorm/`](pistorm/README.md).
+> Upstream MintVID: https://github.com/boingball/MintVID
+
 **Modern video playback and streaming for classic accelerated 68k Amigas.**
 
 Play local video, HTTP/HTTPS streams, HLS, IPTV and public YouTube content

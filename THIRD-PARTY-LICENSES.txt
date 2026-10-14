@@ -97,3 +97,10 @@ Mikael Kalms' C2P collection
 This file supplements, rather than replaces, the upstream licence texts. The
 release packaging target copies the available GPL, Apache and MintAMP/Helix
 licence/notices into the LICENSES drawer automatically.
+
+PiStorm / BerryCore parts (this fork)
+-------------------------------------
+pistorm/ contains the PiStorm playback backend (mrberry, berryvp.library),
+the BerryCore CPU1 decoder modules (liba52: GPL-2.0-or-later, FAAD2:
+GPL-2.0-or-later, FFmpeg: LGPL-2.1-or-later) and the Emu68 BerryCore kernel
+patch (MPL-2.0). See pistorm/LICENSES.md.
