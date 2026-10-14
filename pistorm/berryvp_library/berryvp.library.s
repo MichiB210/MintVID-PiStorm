@@ -69079,6 +69079,8 @@ n79_no_v13:
         tst.l   n66_video_pending
         beq.s   n69_dispatch_ok
         jsr     short_delay
+        bsr     n80_break_pending
+        bne.s   n69_dispatch_fail
         subq.l  #1,d2
         bne.s   n69_dispatch_loop
 n69_dispatch_fail:
@@ -69108,6 +69110,8 @@ n66_force_video_loop:
         tst.l   n66_video_pending
         beq.s   n66_force_video_ok
         jsr     short_delay
+        bsr     n80_break_pending
+        bne.s   n66_force_video_fail
         subq.l  #1,d2
         bne.s   n66_force_video_loop
 n66_force_video_fail:
@@ -69117,6 +69121,25 @@ n66_force_video_ok:
         moveq   #0,d0
 n66_force_video_done:
         movem.l (sp)+,d1-d2
+        rts
+
+; N80: Z clear (and D0=1) if the calling task has a pending Ctrl-C.
+; MintVID's Stop button sends Ctrl-C to mrberry. The signal is only read,
+; never cleared, so mrberry still sees it and stops normally once the
+; library call returns. Without this the wait loops above ran their full
+; bounded count with Stop ignored.
+n80_break_pending:
+        movem.l d1/a0-a1/a6,-(sp)
+        move.l  4.w,a6
+        moveq   #0,d0
+        moveq   #0,d1
+        jsr     SetSignal(a6)
+        and.l   #SIGBREAKF_CTRL_C,d0
+        beq.s   n80_break_none
+        moveq   #1,d0
+n80_break_none:
+        movem.l (sp)+,d1/a0-a1/a6
+        tst.l   d0
         rts
 
 ; Bounded fallback for next-batch overwrite protection and CloseStream only.
