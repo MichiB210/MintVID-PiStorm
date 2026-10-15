@@ -49982,16 +49982,16 @@ n79p_direct_setup_graph:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd1
         move.l  port_last_handle,d0
         cmp.l   v12a_decoder_output,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd2
         move.l  port_fmt_type,d0
         cmp.l   #MMAL_ES_VIDEO,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd3
         move.l  port_fmt_encoding,d0
         cmp.l   #MMAL_ENCODING_I420,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd4
         ; N16: snapshot firmware decoder OUTPUT requirements before OPQV.
         move.l  port_fmt_encoding,d0
         lea     n15_pfx_out_pre_enc,a1
@@ -50052,7 +50052,7 @@ n79p_direct_setup_graph:
 n79p_d_vpv98_c_before_capture_done:
         jsr     hdmi_v40o_capture_wb_fb
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd5
         cmpi.l  #203,v40j_cli_mode
         bne.s   n79p_d_vpv98_c_capture_ok_done
         lea     msg_vpv98_c_capture_ok,a1
@@ -50087,7 +50087,7 @@ n79p_d_v41l_preopen_style_ready:
 n79p_d_n79p96_open_movie_window:
         jsr     hdmi_v40o_open_window
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd6
         cmpi.l  #203,v40j_cli_mode
         bne.s   n79p_d_vpv98_c_window_ok_done
         lea     msg_vpv98_c_window_ok,a1
@@ -50100,7 +50100,7 @@ n79p_d_vpv98_c_window_ok_done:
         ; safety difference from v25/v30: the graph never changes mid-stream.
         jsr     v32_wait_initial_mode
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd7
         cmpi.l  #203,v40j_cli_mode
         bne.s   n79p_d_vpv98_c_selector_ok_done
         lea     msg_vpv98_c_selector_ok,a1
@@ -50142,10 +50142,10 @@ n79p_d_vpv98_c_selector_ok_done:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd8
         move.l  port_last_handle,d0
         cmp.l   v12a_decoder_output,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd9
         move.l  #MMAL_ES_VIDEO,port_fmt_type
         move.l  #MMAL_ENCODING_OPAQUE,port_fmt_encoding
         clr.l   port_fmt_variant
@@ -50162,19 +50162,19 @@ n79p_d_v12b_dec_opaque_first_num_ok:
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd10
 
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd11
         move.l  port_last_handle,d0
         cmp.l   v12a_decoder_output,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd12
         move.l  port_fmt_encoding,d0
         cmp.l   #MMAL_ENCODING_OPAQUE,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd13
 
         ; V12D: use the decoder's MINIMUM opaque header count, not the
         ; recommended count.  This firmware reports min=3, recommended=10 at
@@ -50202,16 +50202,16 @@ n79p_d_v12b_dec_size_nonzero:
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd14
 
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd15
         move.l  port_fmt_encoding,d0
         cmp.l   #MMAL_ENCODING_OPAQUE,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd16
 
         ; N16: exact lazy-allocation contract that is live when first AU arrives.
         move.l  port_fmt_encoding,d0
@@ -50259,7 +50259,7 @@ n79p_d_v12b_dec_size_nonzero:
 
         bsr     v12a_create_isp
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd17
         cmpi.l  #3,v41_display_style
         bne.s   n79p_d_v41b_setup_continue_isp
         lea     msg_vpv98_c_renderer_created,a1
@@ -50267,7 +50267,7 @@ n79p_d_v12b_dec_size_nonzero:
         jsr     vpv21n_trace
         jsr     v41b_setup_renderer_after_create
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd18
         lea     msg_vpv98_c_renderer_ready,a1
         move.l  #msg_vpv98_c_renderer_ready_end-msg_vpv98_c_renderer_ready,d3
         jsr     vpv21n_trace
@@ -50281,7 +50281,7 @@ n79p_d_v41b_setup_continue_isp:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd19
         move.l  port_last_handle,v12a_isp_input
         move.l  #MMAL_ES_VIDEO,port_fmt_type
         move.l  #MMAL_ENCODING_OPAQUE,port_fmt_encoding
@@ -50311,25 +50311,25 @@ n79p_d_v12a_in_num_ok:
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd20
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd21
         move.l  port_last_handle,d0
         cmp.l   v12a_isp_input,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd22
         move.l  port_fmt_encoding,d0
         cmp.l   #MMAL_ENCODING_OPAQUE,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd23
 
         ; HDMI_v41L: ISP OUTPUT 0 = small aspect-correct BGR24. VideoCore does YUV->RGB.
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd24
         move.l  port_last_handle,v12a_isp_output
         move.l  #MMAL_ES_VIDEO,port_fmt_type
         move.l  #MMAL_ENCODING_BGR24,port_fmt_encoding
@@ -50362,18 +50362,18 @@ n79p_d_v12a_in_num_ok:
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd25
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd26
         move.l  port_last_handle,d0
         cmp.l   v12a_isp_output,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd27
         move.l  port_fmt_encoding,d0
         cmp.l   #MMAL_ENCODING_BGR24,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd28
 
         ; mkvr7 SAFE RESTORE:
         ; Matroska H264 input still uses the hardware-proven VPv102 framing and
@@ -50386,7 +50386,7 @@ n79p_d_v12a_in_num_ok:
         ; and VPv174 nonblocking P96 layer handling).
         bsr     v12a_connect_ports
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd29
 
         ; Apply peer input requirements before enabling connected decoder output.
         move.l  v12a_isp_handle,component_handle
@@ -50394,13 +50394,13 @@ n79p_d_v12a_in_num_ok:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd30
         move.l  port_last_handle,d0
         cmp.l   v12a_isp_input,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd31
         bsr     v12a_set_isp_requirements
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd32
 
         ; Enable decoder OUTPUT; connected ISP INPUT comes up through the tunnel.
         move.l  v12a_decoder_handle,component_handle
@@ -50409,7 +50409,7 @@ n79p_d_v12a_in_num_ok:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd33
         move.l  port_buf_num,d0
         cmpi.l  #2,d0
         bcc.s   n79p_d_vpv176_mkv_dec_out_num_ok
@@ -50418,7 +50418,7 @@ n79p_d_vpv176_mkv_dec_out_num_ok:
         move.l  d0,port_buf_num
         jsr     port_enable_output_current
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd34
 
         ; Verify ISP INPUT was enabled by the direct VideoCore tunnel.
         move.l  v12a_isp_handle,component_handle
@@ -50426,9 +50426,9 @@ n79p_d_vpv176_mkv_dec_out_num_ok:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd35
         cmpi.l  #1,port_enabled
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd36
 
         ; Enable host-facing ISP output with exactly two small buffers.
         move.l  v12a_isp_output,output_port_handle
@@ -50436,26 +50436,26 @@ n79p_d_vpv176_mkv_dec_out_num_ok:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd37
         moveq   #2,d0
         move.l  d0,port_buf_num
         move.l  d0,v10j_output_req_count
         jsr     port_enable_output_current
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd38
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd39
         move.l  port_enabled,d0
         cmpi.l  #1,d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd40
 
         ; ISP is a real component and must be enabled too.
         jsr     component_enable_worker
         tst.l   d0
-        bne.w   n79p_d_v12a_setup_fail
+        bne.w   n80_pd41
 
         ; Save only the SMALL ISP output for existing host/HAM6 code.
         move.l  v12a_isp_handle,output_component_handle
@@ -50475,7 +50475,7 @@ n79p_d_vpv176_mkv_dec_out_num_ok:
         add.l   d1,d0                    ; BGR24: aligned width*height*3
         move.l  d0,output_frame_bytes_expected
         cmp.l   output_buf_size_saved,d0
-        bhi.w   n79p_d_v12a_setup_fail
+        bhi.w   n80_pd42
 
         ; V40: the chosen size is now final for this playback.  Resize the
         ; Intuition window exactly once to surround the fixed ISP crop.
@@ -50508,6 +50508,184 @@ n79p_d_vpv176_mkv_dec_out_num_ok:
         jsr     newline
         moveq   #0,d0
         bra.s   n79p_d_v12a_setup_done
+n80_pd1:
+        move.l  d0,n80_pd_d0
+        move.l  #1,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd2:
+        move.l  d0,n80_pd_d0
+        move.l  #2,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd3:
+        move.l  d0,n80_pd_d0
+        move.l  #3,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd4:
+        move.l  d0,n80_pd_d0
+        move.l  #4,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd5:
+        move.l  d0,n80_pd_d0
+        move.l  #5,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd6:
+        move.l  d0,n80_pd_d0
+        move.l  #6,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd7:
+        move.l  d0,n80_pd_d0
+        move.l  #7,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd8:
+        move.l  d0,n80_pd_d0
+        move.l  #8,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd9:
+        move.l  d0,n80_pd_d0
+        move.l  #9,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd10:
+        move.l  d0,n80_pd_d0
+        move.l  #10,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd11:
+        move.l  d0,n80_pd_d0
+        move.l  #11,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd12:
+        move.l  d0,n80_pd_d0
+        move.l  #12,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd13:
+        move.l  d0,n80_pd_d0
+        move.l  #13,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd14:
+        move.l  d0,n80_pd_d0
+        move.l  #14,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd15:
+        move.l  d0,n80_pd_d0
+        move.l  #15,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd16:
+        move.l  d0,n80_pd_d0
+        move.l  #16,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd17:
+        move.l  d0,n80_pd_d0
+        move.l  #17,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd18:
+        move.l  d0,n80_pd_d0
+        move.l  #18,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd19:
+        move.l  d0,n80_pd_d0
+        move.l  #19,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd20:
+        move.l  d0,n80_pd_d0
+        move.l  #20,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd21:
+        move.l  d0,n80_pd_d0
+        move.l  #21,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd22:
+        move.l  d0,n80_pd_d0
+        move.l  #22,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd23:
+        move.l  d0,n80_pd_d0
+        move.l  #23,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd24:
+        move.l  d0,n80_pd_d0
+        move.l  #24,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd25:
+        move.l  d0,n80_pd_d0
+        move.l  #25,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd26:
+        move.l  d0,n80_pd_d0
+        move.l  #26,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd27:
+        move.l  d0,n80_pd_d0
+        move.l  #27,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd28:
+        move.l  d0,n80_pd_d0
+        move.l  #28,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd29:
+        move.l  d0,n80_pd_d0
+        move.l  #29,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd30:
+        move.l  d0,n80_pd_d0
+        move.l  #30,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd31:
+        move.l  d0,n80_pd_d0
+        move.l  #31,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd32:
+        move.l  d0,n80_pd_d0
+        move.l  #32,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd33:
+        move.l  d0,n80_pd_d0
+        move.l  #33,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd34:
+        move.l  d0,n80_pd_d0
+        move.l  #34,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd35:
+        move.l  d0,n80_pd_d0
+        move.l  #35,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd36:
+        move.l  d0,n80_pd_d0
+        move.l  #36,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd37:
+        move.l  d0,n80_pd_d0
+        move.l  #37,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd38:
+        move.l  d0,n80_pd_d0
+        move.l  #38,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd39:
+        move.l  d0,n80_pd_d0
+        move.l  #39,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd40:
+        move.l  d0,n80_pd_d0
+        move.l  #40,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd41:
+        move.l  d0,n80_pd_d0
+        move.l  #41,n80_pd_step
+        bra.w   n80_pd_fail
+n80_pd42:
+        move.l  d0,n80_pd_d0
+        move.l  #42,n80_pd_step
+        bra.w   n80_pd_fail
+; N80: say which of the direct graph setup's failure exits was taken
+; (numbered in source order) and its D0, as N80 GRAPH FAIL STEP/D0.
+n80_pd_fail:
+        move.l  n80_pd_step,d0
+        lea     n80_pfx_pd_step,a1
+        jsr     n15_log_hex32
+        move.l  n80_pd_d0,d0
+        lea     n80_pfx_pd_d0,a1
+        jsr     n15_log_hex32
+        bra.w   n79p_d_v12a_setup_fail
 n79p_d_v12a_setup_fail:
         move.l  v12a_decoder_handle,component_handle
         move.l  v12a_saved_input_handle,input_port_handle
@@ -70660,6 +70838,8 @@ n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
 n80_msg_fail_reset: dc.b "N80_FAILED_STREAM_VC_RESET",0
 n80_msg_no_clock: dc.b "N80_SCHEDULER_WITHOUT_AUDIO_CLOCK_FAIL",0
+n80_pfx_pd_step: dc.b "N80 GRAPH FAIL STEP=",0
+n80_pfx_pd_d0:   dc.b "N80 GRAPH FAIL D0=",0
 n80_pfx_reset_close: dc.b "N80 RESET SERVICE_CLOSE (0=OK)=",0
 n80_pfx_reset_hvs:   dc.b "N80 RESET HVS_RESTORED=",0
 n80_pfx_dg_step: dc.b "N80 DIRECT FAIL STEP=",0
@@ -70910,6 +71090,8 @@ n80_rend_input:              ds.l 1
 n80_dg_d0:                   ds.l 1
 n80_en_why:                  ds.l 1
 n80_no_hdmi_audio:           ds.l 1
+n80_pd_step:                 ds.l 1
+n80_pd_d0:                   ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
