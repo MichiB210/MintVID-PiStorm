@@ -51092,14 +51092,14 @@ n79j_setup_sched_isp_renderer:
         ; Proven N79 graph helper: decoder -> scheduler -> ISP.
         jsr     vpv126_setup_scheduler_data_graph
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j1
         move.l  #1,n73_scheduler_graph_ready
         move.l  #1,vpv166_c_sched_feedahead
         bra.s   n80_n79j_graph_ready
 n80_n79j_direct:
         jsr     n80_setup_direct_isp_graph
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j2
 n80_n79j_graph_ready:
         move.l  v12a_isp_handle,n79j_isp_handle
         move.l  v12a_isp_input,n79j_isp_input
@@ -51108,14 +51108,14 @@ n80_n79j_graph_ready:
         move.l  #3,v41_display_style
         bsr     v12a_create_isp
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j3
         ; Renderer INPUT 0 = the ISP I420 surface.
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j4
         move.l  port_last_handle,v12a_isp_input
         move.l  #MMAL_ES_VIDEO,port_fmt_type
         move.l  #MMAL_ENCODING_I420,port_fmt_encoding
@@ -51145,23 +51145,23 @@ n79j_rin_num_ok:
         jsr     port_info_set_input
         clr.l   v12c_local_set_active
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j5
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j6
         move.l  port_last_handle,d0
         cmp.l   v12a_isp_input,d0
-        bne.w   n79j_fail
+        bne.w   n80_j7
         cmpi.l  #MMAL_ENCODING_I420,port_fmt_encoding
-        bne.w   n79j_fail
+        bne.w   n80_j8
         ; Renderer visible, display region as for the direct C path.
         clr.l   v41b_renderer_reveal_pending
         move.l  #1,v41b_renderer_visible
         bsr     hdmi_v40o_set_displayregion
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j9
         ; ISP.output -> renderer.input through the proven connector.
         move.l  v12a_decoder_handle,n79j_save_dec_handle
         move.l  v12a_decoder_output,n79j_save_dec_output
@@ -51171,17 +51171,17 @@ n79j_rin_num_ok:
         move.l  n79j_save_dec_handle,v12a_decoder_handle
         move.l  n79j_save_dec_output,v12a_decoder_output
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j10
         ; Renderer peer requirements before ISP output is enabled.
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j11
         bsr     v12a_set_isp_requirements
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j12
         ; Enable ISP OUTPUT; connected renderer input comes up with it.
         move.l  n79j_isp_handle,component_handle
         move.l  n79j_isp_output,output_port_handle
@@ -51189,7 +51189,7 @@ n79j_rin_num_ok:
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j13
         move.l  port_buf_num,d0
         cmpi.l  #2,d0
         bcc.s   n79j_iout_num_ok
@@ -51198,23 +51198,23 @@ n79j_iout_num_ok:
         move.l  d0,port_buf_num
         jsr     port_enable_output_current
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j14
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n79j_fail
+        bne.w   n80_j15
         cmpi.l  #1,port_enabled
-        bne.w   n79j_fail
+        bne.w   n80_j16
         ; Enable renderer, then the ISP component.
         jsr     component_enable_worker
         tst.l   d0
-        bne.s   n79j_fail
+        bne.s   n80_j17
         move.l  n79j_isp_handle,component_handle
         jsr     component_enable_worker
         tst.l   d0
-        bne.s   n79j_fail
+        bne.s   n80_j18
         ; No host-facing output buffers on this path.
         clr.l   output_component_handle
         clr.l   output_port_handle
@@ -51233,6 +51233,78 @@ n79j_iout_num_ok:
         jsr     n12_log
         moveq   #0,d0
         bra.s   n79j_done
+n80_j1:
+        move.l  d0,n80_n79j_d0
+        move.l  #1,n80_n79j_step
+        bra.w   n79j_fail
+n80_j2:
+        move.l  d0,n80_n79j_d0
+        move.l  #2,n80_n79j_step
+        bra.w   n79j_fail
+n80_j3:
+        move.l  d0,n80_n79j_d0
+        move.l  #3,n80_n79j_step
+        bra.w   n79j_fail
+n80_j4:
+        move.l  d0,n80_n79j_d0
+        move.l  #4,n80_n79j_step
+        bra.w   n79j_fail
+n80_j5:
+        move.l  d0,n80_n79j_d0
+        move.l  #5,n80_n79j_step
+        bra.w   n79j_fail
+n80_j6:
+        move.l  d0,n80_n79j_d0
+        move.l  #6,n80_n79j_step
+        bra.w   n79j_fail
+n80_j7:
+        move.l  d0,n80_n79j_d0
+        move.l  #7,n80_n79j_step
+        bra.w   n79j_fail
+n80_j8:
+        move.l  d0,n80_n79j_d0
+        move.l  #8,n80_n79j_step
+        bra.w   n79j_fail
+n80_j9:
+        move.l  d0,n80_n79j_d0
+        move.l  #9,n80_n79j_step
+        bra.w   n79j_fail
+n80_j10:
+        move.l  d0,n80_n79j_d0
+        move.l  #10,n80_n79j_step
+        bra.w   n79j_fail
+n80_j11:
+        move.l  d0,n80_n79j_d0
+        move.l  #11,n80_n79j_step
+        bra.w   n79j_fail
+n80_j12:
+        move.l  d0,n80_n79j_d0
+        move.l  #12,n80_n79j_step
+        bra.w   n79j_fail
+n80_j13:
+        move.l  d0,n80_n79j_d0
+        move.l  #13,n80_n79j_step
+        bra.w   n79j_fail
+n80_j14:
+        move.l  d0,n80_n79j_d0
+        move.l  #14,n80_n79j_step
+        bra.w   n79j_fail
+n80_j15:
+        move.l  d0,n80_n79j_d0
+        move.l  #15,n80_n79j_step
+        bra.w   n79j_fail
+n80_j16:
+        move.l  d0,n80_n79j_d0
+        move.l  #16,n80_n79j_step
+        bra.w   n79j_fail
+n80_j17:
+        move.l  d0,n80_n79j_d0
+        move.l  #17,n80_n79j_step
+        bra.w   n79j_fail
+n80_j18:
+        move.l  d0,n80_n79j_d0
+        move.l  #18,n80_n79j_step
+        bra.w   n79j_fail
 n79j_fail:
         tst.l   n79j_save_dec_handle
         beq.s   n79j_fail_no_dec
@@ -51243,6 +51315,13 @@ n79j_fail_no_dec:
         move.l  v12a_saved_input_handle,input_port_handle
         lea     n79j_msg_graph_fail,a1
         jsr     n12_log
+        move.l  n80_n79j_step,d0
+        lea     n80_pfx_j_step,a1
+        jsr     n15_log_hex32
+        move.l  n80_n79j_d0,d0
+        lea     n80_pfx_j_d0,a1
+        jsr     n15_log_hex32
+        clr.l   n80_n79j_step
         moveq   #1,d0
 n79j_done:
         movem.l (sp)+,d1-d7/a0-a3
@@ -70335,6 +70414,8 @@ n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
+n80_pfx_j_step: dc.b "N80 N79J FAIL STEP=",0
+n80_pfx_j_d0:   dc.b "N80 N79J FAIL D0=",0
 n80_pfx_reason: dc.b "N80 DEFER REASON (1=CLOCK 2=PACER 3=BULK 4=POOL 5=AUDIO)=",0
 n80_pfx_graph:  dc.b "N80 STATE SCHED_GRAPH=",0
 n80_pfx_clock:  dc.b "N80 STATE CLOCK_ARMED=",0
@@ -70557,6 +70638,8 @@ n70_early_lead_max_us:       ds.l 1
 ; N79 exact VPr8 scheduler startup state (library mode only).
 n73_scheduler_graph_ready:   ds.l 1
 n80_last_defer:              ds.l 1
+n80_n79j_step:               ds.l 1
+n80_n79j_d0:                 ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
