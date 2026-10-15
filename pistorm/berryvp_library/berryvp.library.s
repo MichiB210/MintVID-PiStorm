@@ -50,7 +50,9 @@ BVP_CAP_H264_HW       equ $00000100
 BVP_CAP_DIRECT_HVS    equ $00000400
 BVP_CAP_FRAME_FLAGS   equ $00000800
 BVP_CAP_INPUT_PTS     equ $00001000
-BVP_CAPS_STAGE3       equ BVP_CAP_API_V1+BVP_CAP_PTS64+BVP_CAP_H264_HW+BVP_CAP_DIRECT_HVS+BVP_CAP_FRAME_FLAGS+BVP_CAP_INPUT_PTS
+; N80: OpenStream honours BVP_OPENF_NO_HDMI_AUDIO (video without HDMI audio).
+BVP_CAP_NO_HDMI_AUDIO equ $00002000
+BVP_CAPS_STAGE3       equ BVP_CAP_API_V1+BVP_CAP_PTS64+BVP_CAP_H264_HW+BVP_CAP_DIRECT_HVS+BVP_CAP_FRAME_FLAGS+BVP_CAP_INPUT_PTS+BVP_CAP_NO_HDMI_AUDIO
 
 BVP_CODEC_NONE        equ 0
 BVP_CODEC_H264        equ 1
@@ -1443,7 +1445,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.80 N80 NO-HDMI-AUDIO DIRECT (15.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -68177,7 +68179,7 @@ n10d_name_12: dc.b "N79_12_VIDEO_RETURN",0
         section bvp_n9_audio_code,code
 
 BVP_GetVersionN9:
-        move.l  #$0003001C,d0
+        move.l  #$00030050,d0           ; N80: 3.80 (P35 reports 3.28)
         rts
 
 ; N16 VIDEO-ONLY CONTROL.  Keep the N13 video backend bit-for-bit in source

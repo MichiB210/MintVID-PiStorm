@@ -86,7 +86,10 @@ it passes `BVP_OPENF_NO_HDMI_AUDIO` (1) to OpenStream for `--paula`,
 `--no-audio`, a file without sound, or a track the Pi side does not play
 (e.g. mono AAC). With that flag the library leaves the scheduler out and
 times frames with its own frame grid; without it (HDMI audio, older
-mrberry, VPberry) nothing changes. The trace shows
+mrberry, VPberry) nothing changes. The N80 library reports version 3.80
+and the capability bit `BVP_CAP_NO_HDMI_AUDIO` ($2000); mrberry refuses
+video without HDMI audio on an older library with "needs berryvp.library
+3.80 or newer" instead of waiting for an audio clock that never starts. The trace shows
 `N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when the direct graph is used. CI builds
 the library with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy
 it to `LIBS:`.

@@ -28,6 +28,7 @@
 #define BVP_CAP_DIRECT_HVS  0x00000400UL
 #define BVP_CAP_FRAME_FLAGS 0x00000800UL
 #define BVP_CAP_INPUT_PTS   0x00001000UL
+#define BVP_CAP_NO_HDMI_AUDIO 0x00002000UL /* berryvp.library 3.80 (N80) */
 #define BVP_REQUIRED_CAPS (BVP_CAP_PTS64 | BVP_CAP_H264_HW | \
                            BVP_CAP_DIRECT_HVS | BVP_CAP_FRAME_FLAGS | \
                            BVP_CAP_INPUT_PTS)
@@ -331,6 +332,15 @@ mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi, int hdmi_audio
            (unsigned long)(ver >> 16), (unsigned long)(ver & 0xffffu), b->caps);
     if ((b->caps & BVP_REQUIRED_CAPS) != BVP_REQUIRED_CAPS) {
         printf("Error: berryvp.library is missing required H.264/HVS/PTS capabilities.\n");
+        mr_berryvp_close(b);
+        return MR_EUNSUPPORTED;
+    }
+    if (!hdmi_audio && !(b->caps & BVP_CAP_NO_HDMI_AUDIO)) {
+        /* An older library ignores the no-HDMI-audio flag and waits for an
+         * audio clock that never starts. */
+        printf("Error: video without HDMI audio needs berryvp.library 3.80 or newer "
+               "(installed: %lu.%lu). Update LIBS:berryvp.library.\n",
+               (unsigned long)(ver >> 16), (unsigned long)(ver & 0xffffu));
         mr_berryvp_close(b);
         return MR_EUNSUPPORTED;
     }
