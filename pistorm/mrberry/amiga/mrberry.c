@@ -1,15 +1,23 @@
 /* MintVID demux -> berryvp.library hardware A/V bridge.
  * Stage 4F HUNKSAFE: the hardware-confirmed Stage-3D H.264 path is unchanged. AAC-LC packets are
  * demuxed by MintVID, wrapped as ADTS where required, decoded by BerryFAAD03
- * on ARM CPU1 and sent as PCM16 to MMAL audio_render/HDMI. */
+ * on ARM CPU1 and sent as PCM16 to MMAL audio_render/HDMI.
+ *
+ * MintVID external player: same task name, signals and status port as
+ * mrplay, so MintVID's Play/Pause/Stop work; pause holds the feed, and a
+ * jump (or --start=) restarts the stream at a keyframe. */
 #include "../core/mr_demux.h"
 #include "mr_berryvp.h"
+#include "mrb_paula.h"
+#include "mr_player_status.h"
 #include <exec/types.h>
+#include <exec/memory.h>
 #include <dos/dos.h>
 #include <intuition/intuition.h>
 #include <proto/dos.h>
 #include <proto/exec.h>
 #include <proto/intuition.h>
+#include <clib/alib_protos.h>   /* NewList() (amiga.lib helper) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,12 +117,39 @@ static mr_status p04_flush_audio_queue(mr_berryvp *bvp,
     return MR_OK;
 }
 
-/* MintVID PiStorm05: N79Q's historical ESC handler belongs to the standalone
- * Intuition window. Library mode deliberately skips that window, so mrberry
- * owns a tiny activated Intuition input window while HVS fullscreen is active.
- * The window itself is hidden under the VideoCore layer; only RAWKEY/vanilla
- * input is used. */
+
+/* ---- Player control: keys, signals and the MintVID status port ----------
+ *
+ * mrberry follows MintVID's external-player contract (docs/EXTERNAL_PLAYER.md
+ * in MintVID): the GUI starts it as task "MintVID player", exactly like
+ * mrplay, so the GUI's Play/Pause/Stop buttons and status line work without
+ * any special case:
+ *   Ctrl-C / Ctrl-F  stop
+ *   Ctrl-D           pause / continue
+ *   Ctrl-E           read the port's command bits (pause, jump forward)
+ * The status lives in the same public port mrplay publishes
+ * ("MintVID.player"), and the final state also goes to the T: file so the
+ * GUI can still read it after mrberry has exited.
+ *
+ * Keys (the 1x1 input window, hidden under the VideoCore picture):
+ *   ESC, 0      stop
+ *   Space, P    pause / continue
+ *   Right/Left  jump 10 s forward/back     (MP4/MOV and MKV only)
+ *   Up/Down     jump 60 s forward/back */
+enum {
+    EV_NONE = 0,
+    EV_STOP,
+    EV_PAUSE,
+    EV_SEEK
+};
+
+#define SEEK_SHORT_US 10000000LL
+#define SEEK_LONG_US  60000000LL
+#define MRBERRY_CODEC "H.264 / VideoCore"
+
 static struct Window *p05_input_window;
+static mr_player_control_port *control_block;
+static ULONG status_file_seq;
 
 static int p05_input_open(void)
 {
@@ -131,105 +166,173 @@ static int p05_input_open(void)
     return p05_input_window != NULL;
 }
 
-static int p05_input_poll_stop(void)
-{
-    struct IntuiMessage *msg;
-    int stop = 0;
-
-    if (!p05_input_window || !p05_input_window->UserPort)
-        return 0;
-
-    while ((msg = (struct IntuiMessage *)GetMsg(p05_input_window->UserPort)) != NULL) {
-        ULONG cls = msg->Class;
-        UWORD code = msg->Code;
-        ReplyMsg((struct Message *)msg);
-
-        if (cls == IDCMP_RAWKEY) {
-            /* Amiga raw key 0x45 = ESC. Ignore key-up (bit 7 set). */
-            if ((code & 0x80u) == 0 && ((code & 0x7fu) == 0x45u))
-                stop = 1;
-        } else if (cls == IDCMP_VANILLAKEY) {
-            if (code == 0x1bu || code == '0')
-                stop = 1;
-        }
-    }
-    return stop;
-}
-
 static void p05_input_close(void)
 {
     if (p05_input_window) {
+        struct IntuiMessage *msg;
+        while ((msg = (struct IntuiMessage *)GetMsg(p05_input_window->UserPort)) != NULL)
+            ReplyMsg((struct Message *)msg);
         CloseWindow(p05_input_window);
         p05_input_window = NULL;
     }
 }
 
-/* MintVID PiStorm06: publish the same atomic terminal status snapshot used by
- * mrplay. MintVID launches mrberry asynchronously, so this T: record is the
- * reliable hand-off for Opening/Playing/Stopped/Finished after mrberry exits. */
-#define P06_STATUS_MAGIC 0x4D525653UL
-#define P06_STATUS_FILE  "T:MintVID.player-status"
-#define P06_STATUS_TMP   "T:MintVID.player-status.tmp"
-#define P06_CODEC_MAX 48
-#define P06_TEXT_MAX 208
-enum {
-    P06_STATE_STARTING = 0,
-    P06_STATE_OPENING,
-    P06_STATE_PLAYING,
-    P06_STATE_UNSUPPORTED,
-    P06_STATE_ERROR,
-    P06_STATE_ENDED
-};
-typedef struct {
-    volatile ULONG magic;
-    volatile ULONG seq;
-    volatile LONG state;
-    char codec[P06_CODEC_MAX];
-    char text[P06_TEXT_MAX];
-} p06_player_status;
-typedef struct {
-    p06_player_status status;
-    ULONG trailer_magic;
-} p06_player_status_snapshot;
-static ULONG p06_status_seq;
-
-static void p06_status_copy(char *dst, size_t size, const char *src)
+/* One pending event from the keyboard, the GUI's signals or the port's
+ * command bits. A jump sets *seek_delta_us. Signals are cleared as they are
+ * read (SetSignal(0, mask)), so one Ctrl-D is one pause toggle. */
+static int poll_event(int64_t *seek_delta_us)
 {
-    size_t i = 0;
-    if (!size) return;
-    if (src)
-        for (; i + 1 < size && src[i]; ++i) dst[i] = src[i];
-    dst[i] = 0;
+    struct IntuiMessage *msg;
+    ULONG sig;
+    int ev = EV_NONE;
+
+    if (p05_input_window && p05_input_window->UserPort) {
+        while ((msg = (struct IntuiMessage *)GetMsg(p05_input_window->UserPort)) != NULL) {
+            ULONG cls = msg->Class;
+            UWORD code = msg->Code;
+            ReplyMsg((struct Message *)msg);
+            if (ev == EV_STOP) continue;
+            if (cls == IDCMP_RAWKEY) {
+                if (code & 0x80u) continue;              /* key up */
+                switch (code & 0x7fu) {
+                case 0x45: ev = EV_STOP; break;          /* ESC          */
+                case 0x4E: ev = EV_SEEK; *seek_delta_us = SEEK_SHORT_US; break;
+                case 0x4F: ev = EV_SEEK; *seek_delta_us = -SEEK_SHORT_US; break;
+                case 0x4C: ev = EV_SEEK; *seek_delta_us = SEEK_LONG_US; break;
+                case 0x4D: ev = EV_SEEK; *seek_delta_us = -SEEK_LONG_US; break;
+                default: break;
+                }
+            } else if (cls == IDCMP_VANILLAKEY) {
+                if (code == 0x1bu || code == '0') ev = EV_STOP;
+                else if (code == ' ' || code == 'p' || code == 'P')
+                    ev = EV_PAUSE;
+            }
+        }
+    }
+    if (ev == EV_STOP) return ev;
+
+    sig = bvp_exec_setsignal(0, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D |
+                                SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F);
+    if (sig & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_F)) return EV_STOP;
+    if (sig & SIGBREAKF_CTRL_D) return EV_PAUSE;
+    if (sig & SIGBREAKF_CTRL_E) {
+        ULONG commands = 0;
+        if (control_block) {
+            Forbid();
+            commands = control_block->commands;
+            control_block->commands = 0;
+            Permit();
+        }
+        if (commands & MR_PLAYER_COMMAND_PAUSE) return EV_PAUSE;
+        if ((commands & MR_PLAYER_COMMAND_FAST) || !commands) {
+            *seek_delta_us = SEEK_SHORT_US;
+            return EV_SEEK;
+        }
+        /* Volume and fullscreen bits do not apply to HDMI output. */
+    }
+    return ev;
 }
 
-static void p06_status_write(LONG state, const char *codec, const char *text)
+static void control_port_close(void)
 {
-    p06_player_status_snapshot snapshot;
+    if (control_block) {
+        Forbid();
+        RemPort(&control_block->port);
+        Permit();
+        FreeMem(control_block, sizeof *control_block);
+        control_block = NULL;
+    }
+}
+
+/* Publish MintVID's player port, unless another player already owns it. */
+static void control_port_open(void)
+{
+    mr_player_control_port *block;
+    Forbid();
+    if (FindPort((CONST_STRPTR)MR_IPTV_PLAYER_PORT)) { Permit(); return; }
+    Permit();
+    block = (mr_player_control_port *)AllocMem(sizeof *block,
+                                               MEMF_PUBLIC | MEMF_CLEAR);
+    if (!block) return;
+    block->port.mp_Node.ln_Type = NT_MSGPORT;
+    block->port.mp_Node.ln_Name = (char *)MR_IPTV_PLAYER_PORT;
+    block->port.mp_Flags = PA_IGNORE;
+    block->port.mp_SigTask = FindTask(NULL);
+    NewList(&block->port.mp_MsgList);
+    block->volume = 64;
+    block->status.state = MR_PLAYER_STATE_STARTING;
+    block->status.magic = MR_PLAYER_STATUS_MAGIC;
+    AddPort(&block->port);
+    control_block = block;
+}
+
+/* Live update of the port only: cheap enough to call once a second. */
+static void status_live(LONG state, const char *text)
+{
+    mr_player_status_set(control_block, state, MRBERRY_CODEC, text);
+}
+
+/* State change: port plus the atomic T: snapshot that outlives mrberry. */
+static void status_set(LONG state, const char *codec, const char *text)
+{
+    mr_player_status_snapshot snapshot;
     BPTR file;
     LONG written;
 
+    mr_player_status_set(control_block, state, codec, text);
     memset(&snapshot, 0, sizeof snapshot);
-    snapshot.status.magic = P06_STATUS_MAGIC;
-    snapshot.status.seq = ++p06_status_seq;
+    snapshot.status.magic = MR_PLAYER_STATUS_MAGIC;
+    snapshot.status.seq = ++status_file_seq;
     snapshot.status.state = state;
-    p06_status_copy(snapshot.status.codec, sizeof snapshot.status.codec,
-                    codec ? codec : "");
-    p06_status_copy(snapshot.status.text, sizeof snapshot.status.text,
-                    text ? text : "");
-    snapshot.trailer_magic = P06_STATUS_MAGIC;
+    mr_player_status_copy(snapshot.status.codec, sizeof snapshot.status.codec,
+                          codec ? codec : "");
+    mr_player_status_copy(snapshot.status.text, sizeof snapshot.status.text,
+                          text ? text : "");
+    snapshot.trailer_magic = MR_PLAYER_STATUS_MAGIC;
 
-    file = Open((CONST_STRPTR)P06_STATUS_TMP, MODE_NEWFILE);
+    file = Open((CONST_STRPTR)MR_PLAYER_STATUS_TMP, MODE_NEWFILE);
     if (!file) return;
     written = Write(file, &snapshot, (LONG)sizeof snapshot);
     Close(file);
     if (written == (LONG)sizeof snapshot) {
-        DeleteFile((CONST_STRPTR)P06_STATUS_FILE);
-        if (!Rename((CONST_STRPTR)P06_STATUS_TMP,
-                    (CONST_STRPTR)P06_STATUS_FILE))
-            DeleteFile((CONST_STRPTR)P06_STATUS_TMP);
+        DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_FILE);
+        if (!Rename((CONST_STRPTR)MR_PLAYER_STATUS_TMP,
+                    (CONST_STRPTR)MR_PLAYER_STATUS_FILE))
+            DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_TMP);
     } else {
-        DeleteFile((CONST_STRPTR)P06_STATUS_TMP);
+        DeleteFile((CONST_STRPTR)MR_PLAYER_STATUS_TMP);
     }
+}
+
+static void format_time(char *out, size_t cap, uint64_t us)
+{
+    unsigned long s = (unsigned long)(us / 1000000u);
+    if (s >= 3600)
+        snprintf(out, cap, "%lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+    else
+        snprintf(out, cap, "%lu:%02lu", s / 60, s % 60);
+}
+
+/* "H:MM:SS" / "HH:MM:SS" / "MM:SS" / plain seconds -> microseconds. */
+static int parse_time(const char *s, uint64_t *out_us)
+{
+    uint64_t total = 0, part = 0;
+    int digits = 0, fields = 0;
+    for (;; s++) {
+        if (*s >= '0' && *s <= '9') {
+            part = part * 10u + (uint64_t)(*s - '0');
+            if (++digits > 9) return 0;
+        } else if (*s == ':' || !*s) {
+            if (!digits || ++fields > 3) return 0;
+            total = total * 60u + part;
+            part = 0; digits = 0;
+            if (!*s) break;
+        } else {
+            return 0;
+        }
+    }
+    *out_us = total * 1000000u;
+    return 1;
 }
 
 static FILE *n76_hostlog;
@@ -462,20 +565,83 @@ static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
     return MR_OK;
 }
 
-int main(int argc, char **argv)
-{
-    setvbuf(stdout, NULL, _IONBF, 0);
-#if MR_DEBUG_LOGS
-    n76_hostlog = fopen("N76_HOST.TXT", "ab");
-#endif
-    n76_hlog("N76_START");
-    DBG_PRINTF("[N76] mrberry HOST-DEMUX trace on N75 scheduler base\n");
-    DBG_PRINTF("[H4F] BerryVP context in BSS: %lu bytes @ %p\n", (unsigned long)sizeof g_bvp, (void *)&g_bvp);
+/* ---- One playback session -------------------------------------------------
+ *
+ * A session opens the BerryVP stream, feeds it from the current demux
+ * position and closes it again. Pause holds the feed inside the session. A
+ * jump (seek) ends the session: berryvp.library has no flush, so mrberry
+ * closes the stream, repositions the demuxer on a keyframe and opens a new
+ * one, which is the same as starting the next film in a row.
+ *
+ * After a seek, timestamps are rebased so the new session starts at 0, like
+ * a fresh file: every packet's PTS has the keyframe's time (base_us)
+ * subtracted, and packets from before the keyframe are dropped. With no
+ * seek, base_us is 0 and packets pass through unchanged. */
+enum {
+    SESSION_END = 0,     /* natural end of file */
+    SESSION_STOP,        /* user stop           */
+    SESSION_SEEK,        /* jump requested      */
+    SESSION_ERROR
+};
+
+typedef struct {
     mr_demux *d;
     const mr_video_info *vi;
     const mr_audio_info *ai;
-    mr_packet pkt;
+    int use_audio;            /* in: wanted; cleared if the track is refused */
+    int paula;                /* sound through the Amiga, not the Pi's HDMI */
+    int low_rate, mono;       /* Paula only, as in mrplay                  */
+    int32_t av_offset_us;     /* Paula only: delay the sound by this much  */
+    int is_mov;
+    int can_seek;
+    uint64_t base_us;         /* media time this session starts at          */
+    const char *audio_note;   /* added to the status line, may be NULL      */
+    /* results */
+    int64_t seek_delta_us;
+    uint64_t pos_us;
+    char error[128];
+} session;
+
+/* Session clock for the status line and for jumps: wall time since the
+ * first video access unit went out, minus time spent paused. */
+typedef struct {
+    int started;
+    uint32_t start_us;
+    uint32_t paused_us;
+} play_clock;
+
+static uint64_t clock_pos(const session *s, const play_clock *c)
+{
+    if (!c->started) return s->base_us;
+    return s->base_us +
+           (uint64_t)(uint32_t)(ac309i_read_sys_us() - c->start_us - c->paused_us);
+}
+
+static void status_playing(const session *s, const play_clock *c, int paused)
+{
+    char text[160], at[24];
+    format_time(at, sizeof at, clock_pos(s, c));
+    snprintf(text, sizeof text, "%s%dx%d, %s, %s%s%s",
+             paused ? "Paused - " : "", s->vi->width, s->vi->height,
+             mr_demux_container_name(s->d), at,
+             s->audio_note ? ", " : "", s->audio_note ? s->audio_note : "");
+    status_live(MR_PLAYER_STATE_PLAYING, text);
+}
+
+/* Returns 0 to drop the packet (it lies before the seek point). */
+static int rebase_packet(const session *s, mr_packet *pkt)
+{
+    if (!s->base_us || !pkt->has_pts) return 1;
+    if (pkt->pts_us < s->base_us) return 0;
+    pkt->pts_us -= s->base_us;
+    return 1;
+}
+
+static int play_session(session *s)
+{
     mr_berryvp *bvp = &g_bvp;
+    mr_packet pkt;
+    mr_status st;
     unsigned long seen = 0, sent = 0, skipped = 0;
     unsigned long audio_seen = 0, audio_sent = 0;
     /* P32: FAST06 E-AC3 natural-EOF drain clock, merged into the
@@ -483,212 +649,181 @@ int main(int argc, char **argv)
     uint64_t eac3_first_pts_us = 0, eac3_last_pts_us = 0;
     uint32_t eac3_first_wall_us = 0;
     int eac3_pts_clock_valid = 0;
-    int ac309i_is_mov = 0;
     ac309i_pacer ac309i_pace;
     int audio_enabled = 0;
     int n73_prime_ready = 0;
     int p04_first_video_sent = 0;
-    int aborted = 0;
-    mr_status st;
+    int result = SESSION_END;
+    play_clock clk;
+    uint32_t last_status_us = 0;
+    const mr_audio_info *ai = s->ai;
+    mrb_paula *paula = NULL;
+    /* Where the 68k time goes, for the log: demuxing, and handing video to
+     * the library (which includes its own wait until a frame is due). */
+    uint64_t t_demux_us = 0, t_vsend_us = 0;
+    uint32_t t_session0 = 0, t0;
 
-    if (argc != 2) {
-        printf("mrberry - H.264 hardware A/V player\n"
-               "Usage: mrberry <movie.mkv|movie.mp4|movie.ts>\n");
-        return 5;
-    }
-    p06_status_write(P06_STATE_OPENING, "H.264 / VideoCore",
-                     "Opening PiStorm VideoCore playback...");
-    DBG_PRINTF("[D01] before mr_demux_open_file\n");
-    d = mr_demux_open_file(argv[1]);
-    DBG_PRINTF("[D02] after mr_demux_open_file ptr=%p\n", (void *)d);
-    if (!d) {
-        printf("Error: cannot open media: %s\n", mr_demux_last_open_error());
-        p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
-                         "Could not open media file");
-        return 10;
-    }
-    DBG_PRINTF("[D03] before mr_demux_video\n");
-    vi = mr_demux_video(d);
-    DBG_PRINTF("[D04] after mr_demux_video ptr=%p\n", (void *)vi);
-    if (!vi || !vi->valid || vi->fourcc != MR_FOURCC('a','v','c','1')) {
-        char codec[80];
-        mr_demux_describe_video_codec(d, codec, sizeof codec);
-        printf("Error: H.264/AVC video is required (found: %s).\n", codec);
-        p06_status_write(P06_STATE_UNSUPPORTED, codec,
-                         "H.264/AVC video is required");
-        mr_demux_close(d);
-        return 10;
-    }
-    DBG_PRINTF("MintVID demux: %s, H.264 %dx%d, config=%lu bytes\n",
-           mr_demux_container_name(d), vi->width, vi->height,
-           (unsigned long)vi->config_len);
-    ac309i_is_mov = !strcmp(mr_demux_container_name(d), "MOV");
-    ai = mr_demux_audio(d);
-    if (ai && ai->valid) {
-        char acodec[80];
-        mr_demux_describe_audio_codec(d, acodec, sizeof acodec);
-        DBG_PRINTF("MintVID audio: %s, %lu Hz, %u ch, config=%u bytes\n",
-               acodec, (unsigned long)ai->sample_rate, (unsigned)ai->channels,
-               (unsigned)ai->config_len);
-    } else {
-        DBG_PRINTF("MintVID audio: no usable audio track\n");
-    }
-    DBG_PRINTF("[N75] Video PTS enabled; natural A/V interleave, scheduler owns presentation time.\n");
-    fflush(stdout);
+    memset(&clk, 0, sizeof clk);
+    s->seek_delta_us = 0;
 
-    /* AC308N3 realtime policy: do not even start the BerryVP graph for
-     * multichannel E-AC3.  The current CPU1 scalar path decodes it correctly
-     * but measured far below realtime; stereo E-AC3 remains supported. */
-    if (ai && ai->valid && ai->format_tag == MR_AUDIO_FORMAT_EAC3 && ai->channels != 2) {
-        if (ai->channels == 6)
-            printf("Error: E-AC3 5.1 audio is not supported for real-time playback. Stereo E-AC3 only.\n");
-        else
-            printf("Error: E-AC3 multichannel audio (%u channels) is not supported for real-time playback. Stereo E-AC3 only.\n",
-                   (unsigned)ai->channels);
-        p06_status_write(P06_STATE_UNSUPPORTED, "E-AC3",
-                         "Multichannel E-AC3 is not supported in real time");
-        mr_demux_close(d);
-        return 20;
-    }
-
-    DBG_PRINTF("[D05] before mr_berryvp_open\n");
-    st = mr_berryvp_open(bvp, vi);
-    DBG_PRINTF("[D06] after mr_berryvp_open st=%ld\n", (long)st);
+    /* HDMI audio only when ConfigAudio will be called and will accept the
+     * track; otherwise the library must build its graph without the
+     * audio-clocked scheduler. */
+    st = mr_berryvp_open(bvp, s->vi,
+                         s->use_audio && !s->paula &&
+                         mr_berryvp_hdmi_audio_ok(ai));
     if (st != MR_OK) {
-        p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
-                         "Could not open BerryVP video graph");
-        mr_demux_close(d);
-        return 20;
+        snprintf(s->error, sizeof s->error, "Could not open BerryVP video graph");
+        return SESSION_ERROR;
     }
-    if (ac309i_is_mov) {
+    if (s->is_mov) {
         /* VPv149 hardware state: MP4 H.264 feed fragments are 128 KiB.
          * This is independent of presentation PTS and of the host-time gate. */
         bvp->video_chunk_limit = 0x00020000UL;
-        DBG_PRINTF("[AC309I] MOV/MP4 H.264 fragment cap: 128 KiB (VPv149 proven)\n");
         n76_hlog("AC309I_MP4_128K_FRAGMENT_CAP");
     }
 
-    if (ai && ai->valid && (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_AC3 || ai->format_tag == MR_AUDIO_FORMAT_EAC3)) {
+    if (s->use_audio && s->paula) {
+        /* MintVID's own decoders and Paula. The VideoCore plays the picture
+         * alone, exactly as with --no-audio, so the BerryCore kernel is not
+         * needed. */
+        static char why[96];
+        char reason[64];
+        paula = mrb_paula_open(ai, s->low_rate, s->mono, s->av_offset_us,
+                               reason, sizeof reason);
+        if (paula) {
+            snprintf(why, sizeof why, "%s", mrb_paula_describe(paula));
+            printf("Audio: %s\n", why);
+        } else {
+            printf("Warning: Amiga audio: %s; playing video without sound.\n",
+                   reason);
+            snprintf(why, sizeof why, "no sound (%s)", reason);
+            s->use_audio = 0;   /* do not try again after a jump */
+        }
+        s->audio_note = why;
+        n73_prime_ready = 1;
+    } else if (s->use_audio) {
         st = mr_berryvp_config_audio(bvp, ai);
         if (st == MR_OK) {
             audio_enabled = 1;
             n73_prime_ready = 1; /* N75: clock/scheduler already armed in ConfigAudio; no host-side video hold. */
-            if (ai->format_tag == MR_AUDIO_FORMAT_AC3)
-                DBG_PRINTF("[AC307A] AC3/berry_ac3.module audio armed; N97QD host + N79Q library path\n");
-            else if (ai->format_tag == MR_AUDIO_FORMAT_EAC3)
-                DBG_PRINTF("[AC308N3] E-AC3 stereo/berry_eac3.module audio armed; stereo HDMI renderer\n");
-            else
-                DBG_PRINTF("[A03] AAC/BerryFAAD03 audio armed; N75 natural scheduler feed enabled\n");
             n76_hlog("N76_AFTER_CONFIG_AUDIO_OK");
+        } else if (st == MR_EUNSUPPORTED) {
+            /* Refused by mrberry's own format check before the library saw
+             * it: the stream is untouched, so play the picture alone. */
+            printf("Warning: this audio format is not supported; playing video without sound.\n");
+            s->use_audio = 0;
+            s->audio_note = "no sound (audio format not supported)";
+            n73_prime_ready = 1;
         } else {
-            printf("Error: audio setup failed; playback stopped.\n");
-            p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
-                             "Audio setup failed");
+            snprintf(s->error, sizeof s->error,
+                     "Audio setup failed (is the BerryCore Emu68 kernel installed?)");
             mr_berryvp_close(bvp);
-            mr_demux_close(d);
-            return 20;
+            return SESSION_ERROR;
         }
     } else {
-        printf("Warning: no supported AAC/AC3/E-AC3 audio track; video will continue without audio.\n");
         n73_prime_ready = 1;
     }
 
-    ac309i_pacer_init(&ac309i_pace, vi, ac309i_is_mov && audio_enabled);
-    if (ac309i_pace.enabled) {
-        DBG_PRINTF("[AC309I] VPv149 host-time feed pacer: fps=%lu/%lu step=%lu + %lu/%lu us, lead=%lu us\n",
-               (unsigned long)vi->rate, (unsigned long)vi->scale,
-               (unsigned long)ac309i_pace.step_whole_us,
-               (unsigned long)ac309i_pace.step_rem,
-               (unsigned long)ac309i_pace.step_den,
-               (unsigned long)ac309i_pace.lead_us);
-        n76_hlog("AC309I_HOST_TIME_PACER_ACTIVE_LEAD_250MS");
-    }
-
-    if (p05_input_open()) n76_hlog("P05_ESC_INPUT_WINDOW_OK");
-    else n76_hlog("P05_ESC_INPUT_WINDOW_FAIL");
-    {
-        char p06_text[128];
-        snprintf(p06_text, sizeof p06_text, "%dx%d, %s",
-                 vi->width, vi->height, mr_demux_container_name(d));
-        p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", p06_text);
-        n76_hlog("P06_STATUS_PLAYING");
-    }
+    ac309i_pacer_init(&ac309i_pace, s->vi, s->is_mov && audio_enabled);
+    if (ac309i_pace.enabled) n76_hlog("AC309I_HOST_TIME_PACER_ACTIVE_LEAD_250MS");
+    status_playing(s, &clk, 0);
 
     n76_hlog("N76_BEFORE_DEMUX_LOOP");
+    t_session0 = (uint32_t)ac309i_read_sys_us();
     for (;;) {
-        if (p05_input_poll_stop()) {
+        int64_t delta = 0;
+        int ev = poll_event(&delta);
+        if (ev == EV_PAUSE) {
+            /* Hold the feed. Nothing new reaches the VideoCore, so the
+             * picture stops once what is already queued has played. */
+            uint32_t paused_at = (uint32_t)ac309i_read_sys_us(), dt;
+            status_playing(s, &clk, 1);
+            mrb_paula_pause(paula, 1);
+            n76_hlog("PAUSE_ON");
+            for (;;) {
+                Delay(2);
+                mrb_paula_service(paula);
+                delta = 0;
+                ev = poll_event(&delta);
+                if (ev == EV_PAUSE || ev == EV_STOP ||
+                    (ev == EV_SEEK && s->can_seek)) break;
+            }
+            dt = (uint32_t)ac309i_read_sys_us() - paused_at;
+            /* Move every wall-clock anchor past the pause. */
+            ac309i_pace.base_us += dt;
+            eac3_first_wall_us += dt;
+            clk.paused_us += dt;
+            mrb_paula_pause(paula, 0);
+            n76_hlog("PAUSE_OFF");
+            if (ev == EV_PAUSE) { status_playing(s, &clk, 0); ev = EV_NONE; }
+        }
+        if (ev == EV_STOP) {
             n76_hlog("P05_ESC_STOP");
-            aborted = 1;
-            st = MR_EAGAIN;
+            result = SESSION_STOP;
             break;
         }
-        if (seen < 3 && audio_seen < 3) n76_hlog("N76_BEFORE_SETSIGNAL");
-        { ULONG n76_sig = bvp_exec_setsignal(0, 0);
-          if (seen < 3 && audio_seen < 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_SETSIGNAL sig=%08lx\n", (unsigned long)n76_sig); fflush(n76_hostlog); }
-          if (n76_sig & SIGBREAKF_CTRL_C) {
-            aborted = 1;
-            st = MR_EAGAIN;
-            break;
-          }
+        if (ev == EV_SEEK) {
+            if (s->can_seek) {
+                s->seek_delta_us = delta;
+                result = SESSION_SEEK;
+                break;
+            }
+            /* TS and other unindexed sources cannot jump. */
         }
-        if (seen < 3 && audio_seen < 3) n76_hlog("N76_BEFORE_DEMUX_NEXT");
-        if (seen < 3) DBG_PRINTF("[D10] before demux_next_packet seen=%lu\n", seen);
-        st = mr_demux_next_packet(d, &pkt);
-        if (seen < 3 && audio_seen < 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_DEMUX_NEXT st=%ld video=%d len=%lu pts=%d\n", (long)st, pkt.is_video, (unsigned long)pkt.len, pkt.has_pts); fflush(n76_hostlog); }
-        if (seen < 3) DBG_PRINTF("[D11] after demux_next_packet st=%ld is_video=%d len=%lu\n", (long)st, pkt.is_video, (unsigned long)pkt.len);
+        {
+            uint32_t now = (uint32_t)ac309i_read_sys_us();
+            if ((uint32_t)(now - last_status_us) >= 1000000u) {
+                last_status_us = now;
+                status_playing(s, &clk, 0);
+            }
+        }
+
+        mrb_paula_service(paula);
+        t0 = (uint32_t)ac309i_read_sys_us();
+        st = mr_demux_next_packet(s->d, &pkt);
+        t_demux_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
         if (st != MR_OK) break;
         if (!pkt.len) continue;
+        if (!rebase_packet(s, &pkt)) continue;
         if (!pkt.is_video) {
             audio_seen++;
+            if (paula) {
+                if (!mrb_paula_feed(paula, &pkt)) {
+                    snprintf(s->error, sizeof s->error,
+                             "Cannot buffer audio (out of memory)");
+                    result = SESSION_ERROR;
+                    break;
+                }
+                audio_sent++;
+                continue;
+            }
             if (!audio_enabled) continue;
-            if (audio_seen <= 4)
-                DBG_PRINTF("[A10] audio #%lu len=%lu pts=%s\n", audio_seen,
-                       (unsigned long)pkt.len, pkt.has_pts ? "yes" : "no");
 
             /* PiStorm04: retain compressed startup audio until one real
              * H.264 AU has completed SendVideo. */
             if (!p04_first_video_sent) {
                 if (!p04_queue_audio(&pkt)) {
-                    printf("Error: cannot buffer startup audio packet %lu (%lu bytes).\n",
-                           audio_seen, (unsigned long)pkt.len);
-                    p04_free_audio_queue();
-                    p05_input_close();
-                    n73_free_video_queue();
-                    mr_berryvp_close(bvp);
-                    mr_demux_close(d);
-                    return 20;
-                }
-                if (n76_hostlog) {
-                    fprintf(n76_hostlog,
-                            "P04_STARTUP_AUDIO_QUEUED count=%lu bytes=%lu\n",
-                            p04_aqueued, p04_abytes);
-                    fflush(n76_hostlog);
+                    snprintf(s->error, sizeof s->error,
+                             "Cannot buffer startup audio (out of memory)");
+                    result = SESSION_ERROR;
+                    break;
                 }
                 continue;
             }
 
-            if (audio_seen <= 3) n76_hlog("N76_BEFORE_SEND_AUDIO");
             st = mr_berryvp_send_audio_packet(bvp, &pkt);
-            if (audio_seen <= 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_SEND_AUDIO st=%ld\n", (long)st); fflush(n76_hostlog); }
             if (st != MR_OK) {
-                printf("Error: audio playback failed at packet %lu.\n", audio_seen);
-                mr_berryvp_close(bvp);
-                mr_demux_close(d);
-                return 20;
+                snprintf(s->error, sizeof s->error,
+                         "Audio playback failed at packet %lu", audio_seen);
+                result = SESSION_ERROR;
+                break;
             }
             if (ai && ai->format_tag == MR_AUDIO_FORMAT_EAC3 && pkt.has_pts) {
                 if (!eac3_pts_clock_valid) {
                     eac3_first_pts_us = pkt.pts_us;
                     eac3_first_wall_us = (uint32_t)ac309i_read_sys_us();
                     eac3_pts_clock_valid = 1;
-                    if (n76_hostlog) {
-                        fprintf(n76_hostlog,
-                                "FAST06_EAC3_ANCHOR pts=$%08lx:%08lx wall=%lu\n",
-                                (unsigned long)(pkt.pts_us >> 32),
-                                (unsigned long)pkt.pts_us,
-                                (unsigned long)eac3_first_wall_us);
-                        fflush(n76_hostlog);
-                    }
                 }
                 eac3_last_pts_us = pkt.pts_us;
             }
@@ -696,139 +831,78 @@ int main(int argc, char **argv)
             if (ac309i_pace.enabled && n73_prime_ready && n73_vhead) {
                 st = ac309i_service_mov_video(bvp, &ac309i_pace, &sent, &skipped);
                 if (st != MR_OK) {
-                    printf("Error: timed MP4 video service failed after audio packet %lu.\n", audio_seen);
-                    n73_free_video_queue();
-                    mr_berryvp_close(bvp);
-                    mr_demux_close(d);
-                    return 20;
+                    snprintf(s->error, sizeof s->error,
+                             "Timed MP4 video feed failed");
+                    result = SESSION_ERROR;
+                    break;
                 }
             }
             if (!n73_prime_ready && audio_sent >= 4) {
-                DBG_PRINTF("[N75] LEGACY-GUARD (unexpected) flushing %lu held video AU(s).\n", n73_vqueued);
                 n73_prime_ready = 1;
                 st = n73_flush_video_queue(bvp, &sent, &skipped);
                 if (st != MR_OK) {
-                    printf("Error: queued video flush failed after audio initialization.\n");
-                    n73_free_video_queue();
-                    mr_berryvp_close(bvp);
-                    mr_demux_close(d);
-                    return 20;
+                    snprintf(s->error, sizeof s->error,
+                             "Queued video flush failed");
+                    result = SESSION_ERROR;
+                    break;
                 }
             }
-            if ((audio_sent & 127u) == 0)
-                DBG_PRINTF("audio packets sent: %lu\n", audio_sent);
             continue;
         }
         seen++;
-        if (seen <= 8) {
-            unsigned long phi = (unsigned long)(pkt.pts_us >> 32);
-            unsigned long plo = (unsigned long)(pkt.pts_us & 0xffffffffUL);
-            DBG_PRINTF("DIAG video #%lu len=%lu annexb=%d has_pts=%d pts=$%08lx:%08lx\n",
-                   seen, (unsigned long)pkt.len, pkt.is_annexb, pkt.has_pts, phi, plo);
-            fflush(stdout);
-        }
         if (!n73_prime_ready) {
             if (!n73_queue_video(&pkt)) {
-                printf("Error: cannot buffer video access unit %lu (%lu bytes).\n",
-                       seen, (unsigned long)pkt.len);
-                n73_free_video_queue();
-                mr_berryvp_close(bvp);
-                mr_demux_close(d);
-                return 20;
+                snprintf(s->error, sizeof s->error,
+                         "Cannot buffer video (out of memory)");
+                result = SESSION_ERROR;
+                break;
             }
-            if (seen <= 8)
-                DBG_PRINTF("[N75] hold video #%lu until Audio-Master (%lu bytes, pts=%s)\n",
-                       seen, (unsigned long)pkt.len, pkt.has_pts ? "yes" : "no");
             continue;
         }
         if (ac309i_pace.enabled) {
             if (!n73_queue_video(&pkt)) {
-                printf("Error: cannot queue timed MP4 video access unit %lu (%lu bytes).\n",
-                       seen, (unsigned long)pkt.len);
-                n73_free_video_queue();
-                mr_berryvp_close(bvp);
-                mr_demux_close(d);
-                return 20;
+                snprintf(s->error, sizeof s->error,
+                         "Cannot queue video (out of memory)");
+                result = SESSION_ERROR;
+                break;
             }
-            if (n73_vqueued > ac309i_pace.queue_peak) {
+            if (n73_vqueued > ac309i_pace.queue_peak)
                 ac309i_pace.queue_peak = n73_vqueued;
-                if (n76_hostlog && (ac309i_pace.queue_peak <= 8u || (ac309i_pace.queue_peak & 15u) == 0u)) {
-                    fprintf(n76_hostlog,
-                            "AC309I_QUEUE_PEAK=%lu vpts=$%08lx:%08lx\n",
-                            ac309i_pace.queue_peak,
-                            (unsigned long)(pkt.pts_us >> 32),
-                            (unsigned long)pkt.pts_us);
-                    fflush(n76_hostlog);
-                }
-            }
+            t0 = (uint32_t)ac309i_read_sys_us();
             st = ac309i_service_mov_video(bvp, &ac309i_pace, &sent, &skipped);
+            t_vsend_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
             if (st != MR_OK) {
-                printf("Error: timed MP4 video service failed at video packet %lu.\n", seen);
-                p04_free_audio_queue();
-                p05_input_close();
-                n73_free_video_queue();
-                mr_berryvp_close(bvp);
-                mr_demux_close(d);
-                return 20;
+                snprintf(s->error, sizeof s->error,
+                         "Timed MP4 video feed failed at frame %lu", seen);
+                result = SESSION_ERROR;
+                break;
             }
-            if (!p04_first_video_sent && sent) {
-                p04_first_video_sent = 1;
-                n76_hlog("P04_FIRST_VIDEO_SENT_BEFORE_PCM");
-                if (ai && ai->format_tag == MR_AUDIO_FORMAT_EAC3 && !eac3_pts_clock_valid &&
-                    p04_ahead && p04_ahead->has_pts) {
-                    eac3_first_pts_us = p04_ahead->pts_us;
-                    eac3_last_pts_us = (p04_atail && p04_atail->has_pts) ?
-                                       p04_atail->pts_us : p04_ahead->pts_us;
-                    eac3_first_wall_us = (uint32_t)ac309i_read_sys_us();
-                    eac3_pts_clock_valid = 1;
-                    if (n76_hostlog) {
-                        fprintf(n76_hostlog,
-                                "FAST06_EAC3_ANCHOR pts=$%08lx:%08lx wall=%lu\n",
-                                (unsigned long)(eac3_first_pts_us >> 32),
-                                (unsigned long)eac3_first_pts_us,
-                                (unsigned long)eac3_first_wall_us);
-                        fflush(n76_hostlog);
-                    }
-                }
-                st = p04_flush_audio_queue(bvp, &audio_sent);
-                if (st != MR_OK) {
-                    printf("Error: startup audio flush failed after first timed video packet.\n");
-                    p04_free_audio_queue();
-                    p05_input_close();
-                    n73_free_video_queue();
-                    mr_berryvp_close(bvp);
-                    mr_demux_close(d);
-                    return 20;
-                }
-                if (n76_hostlog) {
-                    fprintf(n76_hostlog,
-                            "P04_STARTUP_AUDIO_FLUSH_OK sent=%lu remaining=%lu\n",
-                            audio_sent, p04_aqueued);
-                    fflush(n76_hostlog);
-                }
+        } else {
+            t0 = (uint32_t)ac309i_read_sys_us();
+            st = mr_berryvp_send_packet(bvp, &pkt);
+            t_vsend_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
+            if (st == MR_EAGAIN) {
+                skipped++;
+                continue;
             }
-            continue;
+            if (st != MR_OK) {
+                snprintf(s->error, sizeof s->error,
+                         "Video playback failed at frame %lu", seen);
+                result = SESSION_ERROR;
+                break;
+            }
+            sent++;
         }
-        if (seen <= 3) DBG_PRINTF("[D12] before send_packet #%lu\n", seen);
-        if (seen <= 3) n76_hlog("N76_BEFORE_SEND_VIDEO");
-        st = mr_berryvp_send_packet(bvp, &pkt);
-        if (seen <= 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_SEND_VIDEO st=%ld\n", (long)st); fflush(n76_hostlog); }
-        if (seen <= 3) DBG_PRINTF("[D13] after send_packet #%lu st=%ld\n", seen, (long)st);
-        if (st == MR_EAGAIN) {
-            skipped++;
-            continue;
-        }
-        if (st != MR_OK) {
-            printf("Error: video playback failed at packet %lu.\n", seen);
-            mr_berryvp_close(bvp);
-            mr_demux_close(d);
-            return 20;
-        }
-        sent++;
 
-        if (!p04_first_video_sent) {
+        if (!p04_first_video_sent && sent) {
             p04_first_video_sent = 1;
+            clk.started = 1;
+            clk.start_us = (uint32_t)ac309i_read_sys_us();
             n76_hlog("P04_FIRST_VIDEO_SENT_BEFORE_PCM");
+            /* The first frame Paula sound lines up with. Paula mode never
+             * uses the MP4 pacer, so this is the packet just sent. */
+            mrb_paula_anchor(paula, clk.start_us,
+                             pkt.has_pts ? pkt.pts_us : 0);
             if (ai && ai->format_tag == MR_AUDIO_FORMAT_EAC3 && !eac3_pts_clock_valid &&
                 p04_ahead && p04_ahead->has_pts) {
                 eac3_first_pts_us = p04_ahead->pts_us;
@@ -836,88 +910,84 @@ int main(int argc, char **argv)
                                    p04_atail->pts_us : p04_ahead->pts_us;
                 eac3_first_wall_us = (uint32_t)ac309i_read_sys_us();
                 eac3_pts_clock_valid = 1;
-                if (n76_hostlog) {
-                    fprintf(n76_hostlog,
-                            "FAST06_EAC3_ANCHOR pts=$%08lx:%08lx wall=%lu\n",
-                            (unsigned long)(eac3_first_pts_us >> 32),
-                            (unsigned long)eac3_first_pts_us,
-                            (unsigned long)eac3_first_wall_us);
-                    fflush(n76_hostlog);
-                }
             }
             st = p04_flush_audio_queue(bvp, &audio_sent);
             if (st != MR_OK) {
-                printf("Error: startup audio flush failed after first video packet.\n");
-                p04_free_audio_queue();
-                p05_input_close();
-                n73_free_video_queue();
-                mr_berryvp_close(bvp);
-                mr_demux_close(d);
-                return 20;
-            }
-            if (n76_hostlog) {
-                fprintf(n76_hostlog,
-                        "P04_STARTUP_AUDIO_FLUSH_OK sent=%lu remaining=%lu\n",
-                        audio_sent, p04_aqueued);
-                fflush(n76_hostlog);
+                snprintf(s->error, sizeof s->error,
+                         "Startup audio flush failed");
+                result = SESSION_ERROR;
+                break;
             }
         }
-
-        if ((sent & 63u) == 0)
-            DBG_PRINTF("video packets sent: %lu\n", sent);
     }
 
-    if (aborted) {
-        DBG_PRINTF("Ctrl-C: stopping video and returning to Workbench.\n");
-    } else if (st != MR_EAGAIN) {
-        /* Current MintVID demuxers use MR_EAGAIN for normal EOF. Preserve a
-         * diagnostic if that convention changes or a malformed stream stops us. */
+    {
+        /* Wall time of the feed loop, pauses excluded. "other" is
+         * everything not listed: event polling, Paula service, queueing. */
+        uint32_t wall_ms = (uint32_t)((uint32_t)ac309i_read_sys_us() -
+                                      t_session0 - clk.paused_us) / 1000u;
+        unsigned long dec_ms = 0, pkts = 0, starv = 0, minbuf = 0;
+        unsigned long demux_ms = (unsigned long)(t_demux_us / 1000u);
+        unsigned long vsend_ms = (unsigned long)(t_vsend_us / 1000u);
+        unsigned long used;
+        mrb_paula_timing(paula, &dec_ms, &pkts, &starv, &minbuf);
+        used = demux_ms + vsend_ms + dec_ms;
+        DBG_PRINTF("mrberry timing: wall=%lu ms frames=%lu demux=%lu ms "
+                   "video-send=%lu ms audio-decode=%lu ms (%lu packets) "
+                   "other=%lu ms\n",
+                   (unsigned long)wall_ms, sent, demux_ms, vsend_ms, dec_ms,
+                   pkts, used < wall_ms ? (unsigned long)wall_ms - used : 0UL);
+        if (paula)
+            DBG_PRINTF("Amiga audio: %lu underruns, least queued %lu ms\n",
+                       starv, minbuf);
+    }
+    if (result == SESSION_END && st != MR_EAGAIN) {
+        /* Current MintVID demuxers use MR_EAGAIN for normal EOF. */
         printf("Error: demux ended with status %ld after %lu video packets.\n",
                (long)st, seen);
     }
 
-    if (ac309i_pace.enabled && n73_vhead && !aborted) {
+    if (result == SESSION_END && ac309i_pace.enabled && n73_vhead) {
         /* Natural EOF normally leaves only a tiny tail.  Let the absolute
          * timeline reach it without inventing new PTS or changing the grid.
          * Bound this final CPU-only wait to two seconds of the same 1-MHz
          * timer so malformed timing cannot create an endless close hang. */
         uint32_t drain_start = (uint32_t)ac309i_read_sys_us();
         while (n73_vhead) {
+            int64_t delta;
             st = ac309i_service_mov_video(bvp, &ac309i_pace, &sent, &skipped);
-            if (st != MR_OK) break;
-            if (!n73_vhead) break;
-            if (p05_input_poll_stop()) {
-                n76_hlog("P05_ESC_STOP_DRAIN");
-                aborted = 1;
-                break;
-            }
-            if ((bvp_exec_setsignal(0, 0) & SIGBREAKF_CTRL_C) != 0) { aborted = 1; break; }
+            if (st != MR_OK || !n73_vhead) break;
+            if (poll_event(&delta) == EV_STOP) { result = SESSION_STOP; break; }
             if ((uint32_t)(ac309i_read_sys_us() - drain_start) >= 2000000u) break;
         }
     }
-    if (ac309i_pace.enabled) {
-        uint32_t elapsed = ac309i_pace.started ?
-            (uint32_t)(ac309i_read_sys_us() - ac309i_pace.base_us) : 0;
-        DBG_PRINTF("[AC309I] HOST-TIME-PACE sent=%lu elapsed=%lu next=%lu lead=%lu feedlatecnt=%lu maxfeedlate=%lu queuepeak=%lu remaining=%lu\n",
-               ac309i_pace.sent_aus, (unsigned long)elapsed,
-               (unsigned long)ac309i_pace.target_us, (unsigned long)ac309i_pace.lead_us,
-               ac309i_pace.late_count, (unsigned long)ac309i_pace.max_late_us,
-               ac309i_pace.queue_peak, n73_vqueued);
-    }
-    if (n73_vhead) {
-        printf("Warning: %lu queued video access unit(s) remained at end of playback and were released.\n", n73_vqueued);
-        n73_free_video_queue();
-    }
+    n73_free_video_queue();
+    p04_free_audio_queue();
 
-    if (p04_ahead) {
-        printf("Warning: %lu startup audio packet(s) remained queued because no video AU was submitted.\n",
-               p04_aqueued);
-        p04_free_audio_queue();
+    /* Paula still holds a few seconds of sound at the end of the file. */
+    if (result == SESSION_END && paula) {
+        uint32_t drain_start = (uint32_t)ac309i_read_sys_us();
+        while (!mrb_paula_idle(paula)) {
+            int64_t delta;
+            int ev;
+            Delay(1);
+            ev = poll_event(&delta);
+            if (ev == EV_STOP) { result = SESSION_STOP; break; }
+            if ((uint32_t)(ac309i_read_sys_us() - drain_start) >= 10000000u) break;
+        }
+    }
+    if (paula) {
+        unsigned long sil, drop, fixes;
+        mrb_paula_stats(paula, &sil, &drop, &fixes);
+        DBG_PRINTF("Amiga audio sync: %lu corrections, %lu ms silence added, "
+                   "%lu ms dropped\n", fixes, sil, drop);
+        mrb_paula_close(paula);
+        paula = NULL;
     }
 
     /* P32/FAST06: at natural E-AC3 EOF, keep the graph alive until the final
      * scheduled PCM tail has had time to present. ESC remains active here. */
-    if (!aborted && st == MR_EAGAIN && eac3_pts_clock_valid && ai && ai->sample_rate) {
+    if (result == SESSION_END && eac3_pts_clock_valid && ai && ai->sample_rate) {
         uint64_t frame_us = (1536ULL * 1000000ULL + (uint64_t)ai->sample_rate - 1ULL) /
                             (uint64_t)ai->sample_rate;
         uint64_t expected_us = frame_us + 150000ULL;
@@ -930,56 +1000,179 @@ int main(int argc, char **argv)
             if (rem > 15000000ULL) rem = 15000000ULL;
             wait_us = (uint32_t)rem;
         }
-        if (n76_hostlog) {
-            fprintf(n76_hostlog,
-                    "FAST06_EAC3_EOF expected=%lu elapsed=%lu wait=%lu first=$%08lx:%08lx last=$%08lx:%08lx\n",
-                    (unsigned long)expected_us, (unsigned long)elapsed_us,
-                    (unsigned long)wait_us,
-                    (unsigned long)(eac3_first_pts_us >> 32),
-                    (unsigned long)eac3_first_pts_us,
-                    (unsigned long)(eac3_last_pts_us >> 32),
-                    (unsigned long)eac3_last_pts_us);
-            fflush(n76_hostlog);
-        }
         if (wait_us) {
             uint32_t wait_start = (uint32_t)ac309i_read_sys_us();
             while ((uint32_t)(ac309i_read_sys_us() - wait_start) < wait_us) {
-                if (p05_input_poll_stop()) {
-                    n76_hlog("P05_ESC_STOP_DRAIN");
-                    aborted = 1;
-                    break;
-                }
-                if ((bvp_exec_setsignal(0, 0) & SIGBREAKF_CTRL_C) != 0) {
-                    aborted = 1;
-                    break;
-                }
-            }
-            if (n76_hostlog) {
-                fprintf(n76_hostlog, "FAST06_EAC3_EOF_DRAIN_DONE waited=%lu aborted=%d\n",
-                        (unsigned long)(uint32_t)(ac309i_read_sys_us() - wait_start), aborted);
-                fflush(n76_hostlog);
+                int64_t delta;
+                if (poll_event(&delta) == EV_STOP) { result = SESSION_STOP; break; }
             }
         }
     }
 
-    DBG_PRINTF("mrberry A/V complete: video=%lu sent=%lu preconfig-skipped=%lu bytes=%lu; "
-           "audio=%lu sent=%lu adts-bytes=%lu\n",
-           seen, sent, skipped, bvp->bytes, audio_seen, audio_sent, bvp->audio_bytes);
-    DBG_PRINTF("Closing BerryVP stream (EOS + Workbench return) ...\n");
-    st = mr_berryvp_close(bvp);
-    p05_input_close();
-    mr_demux_close(d);
-    if (st != MR_OK) {
-        p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
-                         "VideoCore cleanup failed");
-        return 20;
+    s->pos_us = clock_pos(s, &clk);
+    DBG_PRINTF("mrberry session: video=%lu sent=%lu skipped=%lu audio=%lu sent=%lu\n",
+               seen, sent, skipped, audio_seen, audio_sent);
+    if (mr_berryvp_close(bvp) != MR_OK && result != SESSION_ERROR) {
+        snprintf(s->error, sizeof s->error, "VideoCore cleanup failed");
+        result = SESSION_ERROR;
+    }
+    return result;
+}
+
+static void usage(void)
+{
+    printf("mrberry - H.264 hardware A/V player for PiStorm (Emu68 BerryCore)\n"
+           "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [--start=H:MM:SS] [--no-audio]\n"
+           "               [--paula [--audio-rate=low] [--audio-mono] [--av-offset=MS]]\n"
+           "  --paula  sound through the Amiga (MintVID's decoders), not the Pi's HDMI\n"
+           "Keys: ESC stop, Space pause, Left/Right -/+10 s, Down/Up -/+60 s\n");
+}
+
+int main(int argc, char **argv)
+{
+    session s;
+    const char *path = NULL;
+    uint64_t start_us = 0;
+    int no_audio = 0, paula = 0, low_rate = 0, mono = 0, i;
+    int result = SESSION_ERROR, rc = 20;
+    long av_offset_ms = 0;
+    const char *final_text = NULL;
+    LONG final_state = MR_PLAYER_STATE_ERROR;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+#if MR_DEBUG_LOGS
+    n76_hostlog = fopen("N76_HOST.TXT", "ab");
+#endif
+    n76_hlog("N76_START");
+
+    for (i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--start=", 8)) {
+            if (!parse_time(argv[i] + 8, &start_us)) { usage(); return 5; }
+        } else if (!strcmp(argv[i], "--no-audio")) {
+            no_audio = 1;
+        } else if (!strcmp(argv[i], "--paula")) {
+            paula = 1;
+        } else if (!strcmp(argv[i], "--audio-rate=low")) {
+            low_rate = 1;
+        } else if (!strcmp(argv[i], "--audio-rate=normal")) {
+            low_rate = 0;
+        } else if (!strcmp(argv[i], "--audio-mono")) {
+            mono = 1;
+        } else if (!strncmp(argv[i], "--av-offset=", 12)) {
+            char *end;
+            av_offset_ms = strtol(argv[i] + 12, &end, 10);
+            if (*end || av_offset_ms < -5000 || av_offset_ms > 5000) {
+                usage(); return 5;
+            }
+        } else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            usage(); return 5;
+        } else if (!path) {
+            path = argv[i];
+        } else {
+            usage(); return 5;
+        }
+    }
+    if (!path) { usage(); return 5; }
+
+    memset(&s, 0, sizeof s);
+    control_port_open();
+    status_set(MR_PLAYER_STATE_OPENING, MRBERRY_CODEC,
+               "Opening PiStorm VideoCore playback...");
+
+    s.d = mr_demux_open_file(path);
+    if (!s.d) {
+        printf("Error: cannot open media: %s\n", mr_demux_last_open_error());
+        status_set(MR_PLAYER_STATE_ERROR, MRBERRY_CODEC, "Could not open media file");
+        rc = 10;
+        goto out;
+    }
+    s.vi = mr_demux_video(s.d);
+    if (!s.vi || !s.vi->valid || s.vi->fourcc != MR_FOURCC('a','v','c','1')) {
+        char codec[80], text[128];
+        mr_demux_describe_video_codec(s.d, codec, sizeof codec);
+        printf("Error: H.264/AVC video is required (found: %s).\n", codec);
+        snprintf(text, sizeof text, "PiStorm mode plays H.264 only (this is %s)", codec);
+        status_set(MR_PLAYER_STATE_UNSUPPORTED, codec, text);
+        rc = 10;
+        goto out;
+    }
+    s.is_mov = !strcmp(mr_demux_container_name(s.d), "MOV");
+    s.can_seek = mr_demux_can_seek(s.d);
+    s.ai = mr_demux_audio(s.d);
+    s.paula = paula;
+    s.low_rate = low_rate;
+    s.mono = mono;
+    s.av_offset_us = (int32_t)av_offset_ms * 1000;
+    if (no_audio) {
+        s.audio_note = "sound off";
+    } else if (paula) {
+        /* Whatever MintVID can decode; mrb_paula_open() says if not. */
+        if (s.ai && s.ai->valid) s.use_audio = 1;
+        else s.audio_note = "no sound (no audio track)";
+    } else if (!s.ai || !s.ai->valid ||
+               (s.ai->format_tag != MR_AUDIO_FORMAT_AAC &&
+                s.ai->format_tag != MR_AUDIO_FORMAT_AC3 &&
+                s.ai->format_tag != MR_AUDIO_FORMAT_EAC3)) {
+        printf("Warning: no supported AAC/AC3/E-AC3 audio track; video will continue without audio.\n");
+        s.audio_note = "no sound (no AAC/AC3/E-AC3 track)";
+    } else if (s.ai->format_tag == MR_AUDIO_FORMAT_EAC3 && s.ai->channels != 2) {
+        /* AC308N3: multichannel E-AC3 decodes far below real time on CPU1;
+         * only stereo E-AC3 is played. The picture plays alone. */
+        printf("Warning: multichannel E-AC3 is not supported in real time; playing without sound.\n");
+        s.audio_note = "no sound (E-AC3 5.1 is too slow)";
+    } else {
+        s.use_audio = 1;
     }
 
-    p06_status_write(P06_STATE_ENDED, "H.264 / VideoCore",
-                     aborted ? "Stopped" : "Finished");
-    n76_hlog(aborted ? "P06_STATUS_ENDED_STOPPED" : "P06_STATUS_ENDED_FINISHED");
-    n76_hlog("N76_END_OK");
+    if (start_us) {
+        uint64_t got = 0;
+        if (s.can_seek && mr_demux_seek(s.d, start_us, &got) == MR_OK)
+            s.base_us = got;
+        else
+            printf("Warning: cannot start at a time in this file; starting at the beginning.\n");
+    }
+
+    if (p05_input_open()) n76_hlog("P05_ESC_INPUT_WINDOW_OK");
+    else n76_hlog("P05_ESC_INPUT_WINDOW_FAIL");
+
+    for (;;) {
+        char text[128], at[24];
+        format_time(at, sizeof at, s.base_us);
+        snprintf(text, sizeof text, "%dx%d, %s, %s", s.vi->width, s.vi->height,
+                 mr_demux_container_name(s.d), at);
+        status_set(MR_PLAYER_STATE_PLAYING, MRBERRY_CODEC, text);
+        result = play_session(&s);
+        if (result != SESSION_SEEK) break;
+        {
+            int64_t target = (int64_t)s.pos_us + s.seek_delta_us;
+            uint64_t got = 0;
+            if (target < 0) target = 0;
+            if (mr_demux_seek(s.d, (uint64_t)target, &got) != MR_OK) {
+                snprintf(s.error, sizeof s.error, "Seek failed");
+                result = SESSION_ERROR;
+                break;
+            }
+            s.base_us = got;
+        }
+    }
+
+    if (result == SESSION_ERROR) {
+        printf("Error: %s.\n", s.error);
+        final_state = MR_PLAYER_STATE_ERROR;
+        final_text = s.error;
+        rc = 20;
+    } else {
+        final_state = MR_PLAYER_STATE_ENDED;
+        final_text = result == SESSION_STOP ? "Stopped" : "Finished";
+        rc = 0;
+    }
+    status_set(final_state, MRBERRY_CODEC, final_text);
+
+out:
+    p05_input_close();
+    if (s.d) mr_demux_close(s.d);
+    control_port_close();
+    n76_hlog(rc ? "N76_END_ERROR" : "N76_END_OK");
     if (n76_hostlog) fclose(n76_hostlog);
-    DBG_PRINTF("N76 PASS: host demux trace completed on N75 scheduler base.\n");
-    return 0;
+    return rc;
 }

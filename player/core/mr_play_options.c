@@ -340,6 +340,20 @@ int mr_build_mrberry_arguments(char *out, size_t cap, const char *path)
     return append_quoted(out, cap, path) && append_text(out, cap, "\n");
 }
 
+/* Unlike VPberry's legacy filename-only command, mrberry understands
+ * --no-audio. The GUI must pass it when ticked, especially on stock Emu68
+ * where attempting HDMI audio would enter the BerryCore setup path. */
+int mr_build_mrberry_play_arguments(char *out, size_t cap,
+                                    const mr_play_options *o,
+                                    const char *path)
+{
+    if (!out || !cap || !o || !path || !*path) return 0;
+    out[0] = 0;
+    if (!append_quoted(out, cap, path)) return 0;
+    if (o->no_audio && !append_option(out, cap, "--no-audio")) return 0;
+    return append_text(out, cap, "\n");
+}
+
 int mr_build_player_arguments(char *out, size_t cap,
                               const mr_play_options *o, const char *url,
                               const char *ua, const char *referer)

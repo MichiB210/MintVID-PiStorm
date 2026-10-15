@@ -94,14 +94,31 @@ jobs:
               make -f Makefile.amiga all \
                 AMIGA_ROOT="$AMIGA_ROOT" \
                 SSL=1 SSLCERTS=1
+              # The PiStorm player. Built in its own directory so it does
+              # not touch the MintVID objects above.
+              CC="$AMIGA_GCC" DEBUG_LOGS=0 \
+                sh ../pistorm/mrberry/build.sh /tmp/mrberry
+              cp /tmp/mrberry/mrberry mrberry
             '
+
+      - name: Build berryvp.library (vasm 2.0f)
+        run: |
+          # vasm 2.0f, the version P35 was built with (pinned mirror commit).
+          git clone -q https://github.com/mbitsnbites/vasm-mirror /tmp/vasm
+          git -C /tmp/vasm checkout -q a13e7e728a3dd5a9ba468bf479119e0bc23e70fd
+          make -s -C /tmp/vasm CPU=m68k SYNTAX=mot >/dev/null
+          PATH=/tmp/vasm:$PATH sh pistorm/berryvp_library/build.sh /tmp/library
+          cp /tmp/library/berryvp.library player/berryvp.library
 
       - name: Confirm the programs were produced
         run: |
-          ls -la player/mrplay player/MintVID player/iptvgui player/ytgui \
+          ls -la player/mrplay player/MintVID player/iptvgui player/ytgui player/mrberry \
             player/MintVID-GT player/iptvgui-GT player/ytgui-GT player/mr_decode
           file player/mrplay player/MintVID player/iptvgui player/ytgui \
             player/MintVID-GT player/iptvgui-GT player/ytgui-GT player/mr_decode || true
+
+      - name: Check GUI library startup names
+        run: python3 player/tests/check_gui_libraries.py player/MintVID player/iptvgui player/ytgui
 
       - name: Upload compiled programs
         uses: actions/upload-artifact@v4
@@ -116,6 +133,8 @@ jobs:
             player/iptvgui-GT
             player/ytgui-GT
             player/mr_decode
+            player/mrberry
+            player/berryvp.library
           if-no-files-found: error
           retention-days: 14
 
@@ -176,6 +195,8 @@ jobs:
             do
               test -f "$dir/$program"
             done
+            python3 player/tests/check_gui_libraries.py \
+              "$dir/MintVID" "$dir/iptvgui" "$dir/ytgui"
           done
 
           license_dir="player/release/LICENSES"

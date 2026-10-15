@@ -874,6 +874,25 @@ int main(void) {
                                  sizeof(error)));
     assert(parsed.display == MR_DISPLAY_AGA_WINDOW_HALF);
 
+    /* The fork's fullscreen launcher used to ignore the No audio checkbox,
+     * entering BerryCore setup even when the user requested video only. */
+    mr_play_options_default(&o);
+    o.display = MR_DISPLAY_PISTORM_HARD_FULLSCREEN;
+    assert(mr_build_mrberry_play_arguments(args, sizeof(args), &o,
+                                          "DH0:My Film.mp4"));
+    assert(!strcmp(args, "\"DH0:My Film.mp4\"\n"));
+    o.no_audio = 1;
+    assert(mr_build_mrberry_play_arguments(args, sizeof(args), &o,
+                                          "DH0:My Film.mp4"));
+    assert(!strcmp(args, "\"DH0:My Film.mp4\" --no-audio\n"));
+    assert(!mr_build_mrberry_play_arguments(args, 8, &o, "DH0:film.mp4"));
+    assert(!mr_build_mrberry_play_arguments(args, sizeof(args), &o, ""));
+    assert(!mr_build_mrberry_play_arguments(args, sizeof(args), NULL,
+                                           "DH0:film.mp4"));
+    /* The separate VPberry filename-only helper still has its own grammar. */
+    assert(mr_build_mrberry_arguments(args, sizeof(args), "DH0:My Film.mp4"));
+    assert(!strcmp(args, "\"DH0:My Film.mp4\"\n"));
+
     /* Range limits: 200..2000 ms accepted, anything else refused. */
     {
       char *lo[] = { "x", "--skip-trigger=200" };

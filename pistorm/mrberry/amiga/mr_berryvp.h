@@ -29,7 +29,13 @@ typedef struct {
     unsigned long audio_bytes;
 } mr_berryvp;
 
-mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi);
+/* OpenStream flag: no ConfigAudio will follow (Paula, no audio, or a format
+ * the Pi side cannot play). berryvp.library N80 and later. */
+#define BVP_OPENF_NO_HDMI_AUDIO 1UL
+
+/* 1 when mr_berryvp_config_audio() would accept this audio track. */
+int mr_berryvp_hdmi_audio_ok(const mr_audio_info *ai);
+mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi, int hdmi_audio);
 mr_status mr_berryvp_config_audio(mr_berryvp *b, const mr_audio_info *ai);
 mr_status mr_berryvp_send_packet(mr_berryvp *b, const mr_packet *pkt);
 mr_status mr_berryvp_send_audio_packet(mr_berryvp *b, const mr_packet *pkt);

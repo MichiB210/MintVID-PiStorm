@@ -6,11 +6,15 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
   - Output as a hard full-screen picture on the Pi's HDMI output (mrberry), or in a P96 window on the Workbench (VPberry).
 - **AAC, AC3 and E-AC3 audio**, decoded on the second ARM core (CPU1) of the Pi.
   - Output as PCM over the Pi's HDMI audio.
+- Or **sound through the Amiga** (`--paula`): AAC, MP3, MP2, AC3 and PCM,
+  decoded on the 68k by MintVID's own decoders and played through Paula.
 
 > [!IMPORTANT]
-> **Requires the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** Playback only
-> works with it: the unmodified Emu68 kernel has no BerryCore service on CPU1,
-> so nothing will play.
+> **Sound over HDMI requires the patched Emu68 kernel
+> `Emu68-pistorm-BerryCore`.** The unmodified Emu68 kernel has no BerryCore
+> service on CPU1. The picture alone (`--no-audio`) and the Amiga sound
+> (`--paula`) do not use CPU1 and should work on the normal kernel; this has
+> not yet been confirmed on hardware.
 >
 > **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
 > Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
@@ -38,10 +42,10 @@ MintVID (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 
 | Part | Directory | Language | Rebuild |
 |---|---|---|---|
-| MintVID GUI | `../player/amiga/mrgui*.c` | C (68k) | byte-identical to P35 |
-| mrberry | `mrberry/` | C (68k) | byte-identical to P32/P35 |
+| MintVID GUI | `../player/amiga/mrgui*.c` | C (68k) | changed since P35 (starts mrberry as "MintVID player") |
+| mrberry | `mrberry/` | C (68k) | changed since P35 (controls, Amiga sound) |
 | VPberry (VPr8 P48, window player) | `vpberry/` | 68k assembler (vasm) | byte-identical to P35 |
-| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to P32/P35 |
+| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | changed since P35 (N80, see below) |
 | berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | padded to P32 size, codegen differs, hardware-tested * |
 | berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
@@ -72,6 +76,88 @@ Everything ends up in `pistorm/out/P35/`, and each file is compared against `P35
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
 
+**N80 (berryvp.library): video without HDMI audio.** The library shows
+frames through the VideoCore scheduler, which waits for the Pi's
+Audio-Master clock, and only `ConfigAudio` (HDMI audio, BerryCore kernel)
+starts that clock. With `--no-audio` or `--paula` the first frame therefore
+waited forever. The graph is built in OpenStream/ConfigVideo, before
+ConfigAudio, so mrberry now says up front whether HDMI audio will follow:
+it passes `BVP_OPENF_NO_HDMI_AUDIO` (1) to OpenStream for `--paula`,
+`--no-audio`, a file without sound, or a track the Pi side does not play
+(e.g. mono AAC). With that flag the library leaves the scheduler out and
+times frames with its own frame grid; without it (HDMI audio, older
+mrberry, VPberry) nothing changes. The N80 library reports version 3.80
+and the capability bit `BVP_CAP_NO_HDMI_AUDIO` ($2000); mrberry refuses
+video without HDMI audio on an older library with "needs berryvp.library
+3.80 or newer" instead of waiting for an audio clock that never starts. The trace shows
+`N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when the direct graph is used. CI builds
+the library with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy
+it to `LIBS:`.
+
+With the flag every width uses decoder -> renderer. Tested on a PiStorm 600
+with a 640x360 H.264 clip: picture through the VideoCore, sound through
+Paula, all 250 frames sent close to real time, repeat plays without a
+reboot. Widths whose padded size is not a multiple of 64 (e.g. 134x100)
+used to go through decoder -> ISP -> renderer. Without the scheduler that
+graph never came up, because the VideoCore stopped answering. They now take
+the direct graph as well; whether the renderer shows them cleanly is still
+to be tested.
+
+**Failed streams.** The library used to tear the VideoCore side down only
+after a fully drained EOS. A stream whose setup failed left its components
+and the renderer's display layer behind, and the next open failed with
+backend error -6 until a reboot. CloseStream now closes the stream's MMAL
+service in that case and restores the Workbench display list
+(`N80_FAILED_STREAM_VC_RESET` in the trace). The VideoCore then deletes the
+service's components itself. Stream buffers the VideoCore may still own are
+not freed.
+
+## Playing and controls
+
+The fullscreen mrberry launch now forwards the GUI's **No audio** checkbox
+as `--no-audio` in both ReAction and GadTools. Video-only playback bypasses
+BerryCore audio setup; previously the checkbox was ignored by these fork
+launchers. This does not establish compatibility with every Pi/Emu68 version.
+
+Startup output from GUI-launched mrberry is saved to
+`T:MintVID-mrberry.log`, overwritten on the next launch. Both controllers
+also display the player's saved terminal status after a quick exit. If no
+status is published, the controller points to the log after an early exit
+or roughly 60 seconds, without terminating the process.
+
+In MintVID, choose the display **PiStorm / VC Hard Fullscreen** and press
+Play. MintVID's **Pause** and **Stop** buttons work, like with the normal
+player.
+
+From the Shell:
+
+    mrberry <film.mkv|film.mp4|film.ts> [--start=H:MM:SS] [--no-audio]
+            [--paula [--audio-rate=low] [--audio-mono] [--av-offset=MS]]
+
+`--paula` plays the sound through the Amiga instead of the Pi's HDMI.
+The VideoCore still shows the picture. The 68k decodes the sound with
+MintVID's decoders and keeps it in step with the Pi's timer.
+`--audio-rate=low` and `--audio-mono` save CPU time, as in MintVID.
+If picture and sound are not quite together, `--av-offset=100` plays
+the sound 100 ms later (a negative number plays it earlier). E-AC3 is not
+supported this way.
+
+Keys while the film plays:
+
+| Key | Action |
+|---|---|
+| ESC or 0 | stop |
+| Space or P | pause / continue |
+| Cursor right / left | jump 10 s forward / back |
+| Cursor up / down | jump 60 s forward / back |
+
+- Jumps and `--start` work with MKV and MP4. TS files always play from the
+  start.
+- A jump restarts the VideoCore stream at the nearest keyframe before the
+  new time, so the picture goes away for a moment.
+- If the audio track cannot be played (not AAC, AC3 or stereo E-AC3; with
+  `--paula`: not AAC, MP3, MP2, AC3 or PCM), the film plays without sound.
+
 ## Where the sources come from
 
 The PiStorm parts were developed by Michael with AI assistance (ChatGPT) between September and October 2026. For several stages only binaries were kept. Their source was reconstructed later, and every step was checked byte for byte against the binary of that time. See [`docs/SOURCE_RECONSTRUCTION.md`](docs/SOURCE_RECONSTRUCTION.md).
@@ -99,10 +185,18 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 **Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/P35/`.
 
 **Ergebnis der Neubauten:**
-- exakt gleich (bytegleich) zum Release: MintVID, VPberry, mrberry, berryvp.library und der Emu68-BerryCore-Kern
+- exakt gleich (bytegleich) zum Release: VPberry und der Emu68-BerryCore-Kern (berryvp.library hat die Änderung N80, siehe oben)
+- MintVID und mrberry sind seit P35 geändert (Steuerung, Ton über den Amiga)
 - Die drei CPU1-Module funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
-**Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` geht nichts. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+**Wichtig:** Ton über HDMI braucht den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7. Nur Bild (`--no-audio`) oder Ton über den Amiga (`--paula`) brauchen ihn nicht (auf der Hardware noch nicht bestätigt).
+
+**Ton über den Amiga:** `--paula` spielt den Ton über Paula statt über HDMI. Der 68k dekodiert ihn mit den Decodern von MintVID (AAC, MP3, MP2, AC3, PCM, kein E-AC3). `--audio-rate=low` und `--audio-mono` sparen Rechenzeit. Passen Bild und Ton nicht ganz zusammen, verschiebt `--av-offset=100` den Ton um 100 ms nach hinten (negativ: nach vorne).
+
+**Bedienung:** In MintVID die Anzeige **PiStorm / VC Hard Fullscreen** wählen.
+Pause und Stopp in MintVID funktionieren. Tasten: ESC = Stopp, Leertaste =
+Pause, Cursor rechts/links = 10 s vor/zurück, Cursor hoch/runter = 60 s.
+Springen und `--start=H:MM:SS` gehen bei MKV und MP4.
 
 **Installation:**
 1. Die sieben Dateien `MintVID`, `mrberry`, `VPberry`, `berryvp.library` und die drei `.module`-Dateien in die MintVID-Schublade kopieren.
