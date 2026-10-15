@@ -69126,7 +69126,21 @@ n66_vsvc_have:
         tst.l   n73_scheduler_graph_ready
         beq.s   n73_vsvc_host_pacer
         tst.l   n73_clock_armed
+        bne.s   n80_vsvc_clock_ok
+        ; N80: the scheduler graph only plays once ConfigAudio armed the
+        ; Audio-Master clock.  If ConfigAudio was never called (a caller
+        ; that did not pass BVP_OPENF_NO_HDMI_AUDIO but has no HDMI audio)
+        ; or its clock setup failed, no frame would ever be shown: fail the
+        ; stream instead of waiting forever.
+        tst.l   n73_clock_arm_attempts
+        beq.s   n80_vsvc_no_clock
+        tst.l   n73_clock_arm_failures
         beq.w   n80_defer_clock
+n80_vsvc_no_clock:
+        lea     n80_msg_no_clock,a1
+        jsr     n12_log
+        bra.w   n66_vsvc_fail
+n80_vsvc_clock_ok:
         cmpi.l  #1,n79_first_video_trace_state
         bne.s   n79_no_v08
         lea     n79_v08,a1
@@ -70645,6 +70659,7 @@ n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
 n80_msg_fail_reset: dc.b "N80_FAILED_STREAM_VC_RESET",0
+n80_msg_no_clock: dc.b "N80_SCHEDULER_WITHOUT_AUDIO_CLOCK_FAIL",0
 n80_pfx_reset_close: dc.b "N80 RESET SERVICE_CLOSE (0=OK)=",0
 n80_pfx_reset_hvs:   dc.b "N80 RESET HVS_RESTORED=",0
 n80_pfx_dg_step: dc.b "N80 DIRECT FAIL STEP=",0
