@@ -49362,6 +49362,7 @@ hdmi_v40o_set_displayregion:
         movem.l d1-d7/a0-a3,-(sp)
         clr.l   hdmi_v40o_param_status
         clr.l   hdmi_v40o_param_rx_size
+        clr.l   n80_dr_word
 
         ; Worker payload is 32-byte prefix before param + 84-byte displayregion
         ; = 116 bytes. With 8-byte VCHIQ header, reserve/alignment stride = 128.
@@ -49370,7 +49371,7 @@ hdmi_v40o_set_displayregion:
         move.l  #128,d0
         jsr     h26a_reserve_tx
         tst.l   d0
-        bne.w   hdmi_v40o_param_fail
+        bne.w   n80_dr1
         bra.s   hdmi_v40o_param_tx_ready
 hdmi_v40o_param_tx_legacy:
         move.l  slot_ptr,a0
@@ -49488,39 +49489,42 @@ hdmi_v40o_param_wait:
         subq.l  #1,d7
         bne.s   hdmi_v40o_param_wait
         jsr     dma_post_all
-        bra.w   hdmi_v40o_param_fail
+        bra.w   n80_dr2
 
 hdmi_v40o_param_have:
         jsr     v12a_rx_map_data
         tst.l   d0
-        bne.w   hdmi_v40o_param_fail
+        bne.w   n80_dr3
         lea     4(a2),a0
         jsr     load_le32
         move.l  d0,hdmi_v40o_param_rx_size
         cmp.l   #28,d0
-        bcs.w   hdmi_v40o_param_fail
+        bcs.w   n80_dr4
         lea     8(a2),a0
         jsr     load_le32
+        move.l  d0,n80_dr_word
         cmp.l   #MMAL_MAGIC,d0
-        bne.w   hdmi_v40o_param_fail_consume
+        bne.w   n80_dr5
         lea     12(a2),a0
         jsr     load_le32
+        move.l  d0,n80_dr_word
         cmp.l   #MMAL_PORT_PARAMETER_SET,d0
-        bne.w   hdmi_v40o_param_fail_consume
+        bne.w   n80_dr6
         lea     20(a2),a0
         jsr     load_le32
+        move.l  d0,n80_dr_word
         cmp.l   #$12D30001,d0
-        bne.w   hdmi_v40o_param_fail_consume
+        bne.w   n80_dr7
         lea     32(a2),a0
         jsr     load_le32
         move.l  d0,hdmi_v40o_param_status
         move.l  hdmi_v40o_param_rx_size,d0
         jsr     v12a_rx_consume_payload
         tst.l   d0
-        bne.w   hdmi_v40o_param_fail
+        bne.w   n80_dr8
         move.l  hdmi_v40o_param_status,d0
         tst.l   d0
-        bne.w   hdmi_v40o_param_fail
+        bne.w   n80_dr9
         move.l  #1,hdmi_v40o_displayregion_ok
         lea     msg_hdmi_v40o_displayregion_ok,a1
         move.l  #msg_hdmi_v40o_displayregion_ok_end-msg_hdmi_v40o_displayregion_ok,d3
@@ -49528,6 +49532,40 @@ hdmi_v40o_param_have:
         moveq   #0,d0
         bra.s   hdmi_v40o_param_done
 
+; N80: say why DISPLAYREGION failed (1 tx reserve, 2 no reply, 3 rx map,
+; 4 short reply, 5 bad magic, 6 not PARAMETER_SET reply, 7 wrong context,
+; 8 consume failed, 9 VideoCore status != 0).  WORD = the mismatching
+; reply field for 5..7.
+n80_dr1:
+        moveq   #1,d0
+        bra.s   n80_dr_note
+n80_dr2:
+        moveq   #2,d0
+        bra.s   n80_dr_note
+n80_dr3:
+        moveq   #3,d0
+        bra.s   n80_dr_note
+n80_dr4:
+        moveq   #4,d0
+        bra.s   n80_dr_note
+n80_dr8:
+        moveq   #8,d0
+        bra.s   n80_dr_note
+n80_dr9:
+        moveq   #9,d0
+n80_dr_note:
+        bsr     n80_dr_log
+        bra.s   hdmi_v40o_param_fail
+n80_dr5:
+        moveq   #5,d0
+        bra.s   n80_dr_note_consume
+n80_dr6:
+        moveq   #6,d0
+        bra.s   n80_dr_note_consume
+n80_dr7:
+        moveq   #7,d0
+n80_dr_note_consume:
+        bsr     n80_dr_log
 hdmi_v40o_param_fail_consume:
         move.l  hdmi_v40o_param_rx_size,d0
         jsr     v12a_rx_consume_payload
@@ -49542,6 +49580,22 @@ hdmi_v40o_param_fail:
         moveq   #1,d0
 hdmi_v40o_param_done:
         movem.l (sp)+,d1-d7/a0-a3
+        rts
+
+n80_dr_log:
+        movem.l d0-d1/a0-a1,-(sp)
+        lea     n80_pfx_dr_reason,a1
+        jsr     n15_log_hex32
+        move.l  hdmi_v40o_param_rx_size,d0
+        lea     n80_pfx_dr_size,a1
+        jsr     n15_log_hex32
+        move.l  n80_dr_word,d0
+        lea     n80_pfx_dr_word,a1
+        jsr     n15_log_hex32
+        move.l  hdmi_v40o_param_status,d0
+        lea     n80_pfx_dr_status,a1
+        jsr     n15_log_hex32
+        movem.l (sp)+,d0-d1/a0-a1
         rts
 
 ; Apply buffer requirements to the connected ISP input. This mirrors
@@ -70416,6 +70470,10 @@ n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
 n80_pfx_j_step: dc.b "N80 N79J FAIL STEP=",0
 n80_pfx_j_d0:   dc.b "N80 N79J FAIL D0=",0
+n80_pfx_dr_reason: dc.b "N80 DISPLAYREGION FAIL REASON=",0
+n80_pfx_dr_size:   dc.b "N80 DISPLAYREGION RX_SIZE=",0
+n80_pfx_dr_word:   dc.b "N80 DISPLAYREGION RX_WORD=",0
+n80_pfx_dr_status: dc.b "N80 DISPLAYREGION STATUS=",0
 n80_pfx_reason: dc.b "N80 DEFER REASON (1=CLOCK 2=PACER 3=BULK 4=POOL 5=AUDIO)=",0
 n80_pfx_graph:  dc.b "N80 STATE SCHED_GRAPH=",0
 n80_pfx_clock:  dc.b "N80 STATE CLOCK_ARMED=",0
@@ -70640,6 +70698,7 @@ n73_scheduler_graph_ready:   ds.l 1
 n80_last_defer:              ds.l 1
 n80_n79j_step:               ds.l 1
 n80_n79j_d0:                 ds.l 1
+n80_dr_word:                 ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
