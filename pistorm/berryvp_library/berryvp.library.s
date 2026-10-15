@@ -226,7 +226,6 @@ BVP_OS_Open:
         clr.l   n73_scheduler_graph_ready
         clr.l   n73_clock_armed
         clr.l   n80_last_defer
-        clr.l   n80_isp_started
         clr.l   n73_first_pcm_published
         clr.l   n73_prime_flushes
         clr.l   n73_clock_arm_attempts
@@ -51148,7 +51147,10 @@ n79j_setup_sched_isp_renderer:
         ; never runs, and a scheduler in the chain would hold every frame.
         ; Tunnel decoder -> ISP directly; n66_service_pending_video then
         ; paces AUs with the host frame grid because the graph is not
-        ; marked scheduler-ready.
+        ; marked scheduler-ready.  The tunnel is built after the
+        ; renderer's DISPLAYREGION: with decoder -> ISP already in place
+        ; the VideoCore never answered that request (PiStorm 600).
+        clr.l   n80_direct_mode
         tst.l   n73_clock_armed
         beq.s   n80_n79j_direct
         ; Proven N79 graph helper: decoder -> scheduler -> ISP.
@@ -51159,9 +51161,7 @@ n79j_setup_sched_isp_renderer:
         move.l  #1,vpv166_c_sched_feedahead
         bra.s   n80_n79j_graph_ready
 n80_n79j_direct:
-        jsr     n80_setup_direct_isp_graph
-        tst.l   d0
-        bne.w   n80_j2
+        move.l  #1,n80_direct_mode
 n80_n79j_graph_ready:
         move.l  v12a_isp_handle,n79j_isp_handle
         move.l  v12a_isp_input,n79j_isp_input
@@ -51224,6 +51224,20 @@ n79j_rin_num_ok:
         bsr     hdmi_v40o_set_displayregion
         tst.l   d0
         bne.w   n80_j9
+        ; N80 direct mode: now tunnel decoder -> ISP.  The helper works on
+        ; v12a_isp_*, which hold the renderer here, so swap the ISP in.
+        tst.l   n80_direct_mode
+        beq.s   n80_n79j_after_dr
+        move.l  v12a_isp_handle,n80_rend_handle
+        move.l  v12a_isp_input,n80_rend_input
+        move.l  n79j_isp_handle,v12a_isp_handle
+        move.l  n79j_isp_input,v12a_isp_input
+        jsr     n80_setup_direct_isp_graph
+        move.l  n80_rend_handle,v12a_isp_handle
+        move.l  n80_rend_input,v12a_isp_input
+        tst.l   d0
+        bne.w   n80_j2
+n80_n79j_after_dr:
         ; ISP.output -> renderer.input through the proven connector.
         move.l  v12a_decoder_handle,n79j_save_dec_handle
         move.l  v12a_decoder_output,n79j_save_dec_output
@@ -51273,13 +51287,10 @@ n79j_iout_num_ok:
         jsr     component_enable_worker
         tst.l   d0
         bne.s   n80_j17
-        tst.l   n80_isp_started
-        bne.s   n80_n79j_isp_running
         move.l  n79j_isp_handle,component_handle
         jsr     component_enable_worker
         tst.l   d0
         bne.s   n80_j18
-n80_n79j_isp_running:
         ; No host-facing output buffers on this path.
         clr.l   output_component_handle
         clr.l   output_port_handle
@@ -66380,14 +66391,6 @@ n80_setup_direct_isp_graph:
         jsr     v12a_connect_ports
         tst.l   d0
         bne.w   n80_dg_fail
-        ; Start the ISP now, the way vpv126 starts the scheduler straight
-        ; after decoder -> scheduler (hello_video order).  Left disabled
-        ; until n79j's end, the renderer never answered its DISPLAYREGION.
-        move.l  v12a_isp_handle,component_handle
-        jsr     component_enable_worker
-        tst.l   d0
-        bne.w   n80_dg_enable_fail
-        move.l  #1,n80_isp_started
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
@@ -66426,9 +66429,6 @@ n80_dg_num_ok:
         jsr     n12_log
         moveq   #0,d0
         bra.s   n80_dg_done
-n80_dg_enable_fail:
-        lea     n80_msg_isp_enable_fail,a1
-        jsr     n12_log
 n80_dg_fail:
         lea     n80_msg_direct_fail,a1
         jsr     n12_log
@@ -70490,7 +70490,6 @@ n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
-n80_msg_isp_enable_fail: dc.b "N80_DIRECT_ISP_ENABLE_FAILED",0
 n80_pfx_dr_polls:  dc.b "N80 DISPLAYREGION POLLS=",0
 n80_pfx_j_step: dc.b "N80 N79J FAIL STEP=",0
 n80_pfx_j_d0:   dc.b "N80 N79J FAIL D0=",0
@@ -70723,7 +70722,9 @@ n80_last_defer:              ds.l 1
 n80_n79j_step:               ds.l 1
 n80_n79j_d0:                 ds.l 1
 n80_dr_word:                 ds.l 1
-n80_isp_started:             ds.l 1
+n80_direct_mode:             ds.l 1
+n80_rend_handle:             ds.l 1
+n80_rend_input:              ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1

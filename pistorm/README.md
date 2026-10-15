@@ -82,10 +82,10 @@ Audio-Master clock, and only `ConfigAudio` (HDMI audio, BerryCore kernel)
 starts that clock. With `--no-audio` or `--paula` the first frame therefore
 waited forever. Such streams now leave the scheduler out (decoder -> ISP ->
 renderer, or decoder -> renderer) and are timed by the library's own frame
-grid instead. On that path the ISP is started right after the
-decoder -> ISP tunnel, in the order the scheduler path uses; started last,
-the renderer never answered its display-region request. Streams with HDMI
-audio are unchanged. The trace shows
+grid instead. On that path the decoder -> ISP tunnel is built after the
+renderer's display region is set: with the tunnel already in place the
+VideoCore never answered that request. Streams with HDMI audio are
+unchanged. The trace shows
 `N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when it is taken. CI builds the library
 with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy it to
 `LIBS:`.
