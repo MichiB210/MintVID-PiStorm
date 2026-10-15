@@ -80,15 +80,26 @@ The modules must have the exact sizes that berryvp.library P32 expects. The buil
 frames through the VideoCore scheduler, which waits for the Pi's
 Audio-Master clock, and only `ConfigAudio` (HDMI audio, BerryCore kernel)
 starts that clock. With `--no-audio` or `--paula` the first frame therefore
-waited forever. Such streams now leave the scheduler out (decoder -> ISP ->
-renderer, or decoder -> renderer) and are timed by the library's own frame
-grid instead. On that path the decoder -> ISP tunnel is built after the
-renderer's display region is set: with the tunnel already in place the
-VideoCore never answered that request. Streams with HDMI audio are
-unchanged. The trace shows
-`N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when it is taken. CI builds the library
-with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy it to
-`LIBS:`.
+waited forever. Such streams now leave the scheduler out and are timed by
+the library's own frame grid instead. Streams with HDMI audio are
+unchanged. The trace shows `N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when it is
+taken. CI builds the library with vasm 2.0f and puts it in the
+MintVID-AmigaOS artifact; copy it to `LIBS:`.
+
+The library picks the graph by the decoder's padded width:
+- **A multiple of 64** (640x360, 320x240, 1280x720, most real files):
+  decoder -> renderer. Tested on a PiStorm 600 with a 640x360 H.264 clip,
+  picture through the VideoCore and sound through Paula (`--paula`). All
+  250 frames sent, paced close to real time, repeat plays without a reboot.
+- **Any other width** (e.g. 134x100): decoder -> ISP -> renderer. Not
+  working yet. Whichever of the renderer's display region and the decoder
+  output enable comes second gets no reply from the VideoCore. The N80
+  trace lines (`N80 N79J FAIL STEP`, `N80 DIRECT FAIL STEP`, `N80 ENABLE
+  FAIL`) say where it stopped.
+
+After a failed attempt, reboot before the next one: a failure leaves the
+VideoCore half set up, and the next open then fails early with backend
+error -6.
 
 ## Playing and controls
 
