@@ -7239,6 +7239,12 @@ vpv30_ctx_nonzero:
         or.l    #$30000000,d0
         rts
 
+; N80: same matcher with the 4096-poll cleanup budget.
+vpv30_wait_matching_long:
+        movem.l d1-d7/a0-a1/a3,-(sp)
+        move.l  #V10_CLEANUP_POLL_COUNT,d7
+        bra.s   vpv30_wait_loop
+
 vpv30_wait_matching:
         movem.l d1-d7/a0-a1/a3,-(sp)
         move.l  #POLL_COUNT,d7
@@ -8887,6 +8893,9 @@ port_enable_output_current:
         movem.l d2-d7/a2-a3,-(sp)
 
         move.l  #$1900E002,out_enable_context
+        clr.l   n80_en_why
+        clr.l   out_enable_status
+        clr.l   out_enable_rx_size
 
         ; V12G restart: map absolute TX position through SLAVE_QUEUE.
         tst.l   v12f_local_port
@@ -9048,6 +9057,19 @@ out_enable_clear_loop:
         move.l  d0,VCHIQ_BELL2
 
 out_enable_no_bell:
+        ; N80 direct graph: the renderer is already set up, and the next RX
+        ; record need not be this reply.  Wait for the exact PORT_ACTION +
+        ; context the way v12a_connect_ports does, skipping MMAL events.
+        tst.l   n80_direct_mode
+        beq.s   out_enable_plain_wait
+        move.l  #MMAL_PORT_ACTION,vpv30_expect_type
+        move.l  out_enable_context,vpv30_expect_context
+        jsr     vpv30_wait_matching_long
+        tst.l   d0
+        beq.w   out_enable_reply_mapped
+        move.l  #2,n80_en_why
+        bra.w   out_enable_bad_reply
+out_enable_plain_wait:
         move.l  #POLL_COUNT,d7
 
 out_enable_poll_loop:
@@ -9068,6 +9090,7 @@ out_enable_poll_loop:
 
         ; timeout: regain CPU ownership before returning
         bsr     dma_post_all
+        move.l  #1,n80_en_why
         lea     e_enable_timeout,a1
         move.l  #e_enable_timeout_end-e_enable_timeout,d3
         bsr     print
@@ -9079,6 +9102,7 @@ out_enable_reply_seen:
         jsr     v12a_rx_map_data
         tst.l   d0
         bne.w   out_enable_bad_reply
+out_enable_reply_mapped:
         move.l  a2,a0
         bsr     load_le32
         move.l  d0,out_enable_rx_msgid
@@ -9157,6 +9181,10 @@ out_enable_reply_seen:
         rts
 
 out_enable_bad_reply:
+        tst.l   n80_en_why
+        bne.s   out_enable_why_set
+        move.l  #3,n80_en_why
+out_enable_why_set:
         lea     e_enable_reply,a1
         move.l  #e_enable_reply_end-e_enable_reply,d3
         bsr     print
@@ -66447,8 +66475,23 @@ n80_dg_f4:
         bra.s   n80_dg_fail
 n80_dg_f5:
         move.l  d0,n80_dg_d0
+        move.l  n80_en_why,d0
+        lea     n80_pfx_en_why,a1
+        jsr     n15_log_hex32
+        move.l  out_enable_rx_size,d0
+        lea     n80_pfx_en_rx,a1
+        jsr     n15_log_hex32
+        move.l  out_enable_status,d0
+        lea     n80_pfx_en_st,a1
+        jsr     n15_log_hex32
+        move.l  vpv30_skipped,d0
+        lea     n80_pfx_skipped,a1
+        jsr     n15_log_hex32
+        move.l  vpv30_async_skipped,d0
+        lea     n80_pfx_async,a1
+        jsr     n15_log_hex32
         moveq   #5,d0
-        bra.s   n80_dg_fail
+        bra.w   n80_dg_fail
 n80_dg_f6:
         move.l  d0,n80_dg_d0
         moveq   #6,d0
@@ -70540,6 +70583,11 @@ n80_pfx_dg_d0:   dc.b "N80 DIRECT FAIL D0=",0
 n80_pfx_dg_crx:  dc.b "N80 DIRECT CONNECT RX_SIZE=",0
 n80_pfx_dg_chdr: dc.b "N80 DIRECT CONNECT HDR_STATUS=",0
 n80_pfx_dg_cst:  dc.b "N80 DIRECT CONNECT STATUS=",0
+n80_pfx_en_why:  dc.b "N80 ENABLE FAIL (1 TIMEOUT 2 NO MATCH 3 BAD REPLY)=",0
+n80_pfx_en_rx:   dc.b "N80 ENABLE RX_SIZE=",0
+n80_pfx_en_st:   dc.b "N80 ENABLE STATUS=",0
+n80_pfx_skipped: dc.b "N80 RX SKIPPED=",0
+n80_pfx_async:   dc.b "N80 RX ASYNC_SKIPPED=",0
 n80_pfx_dr_polls:  dc.b "N80 DISPLAYREGION POLLS=",0
 n80_pfx_j_step: dc.b "N80 N79J FAIL STEP=",0
 n80_pfx_j_d0:   dc.b "N80 N79J FAIL D0=",0
@@ -70776,6 +70824,7 @@ n80_direct_mode:             ds.l 1
 n80_rend_handle:             ds.l 1
 n80_rend_input:              ds.l 1
 n80_dg_d0:                   ds.l 1
+n80_en_why:                  ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
