@@ -662,7 +662,12 @@ static int play_session(session *s)
     memset(&clk, 0, sizeof clk);
     s->seek_delta_us = 0;
 
-    st = mr_berryvp_open(bvp, s->vi);
+    /* HDMI audio only when ConfigAudio will be called and will accept the
+     * track; otherwise the library must build its graph without the
+     * audio-clocked scheduler. */
+    st = mr_berryvp_open(bvp, s->vi,
+                         s->use_audio && !s->paula &&
+                         mr_berryvp_hdmi_audio_ok(ai));
     if (st != MR_OK) {
         snprintf(s->error, sizeof s->error, "Could not open BerryVP video graph");
         return SESSION_ERROR;

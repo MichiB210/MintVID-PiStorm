@@ -222,7 +222,7 @@ static int aac_rate_index(uint32_t rate)
 static int parse_aac_config(mr_berryvp *b, const mr_audio_info *ai)
 {
     unsigned obj, sfi, ch;
-    if (!b || !ai || ai->format_tag != MR_AUDIO_FORMAT_AAC) return 0;
+    if (!ai || ai->format_tag != MR_AUDIO_FORMAT_AAC) return 0;
     if (ai->codec_tag == MR_FOURCC('L','A','T','M')) return 0;
     if (ai->config_len >= 2) {
         obj = (unsigned)(ai->config[0] >> 3);
@@ -230,18 +230,22 @@ static int parse_aac_config(mr_berryvp *b, const mr_audio_info *ai)
         ch = (unsigned)((ai->config[1] >> 3) & 0x0fu);
         if (obj != 2u || sfi >= 13u || ch != 2u) return 0;
         if (ai->sample_rate && aac_rates[sfi] != ai->sample_rate) return 0;
-        b->aac_object_type = (uint8_t)obj;
-        b->aac_sf_index = (uint8_t)sfi;
-        b->aac_channels = (uint8_t)ch;
+        if (b) {
+            b->aac_object_type = (uint8_t)obj;
+            b->aac_sf_index = (uint8_t)sfi;
+            b->aac_channels = (uint8_t)ch;
+        }
         return 1;
     }
     if (ai->channels != 2) return 0;
     {
         int idx = aac_rate_index(ai->sample_rate);
         if (idx < 0) return 0;
-        b->aac_object_type = 2;
-        b->aac_sf_index = (uint8_t)idx;
-        b->aac_channels = 2;
+        if (b) {
+            b->aac_object_type = 2;
+            b->aac_sf_index = (uint8_t)idx;
+            b->aac_channels = 2;
+        }
     }
     return 1;
 }
@@ -284,7 +288,24 @@ static mr_status make_adts(mr_berryvp *b, const uint8_t *src, uint32_t n,
     return MR_OK;
 }
 
-mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi)
+int mr_berryvp_hdmi_audio_ok(const mr_audio_info *ai)
+{
+    if (!ai || !ai->valid) return 0;
+    switch (ai->format_tag) {
+    case MR_AUDIO_FORMAT_AAC:
+        return parse_aac_config(NULL, ai);
+    case MR_AUDIO_FORMAT_AC3:
+        return ai->sample_rate >= 8000 && ai->sample_rate <= 192000 &&
+               ai->channels >= 1 && ai->channels <= 6;
+    case MR_AUDIO_FORMAT_EAC3:
+        return ai->sample_rate >= 8000 && ai->sample_rate <= 192000 &&
+               ai->channels == 2;
+    default:
+        return 0;
+    }
+}
+
+mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi, int hdmi_audio)
 {
     ULONG ver;
     LONG r;
@@ -314,7 +335,10 @@ mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi)
         return MR_EUNSUPPORTED;
     }
     DBG_PRINTF("[B05] before OpenStream\n");
-    r = bvp_call_openstream(b->lib, 0);
+    /* The video graph is built before ConfigAudio. Without HDMI audio the
+     * library must leave the audio-clocked scheduler out, or no frame is
+     * ever shown. */
+    r = bvp_call_openstream(b->lib, hdmi_audio ? 0UL : BVP_OPENF_NO_HDMI_AUDIO);
     DBG_PRINTF("[B06] after OpenStream r=%ld\n", (long)r);
     if (r != BVP_OK) {
         printf("Error: BerryVP OpenStream failed: %ld (%s).\n", (long)r, bvp_error_name(r));

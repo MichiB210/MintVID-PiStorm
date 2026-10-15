@@ -32,6 +32,9 @@ BVPERR_UNSUPPORTED    equ -3
 BVPERR_BUSY           equ -4
 BVPERR_TIMEOUT        equ -5
 BVPERR_BACKEND        equ -6
+; N80: OpenStream flag. The caller will not call ConfigAudio (no HDMI
+; audio: Paula, --no-audio, or a format the Pi side does not play).
+BVP_OPENF_NO_HDMI_AUDIO equ 1
 BVPERR_CONFIG         equ -7
 BVPERR_TOOLARGE       equ -8
 BVPERR_NOBACKEND      equ -10
@@ -193,6 +196,10 @@ BVP_OpenStream:
         rts
 BVP_OS_Open:
         move.l  d0,BVP_STREAM_FLAGS(a6)
+        move.l  d0,d1
+        andi.l  #BVP_OPENF_NO_HDMI_AUDIO,d1
+        move.l  d1,n80_no_hdmi_audio
+        clr.l   hdmi_v40o_hvs_saved
         move.l  #BVP_STATE_OPEN,BVP_STATE(a6)
         clr.l   BVP_CONFIG_FLAGS(a6)
         clr.l   BVP_LAST_ERROR(a6)
@@ -535,9 +542,25 @@ BVP_CS_ForceCleanup:
         jsr     dma_pre_all
         jsr     v9_cleanup_all
         jsr     hdmi_v40o_close_window
+        ; N80: v9_cleanup_all only tears down after a drained EOS.  If it
+        ; left the MMAL service open, reset the VideoCore side anyway.
+        tst.l   mmal_remote_port
+        beq.s   BVP_CS_Cleaned
+        jsr     n80_failed_reset
+BVP_CS_Cleaned:
         clr.l   bvp_backend_ready
         clr.l   bvp_library_mode
+        bra.s   BVP_CS_Done
 BVP_CS_NoBackend:
+        ; N80: a stream whose setup failed never got bvp_backend_ready, so
+        ; nothing was torn down and the next open failed with -6 until a
+        ; reboot.  Close its MMAL service and give the display back.
+        tst.l   mmal_remote_port
+        beq.s   BVP_CS_Done
+        bsr     bvp_engine_env
+        jsr     n80_failed_reset
+        clr.l   bvp_library_mode
+BVP_CS_Done:
         bsr     bvp_close_dos
         move.l  bvp_libbase_global,a6
         clr.l   BVP_STATE(a6)
@@ -546,6 +569,40 @@ BVP_CS_NoBackend:
         move.l  d7,BVP_LAST_ERROR(a6)
         move.l  d7,d0
         movem.l (sp)+,d2-d7/a0-a5
+        rts
+
+; N80: reset the VideoCore side after a failed or undrained stream.
+; Closing this invocation's MMAL service makes the VideoCore delete every
+; component it owns (the same step a normal cleanup ends with).  Then
+; the Workbench HVS list saved before the renderer took over is put back.
+; Stream DMA memory is deliberately not freed: the VideoCore may still
+; own it.  Entered with shared RAM DMA-owned; leaves it DMA-owned.
+; Needs a5 = DOS base (bvp_engine_env).
+n80_failed_reset:
+        movem.l d0-d7/a0-a4/a6,-(sp)
+        lea     n80_msg_fail_reset,a1
+        jsr     n12_log
+        jsr     dma_post_all
+        jsr     v9_close_service
+        lea     n80_pfx_reset_close,a1
+        jsr     n15_log_hex32
+        jsr     dma_pre_all
+        move.l  a5,a6
+        move.l  #25,d1
+        jsr     Delay(a6)
+        jsr     dma_post_all
+        move.l  hdmi_v40o_hvs_saved,d0
+        beq.s   n80_reset_no_hvs
+        jsr     hdmi_v40o_restore_hvs_ptr
+        lea     n80_pfx_reset_hvs,a1
+        jsr     n15_log_hex32
+n80_reset_no_hvs:
+        clr.l   component_handle
+        clr.l   hdmi_v40o_renderer_handle
+        clr.l   v12a_isp_handle
+        clr.l   mmal_remote_port
+        jsr     dma_pre_all
+        movem.l (sp)+,d0-d7/a0-a4/a6
         rts
 
 BVP_Control:
@@ -49828,9 +49885,15 @@ n79p_setup_graph_router:
         bne.s   n79p_router_k
         ; N79Q aligned64 fix: use the SPS-derived aligned width (valid here,
         ; unlike the late/zero v12a_dec_crop_w) and a 64-pixel rule.
+        ; N80: without HDMI audio every width takes the direct graph. The
+        ; scheduler-free ISP graph does not come up (the VideoCore stops
+        ; answering), so a non-64-aligned width is shown by the renderer.
+        tst.l   n80_no_hdmi_audio
+        bne.s   n80_router_direct
         move.l  v6_src_aligned_w,d0
         andi.l  #63,d0
         bne.s   n79p_router_k
+n80_router_direct:
         jmp     n79p_direct_setup_graph
 n79p_router_k:
         jmp     v12a_setup_isp_graph
@@ -51179,8 +51242,8 @@ n79j_setup_sched_isp_renderer:
         ; renderer's DISPLAYREGION: with decoder -> ISP already in place
         ; the VideoCore never answered that request (PiStorm 600).
         clr.l   n80_direct_mode
-        tst.l   n73_clock_armed
-        beq.s   n80_n79j_direct
+        tst.l   n80_no_hdmi_audio
+        bne.s   n80_n79j_direct
         ; Proven N79 graph helper: decoder -> scheduler -> ISP.
         jsr     vpv126_setup_scheduler_data_graph
         tst.l   d0
@@ -54446,8 +54509,11 @@ v41b_renderer_visibility_ready:
         ; deferred forever.  Such streams take the direct decoder -> renderer
         ; tunnel instead; n66_service_pending_video then paces them with the
         ; host frame grid (n70_*), as standalone C mode does for MP4 input.
-        tst.l   n73_clock_armed
-        bne.w   n73_library_scheduler_enable
+        ; The caller says so in OpenStream (BVP_OPENF_NO_HDMI_AUDIO): the
+        ; graph is built before ConfigAudio, so n73_clock_armed is always 0
+        ; here and cannot tell the two cases apart.
+        tst.l   n80_no_hdmi_audio
+        beq.w   n73_library_scheduler_enable
         lea     n80_msg_direct_no_audio,a1
         jsr     n12_log
         bra.w   vpv166_c_direct_legacy
@@ -70578,6 +70644,9 @@ n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
+n80_msg_fail_reset: dc.b "N80_FAILED_STREAM_VC_RESET",0
+n80_pfx_reset_close: dc.b "N80 RESET SERVICE_CLOSE (0=OK)=",0
+n80_pfx_reset_hvs:   dc.b "N80 RESET HVS_RESTORED=",0
 n80_pfx_dg_step: dc.b "N80 DIRECT FAIL STEP=",0
 n80_pfx_dg_d0:   dc.b "N80 DIRECT FAIL D0=",0
 n80_pfx_dg_crx:  dc.b "N80 DIRECT CONNECT RX_SIZE=",0
@@ -70825,6 +70894,7 @@ n80_rend_handle:             ds.l 1
 n80_rend_input:              ds.l 1
 n80_dg_d0:                   ds.l 1
 n80_en_why:                  ds.l 1
+n80_no_hdmi_audio:           ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1

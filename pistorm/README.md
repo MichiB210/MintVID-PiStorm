@@ -80,26 +80,34 @@ The modules must have the exact sizes that berryvp.library P32 expects. The buil
 frames through the VideoCore scheduler, which waits for the Pi's
 Audio-Master clock, and only `ConfigAudio` (HDMI audio, BerryCore kernel)
 starts that clock. With `--no-audio` or `--paula` the first frame therefore
-waited forever. Such streams now leave the scheduler out and are timed by
-the library's own frame grid instead. Streams with HDMI audio are
-unchanged. The trace shows `N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when it is
-taken. CI builds the library with vasm 2.0f and puts it in the
-MintVID-AmigaOS artifact; copy it to `LIBS:`.
+waited forever. The graph is built in OpenStream/ConfigVideo, before
+ConfigAudio, so mrberry now says up front whether HDMI audio will follow:
+it passes `BVP_OPENF_NO_HDMI_AUDIO` (1) to OpenStream for `--paula`,
+`--no-audio`, a file without sound, or a track the Pi side does not play
+(e.g. mono AAC). With that flag the library leaves the scheduler out and
+times frames with its own frame grid; without it (HDMI audio, older
+mrberry, VPberry) nothing changes. The trace shows
+`N80_NO_HDMI_AUDIO_DIRECT_RENDERER` when the direct graph is used. CI builds
+the library with vasm 2.0f and puts it in the MintVID-AmigaOS artifact; copy
+it to `LIBS:`.
 
-The library picks the graph by the decoder's padded width:
-- **A multiple of 64** (640x360, 320x240, 1280x720, most real files):
-  decoder -> renderer. Tested on a PiStorm 600 with a 640x360 H.264 clip,
-  picture through the VideoCore and sound through Paula (`--paula`). All
-  250 frames sent, paced close to real time, repeat plays without a reboot.
-- **Any other width** (e.g. 134x100): decoder -> ISP -> renderer. Not
-  working yet. Whichever of the renderer's display region and the decoder
-  output enable comes second gets no reply from the VideoCore. The N80
-  trace lines (`N80 N79J FAIL STEP`, `N80 DIRECT FAIL STEP`, `N80 ENABLE
-  FAIL`) say where it stopped.
+With the flag every width uses decoder -> renderer. Tested on a PiStorm 600
+with a 640x360 H.264 clip: picture through the VideoCore, sound through
+Paula, all 250 frames sent close to real time, repeat plays without a
+reboot. Widths whose padded size is not a multiple of 64 (e.g. 134x100)
+used to go through decoder -> ISP -> renderer. Without the scheduler that
+graph never came up, because the VideoCore stopped answering. They now take
+the direct graph as well; whether the renderer shows them cleanly is still
+to be tested.
 
-After a failed attempt, reboot before the next one: a failure leaves the
-VideoCore half set up, and the next open then fails early with backend
-error -6.
+**Failed streams.** The library used to tear the VideoCore side down only
+after a fully drained EOS. A stream whose setup failed left its components
+and the renderer's display layer behind, and the next open failed with
+backend error -6 until a reboot. CloseStream now closes the stream's MMAL
+service in that case and restores the Workbench display list
+(`N80_FAILED_STREAM_VC_RESET` in the trace). The VideoCore then deletes the
+service's components itself. Stream buffers the VideoCore may still own are
+not freed.
 
 ## Playing and controls
 
