@@ -66390,23 +66390,23 @@ n80_setup_direct_isp_graph:
         clr.l   vpv126_data_graph_ok
         jsr     v12a_connect_ports
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f1
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f2
         jsr     v12a_set_isp_requirements
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f3
         move.l  v12a_decoder_handle,component_handle
         move.l  v12a_decoder_output,output_port_handle
         move.l  #MMAL_PORT_OUTPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f4
         move.l  port_buf_num,d0
         cmpi.l  #2,d0
         bcc.s   n80_dg_num_ok
@@ -66415,21 +66415,66 @@ n80_dg_num_ok:
         move.l  d0,port_buf_num
         jsr     port_enable_output_current
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f5
         move.l  v12a_isp_handle,component_handle
         move.l  #MMAL_PORT_INPUT,port_query_type
         clr.l   port_query_index
         jsr     port_info_get
         tst.l   d0
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f6
         cmpi.l  #1,port_enabled
-        bne.w   n80_dg_fail
+        bne.w   n80_dg_f7
         move.l  #1,vpv126_data_graph_ok
         lea     n80_msg_direct_no_audio,a1
         jsr     n12_log
         moveq   #0,d0
         bra.s   n80_dg_done
+n80_dg_f1:
+        move.l  d0,n80_dg_d0
+        moveq   #1,d0
+        bra.s   n80_dg_fail
+n80_dg_f2:
+        move.l  d0,n80_dg_d0
+        moveq   #2,d0
+        bra.s   n80_dg_fail
+n80_dg_f3:
+        move.l  d0,n80_dg_d0
+        moveq   #3,d0
+        bra.s   n80_dg_fail
+n80_dg_f4:
+        move.l  d0,n80_dg_d0
+        moveq   #4,d0
+        bra.s   n80_dg_fail
+n80_dg_f5:
+        move.l  d0,n80_dg_d0
+        moveq   #5,d0
+        bra.s   n80_dg_fail
+n80_dg_f6:
+        move.l  d0,n80_dg_d0
+        moveq   #6,d0
+        bra.s   n80_dg_fail
+n80_dg_f7:
+        move.l  d0,n80_dg_d0
+        moveq   #7,d0
+        bra.s   n80_dg_fail
 n80_dg_fail:
+        ; N80: which step (1 connect, 2/4/6 port get, 3 ISP requirements,
+        ; 5 decoder output enable, 7 ISP input not enabled), its D0, and
+        ; the CONNECT reply fields.
+        lea     n80_pfx_dg_step,a1
+        jsr     n15_log_hex32
+        move.l  n80_dg_d0,d0
+        lea     n80_pfx_dg_d0,a1
+        jsr     n15_log_hex32
+        move.l  v12a_connect_rx_size,d0
+        lea     n80_pfx_dg_crx,a1
+        jsr     n15_log_hex32
+        move.l  v12a_connect_header_status,d0
+        lea     n80_pfx_dg_chdr,a1
+        jsr     n15_log_hex32
+        move.l  v12a_connect_status,d0
+        lea     n80_pfx_dg_cst,a1
+        jsr     n15_log_hex32
         lea     n80_msg_direct_fail,a1
         jsr     n12_log
         moveq   #1,d0
@@ -70490,6 +70535,11 @@ n73_msg_clock_armed: dc.b "N79_AUDIO_MASTER_CLOCK_ARMED",0
 n73_msg_clock_fail: dc.b "N79_AUDIO_MASTER_CLOCK_FAILED",0
 n80_msg_direct_no_audio: dc.b "N80_NO_HDMI_AUDIO_DIRECT_RENDERER",0
 n80_msg_direct_fail: dc.b "N80_DIRECT_ISP_GRAPH_FAILED",0
+n80_pfx_dg_step: dc.b "N80 DIRECT FAIL STEP=",0
+n80_pfx_dg_d0:   dc.b "N80 DIRECT FAIL D0=",0
+n80_pfx_dg_crx:  dc.b "N80 DIRECT CONNECT RX_SIZE=",0
+n80_pfx_dg_chdr: dc.b "N80 DIRECT CONNECT HDR_STATUS=",0
+n80_pfx_dg_cst:  dc.b "N80 DIRECT CONNECT STATUS=",0
 n80_pfx_dr_polls:  dc.b "N80 DISPLAYREGION POLLS=",0
 n80_pfx_j_step: dc.b "N80 N79J FAIL STEP=",0
 n80_pfx_j_d0:   dc.b "N80 N79J FAIL D0=",0
@@ -70725,6 +70775,7 @@ n80_dr_word:                 ds.l 1
 n80_direct_mode:             ds.l 1
 n80_rend_handle:             ds.l 1
 n80_rend_input:              ds.l 1
+n80_dg_d0:                   ds.l 1
 n73_clock_armed:             ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
