@@ -50,4 +50,11 @@ int  mrb_paula_idle(mrb_paula *p);
 void mrb_paula_stats(const mrb_paula *p, unsigned long *silence_ms,
                      unsigned long *dropped_ms, unsigned long *corrections);
 
+/* Where the 68k time went, for the log: time spent decoding and queueing
+ * sound, packets decoded, Paula underruns and the fewest milliseconds that
+ * were ever queued. */
+void mrb_paula_timing(mrb_paula *p, unsigned long *decode_ms,
+                      unsigned long *packets, unsigned long *starvations,
+                      unsigned long *min_buffered_ms);
+
 #endif

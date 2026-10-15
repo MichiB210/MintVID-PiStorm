@@ -658,6 +658,10 @@ static int play_session(session *s)
     uint32_t last_status_us = 0;
     const mr_audio_info *ai = s->ai;
     mrb_paula *paula = NULL;
+    /* Where the 68k time goes, for the log: demuxing, and handing video to
+     * the library (which includes its own wait until a frame is due). */
+    uint64_t t_demux_us = 0, t_vsend_us = 0;
+    uint32_t t_session0 = 0, t0;
 
     memset(&clk, 0, sizeof clk);
     s->seek_delta_us = 0;
@@ -726,6 +730,7 @@ static int play_session(session *s)
     status_playing(s, &clk, 0);
 
     n76_hlog("N76_BEFORE_DEMUX_LOOP");
+    t_session0 = (uint32_t)ac309i_read_sys_us();
     for (;;) {
         int64_t delta = 0;
         int ev = poll_event(&delta);
@@ -775,7 +780,9 @@ static int play_session(session *s)
         }
 
         mrb_paula_service(paula);
+        t0 = (uint32_t)ac309i_read_sys_us();
         st = mr_demux_next_packet(s->d, &pkt);
+        t_demux_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
         if (st != MR_OK) break;
         if (!pkt.len) continue;
         if (!rebase_packet(s, &pkt)) continue;
@@ -861,7 +868,9 @@ static int play_session(session *s)
             }
             if (n73_vqueued > ac309i_pace.queue_peak)
                 ac309i_pace.queue_peak = n73_vqueued;
+            t0 = (uint32_t)ac309i_read_sys_us();
             st = ac309i_service_mov_video(bvp, &ac309i_pace, &sent, &skipped);
+            t_vsend_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
             if (st != MR_OK) {
                 snprintf(s->error, sizeof s->error,
                          "Timed MP4 video feed failed at frame %lu", seen);
@@ -869,7 +878,9 @@ static int play_session(session *s)
                 break;
             }
         } else {
+            t0 = (uint32_t)ac309i_read_sys_us();
             st = mr_berryvp_send_packet(bvp, &pkt);
+            t_vsend_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
             if (st == MR_EAGAIN) {
                 skipped++;
                 continue;
@@ -910,6 +921,26 @@ static int play_session(session *s)
         }
     }
 
+    {
+        /* Wall time of the feed loop, pauses excluded. "other" is
+         * everything not listed: event polling, Paula service, queueing. */
+        uint32_t wall_ms = (uint32_t)((uint32_t)ac309i_read_sys_us() -
+                                      t_session0 - clk.paused_us) / 1000u;
+        unsigned long dec_ms = 0, pkts = 0, starv = 0, minbuf = 0;
+        unsigned long demux_ms = (unsigned long)(t_demux_us / 1000u);
+        unsigned long vsend_ms = (unsigned long)(t_vsend_us / 1000u);
+        unsigned long used;
+        mrb_paula_timing(paula, &dec_ms, &pkts, &starv, &minbuf);
+        used = demux_ms + vsend_ms + dec_ms;
+        DBG_PRINTF("mrberry timing: wall=%lu ms frames=%lu demux=%lu ms "
+                   "video-send=%lu ms audio-decode=%lu ms (%lu packets) "
+                   "other=%lu ms\n",
+                   (unsigned long)wall_ms, sent, demux_ms, vsend_ms, dec_ms,
+                   pkts, used < wall_ms ? (unsigned long)wall_ms - used : 0UL);
+        if (paula)
+            DBG_PRINTF("Amiga audio: %lu underruns, least queued %lu ms\n",
+                       starv, minbuf);
+    }
     if (result == SESSION_END && st != MR_EAGAIN) {
         /* Current MintVID demuxers use MR_EAGAIN for normal EOF. */
         printf("Error: demux ended with status %ld after %lu video packets.\n",

@@ -110,6 +110,9 @@ struct mrb_paula {
 
     uint64_t drop_frames;       /* pending correction                    */
     unsigned long silence_us, dropped_us, corrections;
+
+    uint64_t decode_us;         /* 68k time in decode_one(), for the log */
+    unsigned long decoded_packets;
 };
 
 static uint64_t frames_to_us(const mrb_paula *p, uint64_t frames)
@@ -362,7 +365,12 @@ void mrb_paula_service(mrb_paula *p)
         pkt_node *n = p->head;
         p->head = n->next;
         if (!p->head) p->tail_node = NULL;
-        decode_one(p, n);
+        {
+            uint32_t t0 = (uint32_t)ac309i_read_sys_us();
+            decode_one(p, n);
+            p->decode_us += (uint32_t)((uint32_t)ac309i_read_sys_us() - t0);
+            p->decoded_packets++;
+        }
         free(n);
     }
     if (!p->anchored || p->paused || !p->started) return;
@@ -401,4 +409,21 @@ void mrb_paula_stats(const mrb_paula *p, unsigned long *silence_ms,
     *silence_ms = p ? p->silence_us / 1000u : 0;
     *dropped_ms = p ? p->dropped_us / 1000u : 0;
     *corrections = p ? p->corrections : 0;
+}
+
+void mrb_paula_timing(mrb_paula *p, unsigned long *decode_ms,
+                      unsigned long *packets, unsigned long *starvations,
+                      unsigned long *min_buffered_ms)
+{
+    mr_audio_diagnostics diag;
+    *decode_ms = *packets = *starvations = *min_buffered_ms = 0;
+    if (!p) return;
+    *decode_ms = (unsigned long)(p->decode_us / 1000u);
+    *packets = p->decoded_packets;
+    if (p->out) {
+        memset(&diag, 0, sizeof diag);
+        audio_diagnostics(p->out, &diag);
+        *starvations = diag.hardware_starvations;
+        *min_buffered_ms = diag.minimum_buffered_ms;
+    }
 }
