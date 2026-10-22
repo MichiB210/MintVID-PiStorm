@@ -133,6 +133,7 @@ From the Shell:
 
     mrberry <film.mkv|film.mp4|film.ts> [--start=H:MM:SS] [--no-audio]
             [--paula [--audio-rate=low] [--audio-mono] [--av-offset=MS]]
+            [--read=KB]
 
 `--paula` plays the sound through the Amiga instead of the Pi's HDMI.
 The VideoCore still shows the picture. The 68k decodes the sound with
@@ -141,6 +142,11 @@ MintVID's decoders and keeps it in step with the Pi's timer.
 If picture and sound are not quite together, `--av-offset=100` plays
 the sound 100 ms later (a negative number plays it earlier). E-AC3 is not
 supported this way.
+
+`--read=KB` sets how much of the file mrberry reads at a time (64 to 1024,
+default 64). Over a network share each read waits for the network, so
+`--read=512` is faster there. Keep the default on local USB or SD storage:
+a large read blocks the player for longer.
 
 Keys while the film plays:
 
@@ -192,6 +198,8 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 **Wichtig:** Ton über HDMI braucht den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7. Nur Bild (`--no-audio`) oder Ton über den Amiga (`--paula`) brauchen ihn nicht (auf der Hardware noch nicht bestätigt).
 
 **Ton über den Amiga:** `--paula` spielt den Ton über Paula statt über HDMI. Der 68k dekodiert ihn mit den Decodern von MintVID (AAC, MP3, MP2, AC3, PCM, kein E-AC3). `--audio-rate=low` und `--audio-mono` sparen Rechenzeit. Passen Bild und Ton nicht ganz zusammen, verschiebt `--av-offset=100` den Ton um 100 ms nach hinten (negativ: nach vorne).
+
+**Netzwerk:** `--read=KB` legt fest, wie viel mrberry auf einmal aus der Datei liest (64 bis 1024, Standard 64). Über ein Netzlaufwerk (NAS) ist `--read=512` schneller, weil jeder Lesezugriff auf das Netz wartet. Auf lokalem USB/SD beim Standard bleiben: große Lesezugriffe blockieren den Player länger.
 
 **Bedienung:** In MintVID die Anzeige **PiStorm / VC Hard Fullscreen** wählen.
 Pause und Stopp in MintVID funktionieren. Tasten: ESC = Stopp, Leertaste =

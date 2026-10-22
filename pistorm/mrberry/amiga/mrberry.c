@@ -34,6 +34,7 @@
 
 extern ULONG bvp_exec_setsignal(ULONG newSignals, ULONG signalSet);
 extern ULONG ac309i_read_sys_us(void);
+void mrb_source_set_read_kb(unsigned kb);   /* core/mr_source.c */
 
 /* D4: keep the ~4 KiB BerryVP bridge context out of the Amiga CLI stack.
  * A normal Shell stack can be only 4096 bytes; the previous automatic
@@ -1024,7 +1025,9 @@ static void usage(void)
     printf("mrberry - H.264 hardware A/V player for PiStorm (Emu68 BerryCore)\n"
            "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [--start=H:MM:SS] [--no-audio]\n"
            "               [--paula [--audio-rate=low] [--audio-mono] [--av-offset=MS]]\n"
+           "               [--read=KB]\n"
            "  --paula  sound through the Amiga (MintVID's decoders), not the Pi's HDMI\n"
+           "  --read   KB per file read, 64 (default) to 1024; try 512 for a NAS\n"
            "Keys: ESC stop, Space pause, Left/Right -/+10 s, Down/Up -/+60 s\n");
 }
 
@@ -1058,6 +1061,12 @@ int main(int argc, char **argv)
             low_rate = 0;
         } else if (!strcmp(argv[i], "--audio-mono")) {
             mono = 1;
+        } else if (!strncmp(argv[i], "--read=", 7)) {
+            /* KB per file read, 64 (default) to 1024; e.g. 512 for a NAS. */
+            char *end;
+            long kb = strtol(argv[i] + 7, &end, 10);
+            if (*end || kb < 64 || kb > 1024) { usage(); return 5; }
+            mrb_source_set_read_kb((unsigned)kb);
         } else if (!strncmp(argv[i], "--av-offset=", 12)) {
             char *end;
             av_offset_ms = strtol(argv[i] + 12, &end, 10);
