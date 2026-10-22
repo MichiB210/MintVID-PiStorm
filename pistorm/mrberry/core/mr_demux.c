@@ -321,12 +321,37 @@ int mr_demux_can_seek(const mr_demux *d)
      * the target packet, which mr_mov_next_packet() already does via
      * file_read_at() - so this is future-proofing the contract, not masking
      * a real limitation today. */
-    return d && d->kind == MR_CONTAINER_MOV && !mr_source_is_streaming(d->owned_source);
+    return d && (d->kind == MR_CONTAINER_MOV || d->kind == MR_CONTAINER_MKV) &&
+           !mr_source_is_streaming(d->owned_source);
+}
+
+/* P96W50: Matroska seek (mrberry overlay, see mr_mkv.c). */
+mr_status mr_mkv_seek(mr_mkv *m, uint64_t target_us, uint64_t *out_us);
+
+/* P96W53: film length in us, 0 = unknown (MKV Duration, MP4 last sample). */
+extern uint64_t mr_mkv_duration_us;
+uint64_t mr_demux_duration_us(const mr_demux *d)
+{
+    if (!d) return 0;
+    if (d->kind == MR_CONTAINER_MKV) return mr_mkv_duration_us;
+    if (d->kind == MR_CONTAINER_MOV) {
+        uint32_t n = mr_mov_sample_count(&d->u.mov), i;
+        uint64_t best = 0;
+        for (i = n > 64 ? n - 64 : 0; i < n; i++) {
+            uint64_t t; int v, k;
+            mr_mov_sample_info(&d->u.mov, i, &t, &v, &k);
+            if (t > best) best = t;
+        }
+        return best * 1000U;
+    }
+    return 0;
 }
 
 mr_status mr_demux_seek(mr_demux *d, uint64_t target_us, uint64_t *out_us)
 {
     if (!mr_demux_can_seek(d)) return MR_EUNSUPPORTED;
+    if (d->kind == MR_CONTAINER_MKV)
+        return mr_mkv_seek(&d->u.mkv, target_us, out_us);
     {
         uint64_t out_ms = 0;
         mr_status st = mr_mov_seek(&d->u.mov, target_us / 1000, &out_ms);

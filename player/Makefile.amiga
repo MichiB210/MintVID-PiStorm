@@ -541,6 +541,13 @@ mrplay: check-cc check-mintamp check-kalms $(PLAY) $(CORE) $(KALMS_OBJ) $(MP2_AS
 	$(CC) $(CFLAGS) $(MINTAMP_FLAGS) $(LIBA52_FLAGS) -o $@ $(PLAY) $(CORE) \
 	    $(MINTAMP_MP3_OBJ) $(MINTAMP_AAC_OBJ) $(LIBA52_OBJ) $(KALMS_OBJ) $(MP2_ASM_OBJ) $(LDFLAGS)
 
+# pistorm/mrberry/build.sh (P96W67, from Darren's PR #1) builds MintVID's
+# audio decoders into mrberry (PAULA) with exactly the sources and flags
+# mrplay uses. It reads them from here.
+print-audio-build:
+	@echo "MINTAMP_SRC=$(MINTAMP_MP3) $(MINTAMP_AAC) $(LIBA52_SRC)"
+	@echo "MINTAMP_FLAGS=$(MINTAMP_FLAGS) $(LIBA52_FLAGS) $(LIBA52_FFT_CPPFLAGS)"
+
 check-kalms:
 	@test -n "$(KALMS_VASM)" -a -x "$(KALMS_VASM)" || { \
 	  echo "ERROR: vasmm68k_mot is required for the Kalms Motorola-syntax source."; \

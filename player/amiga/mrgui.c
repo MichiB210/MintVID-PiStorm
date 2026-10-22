@@ -47,18 +47,20 @@
 #include <proto/slider.h>
 #include <proto/window.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../core/mr_play_options.h"
 #include "../iptv/mr_iptv.h"
 #include "mr_master_options.h"
 #include "mr_akiko.h"
 #include "mr_gui_menu.h"
+#include "mr_paula_pref.h"
 #include "mr_last_dir.h"
 #include "mr_player_status.h"
 #include "mr_saved_options.h"
 #include "mr_playlist.h"
 
-MINTVID_DECLARE_VERSION(mintvid_version_tag, "MintVID");
+MINTVID_DECLARE_VERSION(mintvid_version_tag, "MintVID-pi");
 
 #ifndef MRGUI_CLASS_VERSION
 #define MRGUI_CLASS_VERSION 44
@@ -109,7 +111,9 @@ enum {
     G_YOUTUBE,
     G_VOLUME,
     G_PLAYLIST,
-    G_SKIP_AFTER
+    G_SKIP_AFTER,
+    G_TIME,
+    G_TIME_LABEL
 };
 
 /* Chooser rows are chipset-dependent, so never infer a display mode from a
@@ -136,6 +140,10 @@ static ULONG skip_after_row(unsigned ms)
     }
     return best;
 }
+/* MintVID-pi P96W59: only the H.264/PiStorm outputs are offered; the
+ * classic mrplay options are created (read_play_options() still reads
+ * them) but not shown, and their update functions do nothing. */
+static const int g_pi_only = 1;
 static mr_c2p_mode c2p_values[5];
 static unsigned c2p_count;
 static int add_chooser_node(struct List *list, const char *text);
@@ -145,7 +153,7 @@ static int chipset_has_aga(void)
     return GfxBase && (GfxBase->ChipRevBits0 & GFXF_AA_LISA) != 0;
 }
 
-static int chipset_has_ecs_denise(void)
+static int __attribute__((unused)) chipset_has_ecs_denise(void)
 {
     return GfxBase && (GfxBase->ChipRevBits0 & GFXF_HR_DENISE) != 0;
 }
@@ -342,6 +350,8 @@ static struct Task *find_player(void)
     Forbid();
     task = FindTask((STRPTR)"MintVID player");
     if (!task)
+        task = FindTask((STRPTR)"MintVID-pi player");
+    if (!task)
         task = FindTask((STRPTR)"MintVID Berry player");
     if (!task)
         task = FindTask((STRPTR)"MintVID VPberry player");
@@ -355,6 +365,8 @@ static void signal_player(ULONG mask)
 
     Forbid();
     task = FindTask((STRPTR)"MintVID player");
+    if (!task)   /* P96W45: MintVID-pi mrberry knows Ctrl-D = pause */
+        task = FindTask((STRPTR)"MintVID-pi player");
     if (task)
         Signal(task, mask);
     Permit();
@@ -370,7 +382,9 @@ static void stop_player_and_wait(void)
      * Ctrl-C, so give the two backends distinct task names and stop each
      * with its native signal.  This avoids changing the tested backend. */
     Forbid();
-    task = FindTask((STRPTR)"MintVID Berry player");
+    task = FindTask((STRPTR)"MintVID-pi player");   /* MintVID-pi: mrberry */
+    if (!task)
+        task = FindTask((STRPTR)"MintVID Berry player");
     if (task)
         Signal(task, SIGBREAKF_CTRL_C);
     else {
@@ -450,7 +464,9 @@ static void read_play_options(Object *mode, Object *c2p, Object *h264,
      * integration. Do not persist it into the shared settings consumed by
      * the untouched IPTV/YouTube/mrplay paths. */
     if (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
-        options->display != MR_DISPLAY_PISTORM_HARD_WINDOW)
+        options->display != MR_DISPLAY_PISTORM_HARD_WINDOW &&
+        options->display != MR_DISPLAY_PISTORM_RGB &&
+        options->display != MR_DISPLAY_PISTORM_PAULA)
         mr_saved_options_save(options);
 }
 
@@ -462,6 +478,7 @@ static void update_skip_after(Object *mode, Object *h264, Object *video_mode,
 {
     ULONG selected = 0, selected_h264 = 0, selected_video_mode = 0;
     ULONG no_video;
+    if (g_pi_only) return;
     GetAttr(CHOOSER_Selected, mode, &selected);
     GetAttr(CHOOSER_Selected, h264, &selected_h264);
     GetAttr(CHOOSER_Selected, video_mode, &selected_video_mode);
@@ -489,11 +506,13 @@ static void use_classic_browser_display(mr_play_options *options)
     mr_play_options saved;
     if (!options ||
         (options->display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
-         options->display != MR_DISPLAY_PISTORM_HARD_WINDOW))
+         options->display != MR_DISPLAY_PISTORM_HARD_WINDOW &&
+         options->display != MR_DISPLAY_PISTORM_PAULA))
         return;
     if (mr_saved_options_load(&saved) &&
         saved.display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
         saved.display != MR_DISPLAY_PISTORM_HARD_WINDOW &&
+        saved.display != MR_DISPLAY_PISTORM_PAULA &&
         saved.display <= MR_DISPLAY_HAM8_DITHER)
         options->display = saved.display;
     else
@@ -604,6 +623,19 @@ static void open_youtube_browser(Object *mode, Object *c2p, Object *h264,
     }
 }
 
+/* P96W72: the info area has two lines.  Line 1 (g_info_film) = the film
+ * (name, length, video); line 2 (the old "info" object) = sound/Paula offset,
+ * saved position and every status message (set_info). */
+static Object *g_info_film;
+static Object *g_info_status;        /* = info (line 2) */
+static void set_film_line(struct Window *window, const char *text)
+{
+    if (!g_info_film || !window) return;
+    SetGadgetAttrs((struct Gadget *)g_info_film, window, NULL,
+                   STRINGA_TextVal, (ULONG)(text ? text : ""),
+                   STRINGA_BufferPos, 0, STRINGA_DispPos, 0, TAG_DONE);
+}
+
 static void set_info(Object *info, struct Window *window, const char *text)
 {
     if (!info || !window)
@@ -614,6 +646,280 @@ static void set_info(Object *info, struct Window *window, const char *text)
                    STRINGA_BufferPos, 0,
                    STRINGA_DispPos, 0,
                    TAG_DONE);
+}
+
+/* ---- MintVID-pi B (P96W57): timeline and mrberry INFO --------------------
+ * Choosing a film runs "mrberry <film> INFO" (no Pi, no window) and fills:
+ *   - the info line: length, video, sound (or why it cannot play),
+ *   - the timeline slider (start time, seconds) with its "T h:mm:ss" label,
+ *     preset to the position saved in <film>.t.
+ * The slider does not move during playback; Play passes T=h:mm:ss to
+ * mrberry.  Files mrberry cannot jump in (TS) keep the slider disabled. */
+static Object *g_time_slider;
+static Object *g_time_label;
+static char g_time_text[24];
+static ULONG g_film_len_s;
+static int g_film_seek;
+static char g_film_path[512];
+/* P96W58: one Play/Pause button, the freed button is Fullscreen. */
+static Object *g_play_button;
+static Object *g_full_button;
+static Object *g_ff_button;
+static int g_ff_enabled;
+static int g_play_shows_pause;      /* 1 = button reads "||" */
+static int g_full_enabled = -1;
+static int g_player_paused;         /* mrberry status text "Paused" */
+static int g_player_was_running;
+static int g_launch_display = -1;   /* display of the last launch */
+static Object *g_mode;              /* P96W59: Display chooser */
+
+typedef struct {
+    int ok, playable, seek;
+    ULONG len_ms, resume_s;
+    int have_resume;
+    char video[48], size[16], fps[12], audio[24], ch[4], sound[8], reason[80];
+    char resume_a[8];                 /* P96W71: HDMI / PAULA / NONE */
+    long resume_p;                    /* P96W72: Paula fine offset (ms) */
+    int have_resume_p;
+} mrg_film_info;
+
+static ULONG mrg_hms_to_s(const char *t)
+{
+    ULONG h = 0, m = 0, sec = 0;
+    if (sscanf(t, "%lu:%lu:%lu", &h, &m, &sec) != 3) return 0;
+    return h * 3600UL + m * 60UL + sec;
+}
+
+static void mrg_copy_field(char *dst, size_t cap, const char *src)
+{
+    size_t n = strlen(src);
+    const char *cut = strstr(src, " (fourcc");
+    if (cut) n = (size_t)(cut - src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+/* Run "mrberry <film> INFO" synchronously (own process via SystemTags) and
+ * parse its KEY=VALUE lines from a T: file. */
+static int mrg_film_info_read(const char *path, mrg_film_info *fi)
+{
+    static char cmd[900], prog[300], buf[2048];
+    BPTR in, out, lock;
+    LONG n;
+    char *line;
+
+    memset(fi, 0, sizeof *fi);
+    if (!path || !*path || strchr(path, '"')) return 0;
+    prog[0] = 0;
+    lock = GetProgramDir();
+    if (lock && NameFromLock(lock, (STRPTR)prog, sizeof prog - 16))
+        AddPart((STRPTR)prog, (CONST_STRPTR)"mrberry", sizeof prog);
+    else
+        strcpy(prog, "mrberry");
+    lock = Lock((CONST_STRPTR)prog, ACCESS_READ);
+    if (lock) UnLock(lock);
+    else strcpy(prog, "mrberry");
+    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" INFO", prog, path);
+
+    in = Open((CONST_STRPTR)"NIL:", MODE_OLDFILE);
+    out = Open((CONST_STRPTR)"T:MintVID-pi.info", MODE_NEWFILE);
+    if (!in || !out) {
+        if (in) Close(in);
+        if (out) Close(out);
+        return 0;
+    }
+    SystemTags((CONST_STRPTR)cmd, SYS_Input, (ULONG)in, SYS_Output, (ULONG)out,
+               TAG_END);
+    Close(in);
+    Close(out);
+
+    out = Open((CONST_STRPTR)"T:MintVID-pi.info", MODE_OLDFILE);
+    if (!out) return 0;
+    n = Read(out, buf, (LONG)sizeof buf - 1);
+    Close(out);
+    DeleteFile((CONST_STRPTR)"T:MintVID-pi.info");
+    if (n <= 0) return 0;
+    buf[n] = 0;
+
+    for (line = buf; line && *line;) {
+        char *next = strchr(line, '\n');
+        char *eq;
+        if (next) *next++ = 0;
+        eq = strchr(line, '=');
+        if (eq) {
+            *eq++ = 0;
+            if (!strcmp(line, "MRBERRY_INFO")) fi->ok = 1;
+            else if (!strcmp(line, "PLAYABLE")) fi->playable = *eq == '1';
+            else if (!strcmp(line, "SEEK")) fi->seek = *eq == '1';
+            else if (!strcmp(line, "LENGTH_MS")) fi->len_ms = strtoul(eq, NULL, 10);
+            else if (!strcmp(line, "RESUME_T")) {
+                fi->resume_s = mrg_hms_to_s(eq);
+                fi->have_resume = 1;
+            }
+            else if (!strcmp(line, "VIDEO")) mrg_copy_field(fi->video, sizeof fi->video, eq);
+            else if (!strcmp(line, "SIZE")) mrg_copy_field(fi->size, sizeof fi->size, eq);
+            else if (!strcmp(line, "FPS")) mrg_copy_field(fi->fps, sizeof fi->fps, eq);
+            else if (!strcmp(line, "AUDIO")) mrg_copy_field(fi->audio, sizeof fi->audio, eq);
+            else if (!strcmp(line, "AUDIO_CH")) mrg_copy_field(fi->ch, sizeof fi->ch, eq);
+            else if (!strcmp(line, "SOUND")) mrg_copy_field(fi->sound, sizeof fi->sound, eq);
+            else if (!strcmp(line, "REASON")) mrg_copy_field(fi->reason, sizeof fi->reason, eq);
+            else if (!strcmp(line, "RESUME_A")) mrg_copy_field(fi->resume_a, sizeof fi->resume_a, eq);
+            else if (!strcmp(line, "RESUME_P")) { fi->resume_p = strtol(eq, NULL, 10); fi->have_resume_p = 1; }
+        }
+        line = next;
+    }
+    return fi->ok;
+}
+
+static void mrg_fmt_hms(char *dst, size_t cap, ULONG s)
+{
+    snprintf(dst, cap, "%lu:%02lu:%02lu", s / 3600UL, (s / 60UL) % 60UL, s % 60UL);
+}
+
+static void mrg_time_label_update(struct Window *window)
+{
+    ULONG level = 0;
+    char t[16];
+    if (!g_time_label) return;
+    if (g_time_slider && g_film_seek && g_film_len_s) {
+        GetAttr(SLIDER_Level, g_time_slider, &level);
+        mrg_fmt_hms(t, sizeof t, level);
+        snprintf(g_time_text, sizeof g_time_text, "T %s", t);
+    } else {
+        strcpy(g_time_text, "T -:--:--");
+    }
+    if (window && SetGadgetAttrs((struct Gadget *)g_time_label, window, NULL,
+                                 GA_Text, (ULONG)g_time_text, TAG_DONE))
+        RefreshGList((struct Gadget *)g_time_label, window, NULL, 1);
+}
+
+/* P96W59: the timeline only works for mrberry (HDMI); h264rgb always
+ * starts at the beginning. */
+static int mrg_rgb_selected(void)
+{
+    ULONG row = 0;
+    if (!g_mode) return 0;
+    GetAttr(CHOOSER_Selected, g_mode, &row);
+    return row < mode_count && mode_values[row] == MR_DISPLAY_PISTORM_RGB;
+}
+
+/* P96W71: Display chooser is on "PiStorm / VC Hard Fullscreen (Paula)" */
+static int mrg_paula_selected(void)
+{
+    ULONG row = 0;
+    if (!g_mode) return 0;
+    GetAttr(CHOOSER_Selected, g_mode, &row);
+    return row < mode_count && mode_values[row] == MR_DISPLAY_PISTORM_PAULA;
+}
+
+static void mrg_time_enable(struct Window *window)
+{
+    int on = g_film_seek && g_film_len_s && !mrg_rgb_selected();
+    if (!g_time_slider || !window) return;
+    SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                   GA_Disabled, on ? FALSE : TRUE, TAG_DONE);
+}
+
+static void mrg_time_slider_set(struct Window *window, ULONG len_s,
+                                ULONG level, int enabled)
+{
+    if (!g_time_slider || !window) return;
+    if (!enabled || !len_s) { len_s = 1; level = 0; enabled = 0; }
+    if (level >= len_s) level = 0;
+    SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                   SLIDER_Max, len_s, TAG_DONE);
+    SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                   SLIDER_Level, level, TAG_DONE);
+    mrg_time_enable(window);
+    mrg_time_label_update(window);
+}
+
+/* P96W72: line 2 = sound of the chosen film, with the Paula offset. */
+static mrg_film_info g_fi;
+static int g_fi_valid;
+static long g_live_fine;
+static int mrg_paula_selected(void);
+static void mrg_sound_line(Object *info, struct Window *window)
+{
+    static char l2[200];
+    char snd[64];
+    if (!g_fi_valid || !g_fi.playable) return;
+    if (mrg_paula_selected()) {
+        if (g_fi.audio[0] && !strstr(g_fi.audio, "E-AC")) {
+            long base = mr_paula_pref_load();     /* P96W73: menu value */
+            snprintf(snd, sizeof snd, "Paula %ld ms (base %ld / fine %+ld)",
+                     base + g_live_fine, base, g_live_fine);
+        }
+        else
+            strcpy(snd, "none");
+    } else {
+        strcpy(snd, !strcmp(g_fi.sound, "HDMI") ? "HDMI" : "none");
+    }
+    snprintf(l2, sizeof l2, "%s %sch -> %s%s",
+             g_fi.audio[0] ? g_fi.audio : "no sound", g_fi.ch, snd,
+             g_fi.have_resume ? " | saved" : "");
+    set_info(info, window, l2);
+}
+
+/* Fill timeline (always) and, if text is set, the info line for path. */
+static int mrg_film_info_apply(const char *path, Object *info,
+                               struct Window *window, int text)
+{
+    mrg_film_info fi;
+    static char line[400];
+    const char *name;
+
+    if (!mrg_film_info_read(path, &fi)) {
+        g_film_len_s = 0; g_film_seek = 0; g_film_path[0] = 0;
+        mrg_time_slider_set(window, 0, 0, 0);
+        return 0;
+    }
+    strncpy(g_film_path, path, sizeof g_film_path - 1);
+    g_film_path[sizeof g_film_path - 1] = 0;
+    g_film_len_s = fi.len_ms / 1000UL;
+    g_film_seek = fi.seek && fi.playable;
+    mrg_time_slider_set(window, g_film_len_s,
+                        fi.have_resume ? fi.resume_s : 0, g_film_seek);
+    if (!text) return 1;
+    /* P96W71: a .t that was saved with Paula sound (A:PAULA) selects the
+     * Paula cinema entry, one saved with HDMI sound the normal cinema. */
+    if (fi.have_resume && g_mode && window) {
+        ULONG cur = 0;
+        int want = -1;
+        GetAttr(CHOOSER_Selected, g_mode, &cur);
+        if (cur < mode_count) {
+            if (!strcmp(fi.resume_a, "PAULA") &&
+                mode_values[cur] == MR_DISPLAY_PISTORM_HARD_FULLSCREEN)
+                want = mode_row(MR_DISPLAY_PISTORM_PAULA);
+            else if (!strcmp(fi.resume_a, "HDMI") &&
+                     mode_values[cur] == MR_DISPLAY_PISTORM_PAULA)
+                want = mode_row(MR_DISPLAY_PISTORM_HARD_FULLSCREEN);
+        }
+        if (want >= 0)
+            SetGadgetAttrs((struct Gadget *)g_mode, window, NULL,
+                           CHOOSER_Selected, (ULONG)want, TAG_DONE);
+    }
+    name = (const char *)FilePart((CONST_STRPTR)path);
+    g_fi = fi;
+    g_fi_valid = 1;
+    g_live_fine = fi.have_resume_p ? fi.resume_p : 0;
+    if (!fi.playable) {
+        snprintf(line, sizeof line, "%s | not playable: %s", name,
+                 fi.reason[0] ? fi.reason : "unknown");
+        set_film_line(window, line);
+        set_info(info, window, "");
+        return 1;
+    } else {
+        char len[16];
+        if (g_film_len_s) mrg_fmt_hms(len, sizeof len, g_film_len_s);
+        else strcpy(len, "?:??:??");
+        snprintf(line, sizeof line, "%s | %s | %s %s %s fps",
+                 name, len, fi.video, fi.size, fi.fps);
+        set_film_line(window, line);
+    }
+    mrg_sound_line(info, window);
+    return 1;
 }
 
 static void update_file_info(Object *file, Object *info,
@@ -649,7 +955,12 @@ static void update_file_info(Object *file, Object *info,
     if (lock)
         UnLock(lock);
 
-    set_info(info, window, text);
+    set_film_line(window, text);
+    set_info(info, window, "");
+    /* P96W57: length, video/sound and saved position from mrberry INFO */
+    SetWindowPointer(window, WA_BusyPointer, TRUE, TAG_DONE);
+    mrg_film_info_apply((const char *)path, info, window, 1);
+    SetWindowPointer(window, TAG_DONE);
 }
 
 static void update_mode_controls(Object *mode, Object *c2p, Object *lace,
@@ -665,6 +976,7 @@ static void update_mode_controls(Object *mode, Object *c2p, Object *lace,
     int direct_available;
     int copper_ok;
 
+    if (g_pi_only) return;
     selected = 0;
     GetAttr(CHOOSER_Selected, mode, &selected);
     disable_chipset_options = selected < mode_count &&
@@ -894,6 +1206,8 @@ static void poll_player_status(Object *info, struct Window *window)
     }
     if (ps.seq == player_status_seq) return;
     player_status_seq = ps.seq;
+    g_player_paused = ps.state == MR_PLAYER_STATE_PLAYING &&
+                      !strcmp(ps.text, "Paused");
 
     if (ps.state == MR_PLAYER_STATE_OPENING)
         snprintf(line, sizeof(line), "%s",
@@ -953,6 +1267,34 @@ static void start_iptv_launch(Object *info, struct Window *window,
     iptv_launch_ticks = 0;
 }
 
+/* Insert " text" in front of the trailing newline of an mrberry argument
+ * line. */
+static int mrg_args_append(char *args, size_t cap, const char *text)
+{
+    size_t len = strlen(args);
+    if (len && args[len - 1] == '\n') args[--len] = 0;
+    if (len + strlen(text) + 3 > cap) return 0;
+    strcat(args, " ");
+    strcat(args, text);
+    strcat(args, "\n");
+    return 1;
+}
+
+/* P96W57: T=h:mm:ss from the timeline, only for the film it was read for. */
+static int mrg_args_append_time(char *args, size_t cap, const char *path)
+{
+    ULONG level = 0;
+    char t[24], hms[16];
+    if (!g_time_slider || !g_film_seek || !g_film_len_s ||
+        strcmp(path, g_film_path))
+        return 1;
+    GetAttr(SLIDER_Level, g_time_slider, &level);
+    if (!level) return 1;
+    mrg_fmt_hms(hms, sizeof hms, level);
+    snprintf(t, sizeof t, "T=%s", hms);
+    return mrg_args_append(args, cap, t);
+}
+
 static void start_player_path(const char *full_file, Object *mode,
                               Object *c2p, Object *h264,
                               Object *lace, Object *scale,
@@ -985,13 +1327,19 @@ static void start_player_path(const char *full_file, Object *mode,
     path[sizeof(path) - 1] = 0;
     read_play_options(mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
                       no_audio, mono_audio, video_mode, &options);
+    g_launch_display = (int)options.display;
+    g_player_paused = 0;
 
-    if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN) {
+    if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN ||
+        options.display == MR_DISPLAY_PISTORM_PAULA) {
         /* PiStorm06: discard the previous child's terminal snapshot before
          * launching a new one and reset the GUI sequence latch. */
         clear_player_status_snapshot();
         player_status_seq = 0;
-        if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
+        if (!mr_build_mrberry_arguments(args, sizeof(args), path) ||
+            !mrg_args_append_time(args, sizeof(args), path) ||
+            (options.display == MR_DISPLAY_PISTORM_PAULA &&
+             !mrg_args_append(args, sizeof(args), "PAULA"))) {
             set_info(info, window, "Could not build PiStorm player arguments.");
             return;
         }
@@ -1000,58 +1348,94 @@ static void start_player_path(const char *full_file, Object *mode,
             seglist = LoadSeg((CONST_STRPTR)"mrberry");
         if (!seglist) {
             set_info(info, window,
-                     "Could not load mrberry (keep it beside MintVID).");
+                     "Could not load mrberry (keep it beside MintVID-pi).");
             return;
         }
         process = CreateNewProcTags(
             NP_Seglist, seglist, NP_FreeSeglist, TRUE,
             NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
             NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
-            NP_Name, (ULONG)"MintVID Berry player", TAG_END);
+            NP_Name, (ULONG)"MintVID-pi player", TAG_END);
         if (!process) {
             UnLoadSeg(seglist);
             set_info(info, window, "Could not create the mrberry process.");
         } else {
-            set_info(info, window, "Starting PiStorm VideoCore playback...");
+            set_info(info, window, options.display == MR_DISPLAY_PISTORM_PAULA ?
+                     "Starting PiStorm playback, sound through Paula (+/- = sound offset)..." :
+                     "Starting PiStorm VideoCore playback...");
         }
         return;
     }
 
-    /* PiStorm window player: keep fullscreen mrberry/berryvp.library untouched.
-     * VPr8 expects <movie> W:25; it does not accept mrplay's --flags. */
+    /* MintVID-pi: the PiStorm window is mrberry with W:50 (berryvp.library
+     * P96 window, picture held to the Pi audio clock).  It replaces VPberry
+     * and uses the same process name, status file and stop signal as the
+     * fullscreen mrberry. */
     if (options.display == MR_DISPLAY_PISTORM_HARD_WINDOW) {
         clear_player_status_snapshot();
         player_status_seq = 0;
         if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
-            set_info(info, window, "Could not build VPberry arguments.");
+            set_info(info, window, "Could not build PiStorm player arguments.");
             return;
         }
-        /* Strip the newline before appending the VPr8 window selector. */
-        {
-            size_t len = strlen(args);
-            if (len && args[len - 1] == '\n') args[len - 1] = 0;
-            if (strlen(args) + sizeof(" W:25\n") > sizeof(args)) {
-                set_info(info, window, "VPberry arguments too long.");
-                return;
-            }
-            strcat(args, " W:25\n");
+        if (!mrg_args_append(args, sizeof(args), "W:50") ||
+            !mrg_args_append_time(args, sizeof(args), path)) {
+            set_info(info, window, "PiStorm player arguments too long.");
+            return;
         }
-        seglist = LoadSeg((CONST_STRPTR)"PROGDIR:VPberry");
-        if (!seglist) seglist = LoadSeg((CONST_STRPTR)"VPberry");
+        seglist = LoadSeg((CONST_STRPTR)"PROGDIR:mrberry");
+        if (!seglist)
+            seglist = LoadSeg((CONST_STRPTR)"mrberry");
         if (!seglist) {
-            set_info(info, window, "Could not load VPberry (keep it beside MintVID).");
+            set_info(info, window,
+                     "Could not load mrberry (keep it beside MintVID-pi).");
             return;
         }
         process = CreateNewProcTags(
             NP_Seglist, seglist, NP_FreeSeglist, TRUE,
             NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
-            NP_Cli, TRUE, NP_CommandName, (ULONG)"VPberry",
-            NP_Name, (ULONG)"MintVID VPberry player", TAG_END);
+            NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
+            NP_Name, (ULONG)"MintVID-pi player", TAG_END);
         if (!process) {
             UnLoadSeg(seglist);
-            set_info(info, window, "Could not create VPberry process.");
+            set_info(info, window, "Could not create the mrberry process.");
         } else {
-            set_info(info, window, "Starting VPberry P96 window playback...");
+            set_info(info, window, "Starting PiStorm window playback (W:50)...");
+        }
+        return;
+    }
+
+    /* MintVID-pi P96W59: Amiga RGB output through Michael's h264rgb
+     * (HAM6 192x144, no sound, no pause or start time).  It loads ham.bin,
+     * edge.bin and state.bin from its current directory, so it runs with
+     * the MintVID-pi drawer as current directory.  Ctrl-C stops it. */
+    if (options.display == MR_DISPLAY_PISTORM_RGB) {
+        BPTR home;
+        if (!mr_build_mrberry_arguments(args, sizeof(args), path)) {
+            set_info(info, window, "Could not build h264rgb arguments.");
+            return;
+        }
+        seglist = LoadSeg((CONST_STRPTR)"PROGDIR:h264rgb");
+        if (!seglist)
+            seglist = LoadSeg((CONST_STRPTR)"h264rgb");
+        if (!seglist) {
+            set_info(info, window,
+                     "Could not load h264rgb (keep it beside MintVID-pi).");
+            return;
+        }
+        home = GetProgramDir() ? DupLock(GetProgramDir()) : 0;
+        process = CreateNewProcTags(
+            NP_Seglist, seglist, NP_FreeSeglist, TRUE,
+            NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
+            NP_Cli, TRUE, NP_CommandName, (ULONG)"h264rgb",
+            NP_CurrentDir, (ULONG)home,
+            NP_Name, (ULONG)"MintVID-pi player", TAG_END);
+        if (!process) {
+            UnLoadSeg(seglist);
+            if (home) UnLock(home);
+            set_info(info, window, "Could not create the h264rgb process.");
+        } else {
+            set_info(info, window, "Playing on the Amiga RGB output (HAM6, no sound)...");
         }
         return;
     }
@@ -1095,6 +1479,188 @@ static void start_player(Object *file, Object *mode, Object *c2p,
 }
 
 
+
+/* P96W58: button states, called on every status tick and after actions. */
+static void mrg_buttons_update(struct Window *window)
+{
+    int running = find_player() != NULL;
+    int show_pause = running && !g_player_paused &&
+                     g_launch_display != MR_DISPLAY_PISTORM_RGB &&
+                     g_launch_display != MR_DISPLAY_PISTORM_PAULA;
+    int full = running && g_launch_display == MR_DISPLAY_PISTORM_HARD_WINDOW;
+    if (!running) g_player_paused = 0;
+    if (g_play_button && window && show_pause != g_play_shows_pause) {
+        g_play_shows_pause = show_pause;
+        if (SetGadgetAttrs((struct Gadget *)g_play_button, window, NULL,
+                           GA_Text, (ULONG)(show_pause ? "||" : ">"), TAG_DONE))
+            RefreshGList((struct Gadget *)g_play_button, window, NULL, 1);
+    }
+    if (g_ff_button && window && running != g_ff_enabled) {
+        g_ff_enabled = running;
+        SetGadgetAttrs((struct Gadget *)g_ff_button, window, NULL,
+                       GA_Disabled, running ? FALSE : TRUE, TAG_DONE);
+    }
+    if (g_full_button && window && full != g_full_enabled) {
+        g_full_enabled = full;
+        SetGadgetAttrs((struct Gadget *)g_full_button, window, NULL,
+                       GA_Disabled, full ? FALSE : TRUE, TAG_DONE);
+    }
+}
+
+/* Fullscreen: stop the PiStorm window film with Ctrl-F (mrberry writes the
+ * .t position without recap), read it, switch the Display chooser to
+ * cinema and start again at that position. */
+static void mrg_switch_fullscreen(Object *file, Object *mode, Object *c2p,
+                                  Object *h264, Object *lace, Object *scale,
+                                  Object *audio_rate, Object *fast_buffer,
+                                  Object *no_audio, Object *mono_audio,
+                                  Object *video_mode, Object *info,
+                                  struct Window *window)
+{
+    struct Task *task;
+    int guard, row;
+
+    if (!find_player() || g_launch_display != MR_DISPLAY_PISTORM_HARD_WINDOW ||
+        !g_film_path[0]) {
+        set_info(info, window, "Fullscreen works while a film plays in the PiStorm window.");
+        return;
+    }
+    row = mode_row(MR_DISPLAY_PISTORM_HARD_FULLSCREEN);
+    if (row < 0) return;
+    SetWindowPointer(window, WA_BusyPointer, TRUE, TAG_DONE);
+    set_info(info, window, "Switching to fullscreen...");
+    Forbid();
+    task = FindTask((STRPTR)"MintVID-pi player");
+    if (task) Signal(task, SIGBREAKF_CTRL_F);
+    Permit();
+    for (guard = 0; guard < 500 && find_player(); guard++)
+        Delay(1);
+    if (find_player()) {
+        SetWindowPointer(window, TAG_DONE);
+        set_info(info, window, "The window film did not stop - fullscreen cancelled.");
+        return;
+    }
+    g_player_was_running = 0;
+    mrg_film_info_apply(g_film_path, info, window, 0);
+    SetGadgetAttrs((struct Gadget *)mode, window, NULL,
+                   CHOOSER_Selected, (ULONG)row, TAG_DONE);
+    update_mode_controls(mode, c2p, lace, scale, window, TRUE);
+    update_skip_after(mode, h264, video_mode, window);
+    SetWindowPointer(window, TAG_DONE);
+    start_player(file, mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
+                 no_audio, mono_audio, video_mode, info, window);
+    mrg_buttons_update(window);
+}
+
+/* P96W62: follow the running film on the timeline.  mrberry writes the
+ * film position (whole seconds) to T:MintVID-pi.pos every 10 s of film
+ * time.  After the user moves the slider it is left alone for
+ * MRG_POS_HOLD_TICKS status ticks (or until ">>"/stop). */
+#define MRG_POS_FILE "T:MintVID-pi.pos"
+#define MRG_POS_HOLD_TICKS 40          /* 40 x 250 ms = 10 s */
+static int g_pos_hold;
+static ULONG g_pos_last = (ULONG)-1;
+
+static void mrg_pos_poll(struct Window *window)
+{
+    BPTR f;
+    char buf[48];
+    LONG n;
+    ULONG sec = 0;
+    int i;
+    char *pp;
+    if (!window || !g_film_path[0]) return;
+    f = Open((CONST_STRPTR)MRG_POS_FILE, MODE_OLDFILE);
+    if (!f) return;
+    n = Read(f, buf, (LONG)sizeof buf - 1);
+    Close(f);
+    if (n <= 0) return;
+    buf[n] = 0;
+    /* P96W72: second line "P:<ms>" = live Paula fine offset */
+    pp = strstr(buf, "P:");
+    if (pp && g_launch_display == MR_DISPLAY_PISTORM_PAULA) {
+        long fine = strtol(pp + 2, NULL, 10);
+        if (fine != g_live_fine) {
+            g_live_fine = fine;
+            mrg_sound_line(g_info_status, window);
+        }
+    }
+    if (g_pos_hold > 0) { g_pos_hold--; return; }
+    if (!g_time_slider || !g_film_seek || !g_film_len_s) return;
+    for (i = 0; buf[i] >= '0' && buf[i] <= '9'; i++)
+        sec = sec * 10 + (ULONG)(buf[i] - '0');
+    if (!i || sec == g_pos_last) return;
+    g_pos_last = sec;
+    if (sec >= g_film_len_s) sec = g_film_len_s - 1;
+    SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                   SLIDER_Level, sec, TAG_DONE);
+    mrg_time_label_update(window);
+}
+
+/* P96W61: ">>" jump.  The user sets a new time on the timeline (forward
+ * or back) while a film plays and presses ">>": stop mrberry with Ctrl-F
+ * (writes .t without the 30 s recap), then start the same film again in
+ * the same display at the slider time. */
+static void mrg_jump(Object *file, Object *mode, Object *c2p,
+                     Object *h264, Object *lace, Object *scale,
+                     Object *audio_rate, Object *fast_buffer,
+                     Object *no_audio, Object *mono_audio,
+                     Object *video_mode, Object *info,
+                     struct Window *window)
+{
+    struct Task *task;
+    ULONG level = 0;
+    int guard, row;
+    char hms[16], text[64];
+
+    if (!find_player() || !g_film_path[0] ||
+        (g_launch_display != MR_DISPLAY_PISTORM_HARD_WINDOW &&
+         g_launch_display != MR_DISPLAY_PISTORM_HARD_FULLSCREEN &&
+         g_launch_display != MR_DISPLAY_PISTORM_PAULA)) {
+        set_info(info, window, "Set the time on the timeline while a film plays, then >>.");
+        return;
+    }
+    if (!g_film_seek || !g_film_len_s || !g_time_slider) {
+        set_info(info, window, "This film cannot jump (no seek support).");
+        return;
+    }
+    row = mode_row(g_launch_display);
+    if (row < 0) return;
+    GetAttr(SLIDER_Level, g_time_slider, &level);
+    mrg_fmt_hms(hms, sizeof hms, level);
+    snprintf(text, sizeof text, "Jumping to %s...", hms);
+    SetWindowPointer(window, WA_BusyPointer, TRUE, TAG_DONE);
+    set_info(info, window, text);
+    Forbid();
+    task = FindTask((STRPTR)"MintVID-pi player");
+    if (task) Signal(task, SIGBREAKF_CTRL_F);
+    Permit();
+    for (guard = 0; guard < 500 && find_player(); guard++)
+        Delay(1);
+    if (find_player()) {
+        SetWindowPointer(window, TAG_DONE);
+        set_info(info, window, "The film did not stop - jump cancelled.");
+        return;
+    }
+    g_player_was_running = 0;
+    g_player_paused = 0;
+    g_pos_hold = 0;
+    g_pos_last = (ULONG)-1;
+    /* re-read the film (.t now holds the stop position), then put the
+     * slider back to the time the user chose */
+    mrg_film_info_apply(g_film_path, info, window, 0);
+    SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                   SLIDER_Level, level, TAG_DONE);
+    mrg_time_label_update(window);
+    SetGadgetAttrs((struct Gadget *)mode, window, NULL,
+                   CHOOSER_Selected, (ULONG)row, TAG_DONE);
+    update_mode_controls(mode, c2p, lace, scale, window, TRUE);
+    update_skip_after(mode, h264, video_mode, window);
+    SetWindowPointer(window, TAG_DONE);
+    start_player(file, mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
+                 no_audio, mono_audio, video_mode, info, window);
+    mrg_buttons_update(window);
+}
 
 #define MRG_PL_LIST 200
 #define MRG_PL_ADD 201
@@ -1376,7 +1942,7 @@ static int mrg_playlist_open(mrg_playlist_window *p, mr_playlist *playlist,
         LAYOUT_AddChild, (ULONG)row1, CHILD_WeightedHeight, 0,
         LAYOUT_AddChild, (ULONG)row2, CHILD_WeightedHeight, 0, TAG_DONE);
     p->window_object = (Object *)NewObject(WINDOW_GetClass(), NULL,
-        WA_Title, (ULONG)"MintVID Playlist", WA_Activate, TRUE,
+        WA_Title, (ULONG)"MintVID-pi Playlist", WA_Activate, TRUE,
         WA_DepthGadget, TRUE, WA_DragBar, TRUE, WA_CloseGadget, TRUE,
         WA_IDCMP, IDCMP_GADGETUP | IDCMP_CLOSEWINDOW |
                   IDCMP_REFRESHWINDOW,
@@ -1467,7 +2033,6 @@ int main(void)
     Object *layout;
     Object *controls;
     Object *controls_top;
-    Object *controls_bottom;
     Object *buttons;
     Object *transport;
     Object *services;
@@ -1535,7 +2100,6 @@ int main(void)
     layout = NULL;
     controls = NULL;
     controls_top = NULL;
-    controls_bottom = NULL;
     buttons = NULL;
     transport = NULL;
     services = NULL;
@@ -1598,62 +2162,19 @@ int main(void)
     }
 
     have_rtg = default_screen_is_rtg();
-    if (chipset_has_aga()) {
-        if (!add_mode_node(&modes, "AGA (256 colours)", MR_DISPLAY_AGA) ||
-            !add_mode_node(&modes, "ECS (32 colours)", MR_DISPLAY_AGA_ECS32) ||
-            !add_mode_node(&modes, "ECS (16 colours)", MR_DISPLAY_AGA_ECS16) ||
-            !add_mode_node(&modes, "ECS (EHB, 64 colours)", MR_DISPLAY_AGA_EHB))
-            goto cleanup;
-    } else if (!add_mode_node(&modes,
-                              chipset_has_ecs_denise() ? "ECS (32 colours)" :
-                                                         "OCS (32 colours)",
-                              MR_DISPLAY_AGA) ||
-               !add_mode_node(&modes, "ECS (EHB, 64 colours)",
-                              MR_DISPLAY_AGA_EHB))
-        goto cleanup;
-    if (!add_mode_node(&modes, "HAM6", MR_DISPLAY_HAM6) ||
-        !add_mode_node(&modes, "HAM6 (Dither)", MR_DISPLAY_HAM6_DITHER) ||
-        (chipset_has_aga() &&
-         !add_mode_node(&modes, "HAM8", MR_DISPLAY_HAM8)) ||
-        (chipset_has_aga() &&
-         !add_mode_node(&modes, "HAM8 (Dither)", MR_DISPLAY_HAM8_DITHER)) ||
-        /* Video in a Workbench window with shared pens, full or half size.
-         * Only offered on a native-chipset (AGA/ECS/OCS) Workbench: an RTG
-         * one has RTG (WritePixel) and RTG (Half). */
-        (!have_rtg && !add_mode_node(&modes,
-             chipset_has_aga() ? "AGA (Window)" :
-             chipset_has_ecs_denise() ? "ECS (Window)" : "OCS (Window)",
-             MR_DISPLAY_AGA_WINDOW)) ||
-        (!have_rtg && !add_mode_node(&modes,
-             chipset_has_aga() ? "AGA (Window Half)" :
-             chipset_has_ecs_denise() ? "ECS (Window Half)" :
-                                        "OCS (Window Half)",
-             MR_DISPLAY_AGA_WINDOW_HALF)) ||
-        (have_rtg && !add_mode_node(&modes, "RTG (WritePixel)", MR_DISPLAY_CGX)) ||
-        /* Half-resolution WritePixel for boards with no working P96
-         * overlay (PiStorm): a quarter of the YUV->RGB and blit work. */
-        (have_rtg && !add_mode_node(&modes, "RTG (Half)", MR_DISPLAY_RTG_HALF)) ||
-        (have_rtg && !add_mode_node(&modes, "P96 (Windowed)", MR_DISPLAY_P96)) ||
-        (have_rtg && !add_mode_node(&modes, "P96 (Fullscreen)",
-                                    MR_DISPLAY_P96_FULLSCREEN)))
-        goto cleanup;
-    /* P96 (with its own hardware-overlay-first backend chain - see
-     * amiga/display_p96pip.c) is the fastest choice when available, ahead
-     * of plain WritePixel and AGA/HAM - default to it rather than
-     * WritePixel. */
-    if (have_rtg) default_mode = (int)mode_count - 1;
-    /* Dedicated PiStorm/VideoCore output. All original display entries
-     * continue to use mrplay unchanged. */
+    (void)have_rtg;
+    /* MintVID-pi P96W60: H.264 through the Pi only - HDMI cinema and HDMI
+     * window (W:50).  The Amiga RGB entry (h264rgb) was taken out again:
+     * whether the native output has a signal depends on the OS setup
+     * (CaffeineOS skips the native monitor drivers), so it is not offered. */
     if (!add_mode_node(&modes, "PiStorm / VC Hard Fullscreen",
                        MR_DISPLAY_PISTORM_HARD_FULLSCREEN) ||
         !add_mode_node(&modes, "PiStorm / VC Hard Fenster",
-                       MR_DISPLAY_PISTORM_HARD_WINDOW))
+                       MR_DISPLAY_PISTORM_HARD_WINDOW) ||
+        !add_mode_node(&modes, "PiStorm / VC Hard Fullscreen (Paula)",
+                       MR_DISPLAY_PISTORM_PAULA))
         goto cleanup;
-    /* Audio only, listed last so it never becomes the hardware default.
-     * It sits here rather than under Video so it is easy to find; Video,
-     * Skip after and VQ grey out under it (update_skip_after()). */
-    if (!add_mode_node(&modes, "No Video (audio only)", MR_DISPLAY_NONE))
-        goto cleanup;
+    default_mode = 0;
     if (!add_c2p_node(&c2p_modes, "Standard", MR_C2P_STANDARD) ||
         (mr_akiko_available() &&
          !add_c2p_node(&c2p_modes, "CD32", MR_C2P_AKIKO)) ||
@@ -1796,6 +2317,7 @@ int main(void)
                                CHOOSER_Labels, (ULONG)&modes,
                                CHOOSER_Selected, default_mode,
                                TAG_DONE);
+    g_mode = mode;
     c2p = (Object *)NewObject(CHOOSER_GetClass(), NULL,
                               GA_ID, G_C2P,
                               GA_RelVerify, TRUE,
@@ -1862,11 +2384,19 @@ int main(void)
     skip_after_label = (Object *)NewObject(LABEL_GetClass(), NULL,
                                            LABEL_Text, (ULONG)"Skip after",
                                            TAG_DONE);
-    info = (Object *)NewObject(STRING_GetClass(), NULL,
+    g_info_film = (Object *)NewObject(STRING_GetClass(), NULL,
                                GA_ReadOnly, TRUE,
                                STRINGA_TextVal, (ULONG)"No file selected",
                                STRINGA_MaxChars, 640,
                                TAG_DONE);
+    info = (Object *)NewObject(STRING_GetClass(), NULL,
+                               GA_ReadOnly, TRUE,
+                               STRINGA_TextVal, (ULONG)"",
+                               STRINGA_MaxChars, 640,
+                               TAG_DONE);
+    g_info_status = info;
+    if (!g_info_film)
+        goto cleanup;
     file_label = (Object *)NewObject(LABEL_GetClass(), NULL,
                                      LABEL_Text, (ULONG)"File",
                                      TAG_DONE);
@@ -1916,44 +2446,14 @@ int main(void)
                                        LAYOUT_SpaceInner, TRUE,
                                        LAYOUT_AddChild, (ULONG)mode,
                                        CHILD_Label, (ULONG)display_label,
-                                       LAYOUT_AddChild, (ULONG)c2p,
-                                       CHILD_Label, (ULONG)c2p_label,
-                                       LAYOUT_AddChild, (ULONG)h264,
-                                       CHILD_Label, (ULONG)h264_label,
-                                       LAYOUT_AddChild, (ULONG)lace,
-                                       CHILD_WeightedWidth, 0,
-                                       LAYOUT_AddChild, (ULONG)scale,
-                                       CHILD_Label, (ULONG)scale_label,
                                        TAG_DONE);
     if (!controls_top)
-        goto cleanup;
-
-    controls_bottom = (Object *)NewObject(LAYOUT_GetClass(), NULL,
-                                          LAYOUT_Orientation,
-                                          LAYOUT_ORIENT_HORIZ,
-                                          LAYOUT_SpaceInner, TRUE,
-                                          LAYOUT_AddChild, (ULONG)audio_rate,
-                                          CHILD_Label, (ULONG)audio_rate_label,
-                                          LAYOUT_AddChild, (ULONG)fast_buffer,
-                                          CHILD_Label, (ULONG)fast_buffer_label,
-                                          LAYOUT_AddChild, (ULONG)no_audio,
-                                          CHILD_WeightedWidth, 0,
-                                          LAYOUT_AddChild, (ULONG)mono_audio,
-                                          CHILD_WeightedWidth, 0,
-                                          LAYOUT_AddChild, (ULONG)video_mode,
-                                          CHILD_Label, (ULONG)video_mode_label,
-                                          LAYOUT_AddChild, (ULONG)g_skip_after,
-                                          CHILD_Label, (ULONG)skip_after_label,
-                                          TAG_DONE);
-    if (!controls_bottom)
         goto cleanup;
 
     controls = (Object *)NewObject(LAYOUT_GetClass(), NULL,
                                     LAYOUT_Orientation, LAYOUT_ORIENT_VERT,
                                     LAYOUT_SpaceInner, TRUE,
                                     LAYOUT_AddChild, (ULONG)controls_top,
-                                    CHILD_WeightedHeight, 0,
-                                    LAYOUT_AddChild, (ULONG)controls_bottom,
                                     CHILD_WeightedHeight, 0,
                                     TAG_DONE);
     if (!controls)
@@ -1964,10 +2464,12 @@ int main(void)
                                       GA_Text, (ULONG)">",
                                       GA_RelVerify, TRUE,
                                       TAG_DONE);
+    /* P96W58: G_PAUSE is the Fullscreen button now; Play/Pause is one. */
     pause_button = (Object *)NewObject(BUTTON_GetClass(), NULL,
                                        GA_ID, G_PAUSE,
-                                       GA_Text, (ULONG)"||",
+                                       GA_Text, (ULONG)"Full",
                                        GA_RelVerify, TRUE,
+                                       GA_Disabled, TRUE,
                                        TAG_DONE);
     stop_button = (Object *)NewObject(BUTTON_GetClass(), NULL,
                                       GA_ID, G_STOP,
@@ -1978,32 +2480,43 @@ int main(void)
                                     GA_ID, G_FF,
                                     GA_Text, (ULONG)">>",
                                     GA_RelVerify, TRUE,
+                                    GA_Disabled, TRUE,
                                     TAG_DONE);
-    iptv_button = (Object *)NewObject(BUTTON_GetClass(), NULL,
-                                      GA_ID, G_IPTV,
-                                      GA_Text, (ULONG)"IPTV...",
-                                      GA_RelVerify, TRUE,
-                                      TAG_DONE);
-    youtube_button = (Object *)NewObject(BUTTON_GetClass(), NULL,
-                                         GA_ID, G_YOUTUBE,
-                                         GA_Text, (ULONG)"YouTube...",
-                                         GA_RelVerify, TRUE,
-                                         TAG_DONE);
-    volume_slider = (Object *)NewObject(SLIDER_GetClass(), NULL,
-                                         GA_ID, G_VOLUME,
-                                         GA_RelVerify, TRUE,
-                                         SLIDER_Min, 0,
-                                         SLIDER_Max, 64,
-                                         SLIDER_Level, 64,
-                                         SLIDER_Orientation, SLIDER_HORIZONTAL,
-                                         TAG_DONE);
+    /* MintVID-pi P96W59: IPTV/YouTube (classic mrplay path) are left out
+     * for now - mrberry cannot open network streams yet. */
+    iptv_button = NULL;
+    youtube_button = NULL;
+    /* P96W57: the wide slider is the start-time timeline now; volume
+     * (only used by the mrplay path - mrberry plays over HDMI, the TV
+     * remote sets the volume) is a narrow vertical slider. */
+    g_time_slider = (Object *)NewObject(SLIDER_GetClass(), NULL,
+                                        GA_ID, G_TIME,
+                                        GA_RelVerify, TRUE,
+                                        GA_Disabled, TRUE,
+                                        SLIDER_Min, 0,
+                                        SLIDER_Max, 1,
+                                        SLIDER_Level, 0,
+                                        SLIDER_Orientation, SLIDER_HORIZONTAL,
+                                        TAG_DONE);
+    strcpy(g_time_text, "T -:--:--");
+    g_time_label = (Object *)NewObject(BUTTON_GetClass(), NULL,
+                                       GA_ID, G_TIME_LABEL,
+                                       GA_Text, (ULONG)g_time_text,
+                                       GA_ReadOnly, TRUE,
+                                       TAG_DONE);
+    /* P96W59: no volume slider - mrberry plays over HDMI (TV remote),
+     * h264rgb has no sound. */
+    volume_slider = NULL;
     playlist_button = (Object *)NewObject(BUTTON_GetClass(), NULL,
                                           GA_ID, G_PLAYLIST,
                                           GA_Text, (ULONG)"Playlist",
                                           GA_RelVerify, TRUE, TAG_DONE);
+    g_play_button = play_button;
+    g_full_button = pause_button;
+    g_ff_button = ff_button;
+    g_ff_enabled = 0;
     if (!play_button || !pause_button || !stop_button || !ff_button ||
-        !iptv_button || !youtube_button || !volume_slider ||
-        !playlist_button)
+        !g_time_slider || !g_time_label || !playlist_button)
         goto cleanup;
 
     /* VLC-style lower strip: fixed media buttons on the left, a real
@@ -2018,16 +2531,19 @@ int main(void)
                                      CHILD_MinWidth, 30, CHILD_MaxWidth, 30,
                                      LAYOUT_AddChild, (ULONG)pause_button,
                                      CHILD_WeightedWidth, 0,
-                                     CHILD_MinWidth, 30, CHILD_MaxWidth, 30,
+                                     CHILD_MinWidth, 44, CHILD_MaxWidth, 44,
                                      LAYOUT_AddChild, (ULONG)stop_button,
                                      CHILD_WeightedWidth, 0,
                                      CHILD_MinWidth, 30, CHILD_MaxWidth, 30,
                                      LAYOUT_AddChild, (ULONG)ff_button,
                                      CHILD_WeightedWidth, 0,
                                      CHILD_MinWidth, 34, CHILD_MaxWidth, 34,
-                                     LAYOUT_AddChild, (ULONG)volume_slider,
+                                     LAYOUT_AddChild, (ULONG)g_time_slider,
                                      CHILD_WeightedWidth, 1,
                                      CHILD_MinWidth, 110,
+                                     LAYOUT_AddChild, (ULONG)g_time_label,
+                                     CHILD_WeightedWidth, 0,
+                                     CHILD_MinWidth, 92, CHILD_MaxWidth, 92,
                                      TAG_DONE);
     if (!transport)
         goto cleanup;
@@ -2035,12 +2551,6 @@ int main(void)
     services = (Object *)NewObject(LAYOUT_GetClass(), NULL,
                                     LAYOUT_Orientation, LAYOUT_ORIENT_HORIZ,
                                     LAYOUT_SpaceInner, TRUE,
-                                    LAYOUT_AddChild, (ULONG)iptv_button,
-                                    CHILD_WeightedWidth, 0,
-                                    CHILD_MinWidth, 72, CHILD_MaxWidth, 72,
-                                    LAYOUT_AddChild, (ULONG)youtube_button,
-                                    CHILD_WeightedWidth, 0,
-                                    CHILD_MinWidth, 82, CHILD_MaxWidth, 82,
                                     LAYOUT_AddChild, (ULONG)playlist_button,
                                     CHILD_WeightedWidth, 0,
                                     CHILD_MinWidth, 76, CHILD_MaxWidth, 76,
@@ -2065,9 +2575,12 @@ int main(void)
                                   LAYOUT_SpaceInner, TRUE,
                                   LAYOUT_AddChild, (ULONG)file,
                                   CHILD_Label, (ULONG)file_label,
+                                  CHILD_WeightedHeight, 0,
                                   LAYOUT_AddChild, (ULONG)controls,
                                   CHILD_WeightedHeight, 0,
                                   LAYOUT_AddChild, (ULONG)buttons,
+                                  CHILD_WeightedHeight, 0,
+                                  LAYOUT_AddChild, (ULONG)g_info_film,
                                   CHILD_WeightedHeight, 0,
                                   LAYOUT_AddChild, (ULONG)info,
                                   CHILD_WeightedHeight, 0,
@@ -2077,7 +2590,7 @@ int main(void)
 
     window_object = (Object *)NewObject(WINDOW_GetClass(), NULL,
                                          WA_Title,
-                                         (ULONG)"MintVID Control",
+                                         (ULONG)"MintVID-pi Control",
                                          WA_Activate, TRUE,
                                          WA_DepthGadget, TRUE,
                                          WA_DragBar, TRUE,
@@ -2090,6 +2603,7 @@ int main(void)
                                          IDCMP_IDCMPUPDATE |
                                          IDCMP_REFRESHWINDOW,
                                          WINDOW_Position, WPOS_CENTERSCREEN,
+                                         WINDOW_LockHeight, TRUE,   /* P96W72 */
                                          WINDOW_ParentGroup, (ULONG)layout,
                                          TAG_DONE);
     if (!window_object)
@@ -2098,6 +2612,7 @@ int main(void)
     window = (struct Window *)RA_OpenWindow(window_object);
     if (!window)
         goto cleanup;
+    mr_gui_menu_with_paula = 1;        /* P96W73 */
     mr_gui_menu_open(&app_menu, window);
 
     update_mode_controls(mode, c2p, lace, scale, window, TRUE);
@@ -2122,6 +2637,19 @@ int main(void)
             status_timer_running = 0;
             poll_player_status(info, window);
             poll_iptv_launch(info, window, iptv_button);
+            /* P96W58: when the player process is gone, a stop has written
+             * a new <film>.t - read it again so the timeline (and Play)
+             * continue from there.  (W57 waited for the ENDED status,
+             * which did not move the slider on hardware.) */
+            {
+                int running = find_player() != NULL;
+                if (g_player_was_running && !running && g_film_path[0])
+                    mrg_film_info_apply(g_film_path, info, window, 0);
+                g_player_was_running = running;
+                if (running) mrg_pos_poll(window);
+                else { g_pos_hold = 0; g_pos_last = (ULONG)-1; }
+                mrg_buttons_update(window);
+            }
             status_timer_start();
         }
 
@@ -2139,6 +2667,8 @@ int main(void)
                     mr_gui_open_guide(&app_menu, window);
                 else if (action == MR_GUI_MENU_QUIT)
                     goto done;
+                else if (action == MR_GUI_MENU_PAULA)
+                    mrg_sound_line(info, window);   /* P96W73: new base */
                 break;
             }
 
@@ -2150,6 +2680,8 @@ int main(void)
                     break;
 
                 case G_MODE:
+                    mrg_time_enable(window);
+                    mrg_sound_line(info, window);      /* P96W72: HDMI/Paula */
                     update_mode_controls(mode, c2p, lace, scale, window, TRUE);
                     update_skip_after(mode, h264, video_mode, window);
                     publish_play_options(master_options, mode, c2p, h264,
@@ -2194,25 +2726,53 @@ int main(void)
                     break;
 
                 case G_PLAY:
-                    start_player(file, mode, c2p, h264, lace, scale,
-                                 audio_rate, fast_buffer, no_audio, mono_audio,
-                                 video_mode, info, window);
+                    /* P96W58: one button - start, or pause/continue */
+                    if (find_player() &&
+                        (g_launch_display == MR_DISPLAY_PISTORM_RGB ||
+                         g_launch_display == MR_DISPLAY_PISTORM_PAULA)) {
+                        set_info(info, window, g_launch_display == MR_DISPLAY_PISTORM_PAULA ?
+                                 "Pause is not available with Paula sound yet." :
+                                 "Amiga RGB output has no pause.");
+                    } else if (find_player()) {
+                        signal_player(SIGBREAKF_CTRL_D);
+                        g_player_paused = !g_player_paused;
+                    } else {
+                        start_player(file, mode, c2p, h264, lace, scale,
+                                     audio_rate, fast_buffer, no_audio,
+                                     mono_audio, video_mode, info, window);
+                    }
+                    mrg_buttons_update(window);
                     break;
 
-                case G_PAUSE:
-                    signal_player(SIGBREAKF_CTRL_D);
+                case G_PAUSE:      /* Fullscreen */
+                    mrg_switch_fullscreen(file, mode, c2p, h264, lace, scale,
+                                          audio_rate, fast_buffer, no_audio,
+                                          mono_audio, video_mode, info, window);
                     break;
 
                 case G_STOP:
                     stop_player_and_wait();
+                    /* P96W58: mrberry has written <film>.t - read it now */
+                    if (!find_player() && g_player_was_running && g_film_path[0]) {
+                        g_player_was_running = 0;
+                        mrg_film_info_apply(g_film_path, info, window, 0);
+                    }
+                    mrg_buttons_update(window);
                     break;
 
-                case G_FF:
-                    signal_player(SIGBREAKF_CTRL_E);
+                case G_FF:         /* P96W61: jump to timeline time */
+                    mrg_jump(file, mode, c2p, h264, lace, scale,
+                             audio_rate, fast_buffer, no_audio,
+                             mono_audio, video_mode, info, window);
                     break;
 
                 case G_VOLUME:
                     apply_gui_volume(volume_slider);
+                    break;
+
+                case G_TIME:
+                    mrg_time_label_update(window);
+                    if (find_player()) g_pos_hold = MRG_POS_HOLD_TICKS;
                     break;
 
                 case G_PLAYLIST:
@@ -2280,28 +2840,7 @@ cleanup:
                 DisposeObject(controls_top);
             } else {
                 if (mode) DisposeObject(mode);
-                if (c2p) DisposeObject(c2p);
-                if (h264) DisposeObject(h264);
-                if (lace) DisposeObject(lace);
-                if (scale) DisposeObject(scale);
                 if (display_label) DisposeObject(display_label);
-                if (c2p_label) DisposeObject(c2p_label);
-                if (h264_label) DisposeObject(h264_label);
-                if (scale_label) DisposeObject(scale_label);
-            }
-            if (controls_bottom) {
-                DisposeObject(controls_bottom);
-            } else {
-                if (audio_rate) DisposeObject(audio_rate);
-                if (fast_buffer) DisposeObject(fast_buffer);
-                if (no_audio) DisposeObject(no_audio);
-                if (mono_audio) DisposeObject(mono_audio);
-                if (video_mode) DisposeObject(video_mode);
-                if (audio_rate_label) DisposeObject(audio_rate_label);
-                if (fast_buffer_label) DisposeObject(fast_buffer_label);
-                if (video_mode_label) DisposeObject(video_mode_label);
-                if (g_skip_after) DisposeObject(g_skip_after);
-                if (skip_after_label) DisposeObject(skip_after_label);
             }
         }
 
@@ -2316,6 +2855,8 @@ cleanup:
                 if (stop_button) DisposeObject(stop_button);
                 if (ff_button) DisposeObject(ff_button);
                 if (volume_slider) DisposeObject(volume_slider);
+                if (g_time_slider) DisposeObject(g_time_slider);
+                if (g_time_label) DisposeObject(g_time_label);
             }
             if (services) {
                 DisposeObject(services);
@@ -2330,9 +2871,31 @@ cleanup:
             DisposeObject(file);
         if (info)
             DisposeObject(info);
+        if (g_info_film)
+            DisposeObject(g_info_film);
         if (file_label)
             DisposeObject(file_label);
     }
+
+    /* P96W59: the classic options were never put into the window layout,
+     * so they are always disposed here on their own. */
+    if (c2p) DisposeObject(c2p);
+    if (h264) DisposeObject(h264);
+    if (lace) DisposeObject(lace);
+    if (scale) DisposeObject(scale);
+    if (c2p_label) DisposeObject(c2p_label);
+    if (h264_label) DisposeObject(h264_label);
+    if (scale_label) DisposeObject(scale_label);
+    if (audio_rate) DisposeObject(audio_rate);
+    if (fast_buffer) DisposeObject(fast_buffer);
+    if (no_audio) DisposeObject(no_audio);
+    if (mono_audio) DisposeObject(mono_audio);
+    if (video_mode) DisposeObject(video_mode);
+    if (audio_rate_label) DisposeObject(audio_rate_label);
+    if (fast_buffer_label) DisposeObject(fast_buffer_label);
+    if (video_mode_label) DisposeObject(video_mode_label);
+    if (g_skip_after) DisposeObject(g_skip_after);
+    if (skip_after_label) DisposeObject(skip_after_label);
 
     free_chooser_nodes(&modes);
     free_chooser_nodes(&c2p_modes);
@@ -2343,6 +2906,14 @@ cleanup:
     free_chooser_nodes(&video_modes);
     free_chooser_nodes(&skip_after_modes);
     g_skip_after = NULL;
+    g_time_slider = NULL;
+    g_time_label = NULL;
+    g_play_button = NULL;
+    g_info_film = NULL;
+    g_info_status = NULL;
+    g_full_button = NULL;
+    g_ff_button = NULL;
+    g_mode = NULL;
     close_reaction_classes();
     return status;
 }

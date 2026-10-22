@@ -243,12 +243,40 @@ static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
     }
 }
 
+/* P96W53: film length.  Segment Duration (0x4489) is a float in timecode
+ * ticks; decoded to an integer like sample_rate_be (no soft-float). */
+uint64_t mr_mkv_duration_us;
+static uint64_t mkv_duration_ticks;
+
+static uint64_t float_be_u64(const uint8_t *p, size_t n)
+{
+    uint64_t bits, mantissa;
+    unsigned mantissa_bits, exponent_bits, exponent, exponent_max;
+    int bias, shift;
+    if (n == 4) { mantissa_bits = 23; exponent_bits = 8; bias = 127; }
+    else if (n == 8) { mantissa_bits = 52; exponent_bits = 11; bias = 1023; }
+    else return 0;
+    bits = uint_be(p, n);
+    if (bits & (UINT64_C(1) << (mantissa_bits + exponent_bits))) return 0;
+    exponent_max = (1U << exponent_bits) - 1U;
+    exponent = (unsigned)((bits >> mantissa_bits) & exponent_max);
+    if (!exponent || exponent == exponent_max) return 0;
+    mantissa = (bits & ((UINT64_C(1) << mantissa_bits) - 1)) |
+               (UINT64_C(1) << mantissa_bits);
+    shift = (int)exponent - bias - (int)mantissa_bits;
+    if (shift >= 0) return shift >= 11 ? 0 : mantissa << shift;
+    if ((unsigned)-shift >= 64) return 0;
+    return mantissa >> (unsigned)-shift;
+}
+
 static void parse_info(mr_mkv *m, const uint8_t *p, size_t len)
 {
     size_t pos = 0; ebml_elem e;
     while (mem_elem(p, len, pos, &e)) {
         if (e.id == 0x2ad7b1 && e.size <= 8)
             m->timecode_scale = uint_be(p + e.payload, (size_t)e.size);
+        else if (e.id == 0x4489)
+            mkv_duration_ticks = float_be_u64(p + e.payload, (size_t)e.size);
         pos = (size_t)e.end;
     }
 }
@@ -272,6 +300,7 @@ static mr_status open_common(mr_mkv *m)
         return MR_EFORMAT;
     m->segment_start = segment.payload; m->segment_end = segment.end;
     m->timecode_scale = 1000000;
+    mkv_duration_ticks = 0; mr_mkv_duration_us = 0;
     for (pos = segment.payload; pos < segment.end;) {
         if (!elem_at(m, pos, segment.end, &e)) return MR_EFORMAT;
         if (e.id == 0x1f43b675) { m->first_cluster = pos; break; }
@@ -285,6 +314,7 @@ static mr_status open_common(mr_mkv *m)
         pos = e.end;
     }
     if (!m->first_cluster || !m->video.valid) return MR_EUNSUPPORTED;
+    mr_mkv_duration_us = mkv_duration_ticks * m->timecode_scale / 1000U;
     mr_mkv_rewind(m);
     return MR_OK;
 }
@@ -453,6 +483,312 @@ mr_status mr_mkv_next_packet(mr_mkv *m, mr_packet *pkt)
         }
     }
     return MR_EAGAIN;
+}
+
+/* ---- P96W50: T: start time (seek) ---------------------------------------
+ * Like VPr8's R5 compressed T: seek, but on the host demux: no frame is
+ * decoded during the search, only element headers and NAL headers are read.
+ *   1. walk the cluster headers (offset + timestamp; cluster payloads are
+ *      skipped by their size),
+ *   2. in the last cluster that starts at or before the target, and if
+ *      needed in the clusters before it, look for the last video block that
+ *      is a real H.264 IDR (nal_unit_type 5) with PTS <= target,
+ *   3. none within ~2 minutes before the target: take the first IDR after it.
+ * The cursor is left on that block, so the next packet is the IDR itself. */
+#define MKV_SEEK_BACK_US  (120ULL * 1000000ULL)
+
+static int block_head(mr_mkv *m, const ebml_elem *e, uint64_t *track,
+                      int16_t *rel, uint8_t *flags, unsigned *hdr)
+{
+    uint8_t b[12];
+    unsigned nt;
+    size_t n = e->size < sizeof b ? (size_t)e->size : sizeof b;
+    if (n < 4 || !read_at(m, e->payload, b, n) ||
+        !vint(b, n, track, &nt, 0, NULL) || nt + 3 > n) return 0;
+    *rel = (int16_t)(((unsigned)b[nt] << 8) | b[nt + 1]);
+    *flags = b[nt + 2];
+    *hdr = nt + 3;
+    return 1;
+}
+
+/* AVC length-prefixed access unit at [off,end): 1 = contains an IDR slice. */
+static int block_is_idr(mr_mkv *m, uint64_t off, uint64_t end, unsigned ls)
+{
+    uint8_t b[5];
+    unsigned i, guard = 0;
+    while (off + ls < end && guard++ < 64) {
+        uint32_t len = 0;
+        unsigned t;
+        if (!read_at(m, off, b, ls + 1)) return 0;
+        for (i = 0; i < ls; i++) len = (len << 8) | b[i];
+        if (!len || len > end - off - ls) return 0;
+        t = b[ls] & 31u;
+        if (t == 5) return 1;
+        if (t >= 1 && t <= 4) return 0;     /* first slice is not IDR */
+        off += ls + len;
+    }
+    return 0;
+}
+
+typedef struct {
+    int found;
+    uint64_t elem, cluster, cluster_end, cluster_tc, pts_us;
+} mkv_seek_hit;
+
+/* Scan one cluster for IDR video blocks.  mode 0: keep the one with the
+ * largest PTS <= target; mode 1: stop at the
+ * first one.  tc_us and end return the cluster start time and end. */
+static int scan_cluster(mr_mkv *m, uint64_t coff, uint64_t target, int mode,
+                        unsigned ls, mkv_seek_hit *hit,
+                        uint64_t *tc_us, uint64_t *end)
+{
+    ebml_elem c, e;
+    uint64_t pos, tc = 0;
+    if (!elem_at(m, coff, m->segment_end, &c) || c.id != 0x1f43b675 ||
+        c.unknown) return 0;
+    if (end) *end = c.end;
+    if (tc_us) *tc_us = 0;
+    for (pos = c.payload; pos < c.end; pos = e.end) {
+        ebml_elem blk;
+        uint64_t track, pts;
+        int16_t rel;
+        uint8_t flags;
+        unsigned hdr;
+        int64_t ticks;
+        if (!elem_at(m, pos, c.end, &e) || e.unknown || e.end <= pos) return 0;
+        if (e.id == 0xe7 && e.size <= 8) {
+            uint8_t b[8];
+            if (!read_at(m, e.payload, b, (size_t)e.size)) return 0;
+            tc = uint_be(b, (size_t)e.size);
+            if (tc_us) *tc_us = tc * m->timecode_scale / 1000U;
+            if (mode == 0 && tc * m->timecode_scale / 1000U > target) return 1;
+            continue;
+        }
+        if (e.id == 0xa3) {
+            blk = e;
+        } else if (e.id == 0xa0) {
+            uint64_t child = e.payload;
+            int got = 0;
+            while (child < e.end) {
+                if (!elem_at(m, child, e.end, &blk) || blk.unknown ||
+                    blk.end <= child) return 0;
+                if (blk.id == 0xa1) { got = 1; break; }
+                child = blk.end;
+            }
+            if (!got) continue;
+        } else continue;
+        if (!block_head(m, &blk, &track, &rel, &flags, &hdr)) return 0;
+        if (track != m->video_track) continue;
+        ticks = (int64_t)tc + rel;
+        if (ticks < 0) ticks = 0;
+        pts = (uint64_t)ticks * m->timecode_scale / 1000U;
+        /* blocks are in decode order: once one video block is past the
+         * target, every later IDR is too (it follows all earlier frames) */
+        if (mode == 0 && pts > target) return 1;
+        if (e.id == 0xa3 && !(flags & 0x80)) continue;   /* not a keyframe */
+        if ((flags >> 1) & 3) continue;                    /* laced video */
+        if (mode == 0 && hit->found && pts <= hit->pts_us) continue;
+        if (!block_is_idr(m, blk.payload + hdr, blk.end, ls)) continue;
+        hit->found = 1; hit->elem = pos; hit->cluster = coff;
+        hit->cluster_end = c.end; hit->cluster_tc = tc; hit->pts_us = pts;
+        if (mode == 1) return 1;
+    }
+    return 1;
+}
+
+typedef struct { uint64_t *off, *us; size_t n, cap; } mkv_index;
+
+/* 1 when the last mr_mkv_seek() could use the file's Cues index. */
+int mr_mkv_seek_used_cues;
+
+static int index_add(mkv_index *x, uint64_t off, uint64_t us)
+{
+    if (x->n == x->cap) {
+        size_t nc = x->cap ? x->cap * 2 : 256;
+        uint64_t *a = (uint64_t *)realloc(x->off, nc * sizeof *a), *b;
+        if (!a) return 0;
+        x->off = a;
+        b = (uint64_t *)realloc(x->us, nc * sizeof *b);
+        if (!b) return 0;
+        x->us = b; x->cap = nc;
+    }
+    x->off[x->n] = off; x->us[x->n] = us; x->n++;
+    return 1;
+}
+
+/* Cues (the file's own key frame index): their offset from a SeekHead, or a
+ * Cues element in front of the first cluster.  0 = none found. */
+static uint64_t find_cues(mr_mkv *m)
+{
+    uint64_t pos;
+    ebml_elem e;
+    for (pos = m->segment_start; pos < m->segment_end; pos = e.end) {
+        if (!elem_at(m, pos, m->segment_end, &e) || e.unknown || e.end <= pos) return 0;
+        if (e.id == 0x1c53bb6b) return pos;
+        if (e.id == 0x1f43b675) return 0;
+        if (e.id == 0x114d9b74 && e.size <= 65536 && load(m, e.payload, (size_t)e.size)) {
+            size_t sp = 0, size = (size_t)e.size;
+            ebml_elem s;
+            while (mem_elem(m->scratch, size, sp, &s)) {
+                if (s.id == 0x4dbb) {
+                    size_t cp = (size_t)s.payload;
+                    uint64_t id = 0, at = 0;
+                    ebml_elem f;
+                    while (cp < s.end && mem_elem(m->scratch, (size_t)s.end, cp, &f)) {
+                        if (f.id == 0x53ab && f.size <= 8)
+                            id = uint_be(m->scratch + f.payload, (size_t)f.size);
+                        else if (f.id == 0x53ac && f.size <= 8)
+                            at = uint_be(m->scratch + f.payload, (size_t)f.size);
+                        cp = (size_t)f.end;
+                    }
+                    if (id == 0x1c53bb6b) {
+                        ebml_elem cues;
+                        uint64_t off = m->segment_start + at;
+                        if (elem_at(m, off, m->segment_end, &cues) &&
+                            cues.id == 0x1c53bb6b) return off;
+                    }
+                }
+                sp = (size_t)s.end;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Video cue points (time, cluster offset) in file order. */
+static int load_cues(mr_mkv *m, uint64_t off, mkv_index *x)
+{
+    ebml_elem cues, cp, f, t;
+    size_t pos, size;
+    if (!elem_at(m, off, m->segment_end, &cues) || cues.unknown ||
+        cues.size > MKV_META_MAX || !load(m, cues.payload, (size_t)cues.size))
+        return 0;
+    size = (size_t)cues.size;
+    for (pos = 0; mem_elem(m->scratch, size, pos, &cp); pos = (size_t)cp.end) {
+        size_t q;
+        uint64_t time = 0, cluster = 0, track = 0;
+        int have_time = 0, have_pos = 0;
+        if (cp.id != 0xbb) continue;
+        for (q = (size_t)cp.payload; q < cp.end &&
+             mem_elem(m->scratch, (size_t)cp.end, q, &f); q = (size_t)f.end) {
+            if (f.id == 0xb3 && f.size <= 8) {
+                time = uint_be(m->scratch + f.payload, (size_t)f.size);
+                have_time = 1;
+            } else if (f.id == 0xb7) {
+                size_t r;
+                uint64_t tr = 0, cl = 0;
+                int hc = 0;
+                for (r = (size_t)f.payload; r < f.end &&
+                     mem_elem(m->scratch, (size_t)f.end, r, &t); r = (size_t)t.end) {
+                    if (t.id == 0xf7 && t.size <= 8)
+                        tr = uint_be(m->scratch + t.payload, (size_t)t.size);
+                    else if (t.id == 0xf1 && t.size <= 8) {
+                        cl = uint_be(m->scratch + t.payload, (size_t)t.size);
+                        hc = 1;
+                    }
+                }
+                if (hc && (tr == m->video_track || !have_pos)) {
+                    track = tr; cluster = cl; have_pos = 1;
+                }
+            }
+        }
+        if (!have_time || !have_pos || track != m->video_track) continue;
+        if (x->n && m->segment_start + cluster == x->off[x->n - 1]) continue;
+        if (!index_add(x, m->segment_start + cluster, time * m->timecode_scale / 1000U))
+            return 0;
+    }
+    return x->n != 0;
+}
+
+/* No Cues: walk the cluster headers up to the first one after the target
+ * (one small read per cluster). */
+static int walk_clusters(mr_mkv *m, uint64_t target_us, mkv_index *x)
+{
+    uint64_t pos;
+    ebml_elem e;
+    for (pos = m->first_cluster; pos < m->segment_end; pos = e.end) {
+        uint64_t tc = 0, child, us;
+        if (!elem_at(m, pos, m->segment_end, &e)) break;
+        if (e.id != 0x1f43b675) { if (e.unknown || e.end <= pos) break; continue; }
+        if (e.unknown) break;                      /* cannot skip it */
+        for (child = e.payload; child < e.end;) {
+            ebml_elem t;
+            if (!elem_at(m, child, e.end, &t) || t.unknown || t.end <= child) break;
+            if (t.id == 0xe7 && t.size <= 8) {
+                uint8_t b[8];
+                if (read_at(m, t.payload, b, (size_t)t.size))
+                    tc = uint_be(b, (size_t)t.size);
+                break;
+            }
+            if (t.id == 0xa3 || t.id == 0xa0) break;
+            child = t.end;
+        }
+        us = tc * m->timecode_scale / 1000U;
+        if (x->n && us > target_us) break;
+        if (!index_add(x, pos, us)) return 0;
+    }
+    return x->n != 0;
+}
+
+mr_status mr_mkv_seek(mr_mkv *m, uint64_t target_us, uint64_t *out_us)
+{
+    mkv_index x;
+    uint64_t pos, cues;
+    size_t k, j;
+    unsigned ls = 4;
+    mkv_seek_hit hit;
+    ebml_elem e;
+    mr_status st = MR_OK;
+
+    if (!m->video_track) return MR_EUNSUPPORTED;
+    if (m->video.config && m->video.config_len >= 5 && m->video.config[0] == 1)
+        ls = (m->video.config[4] & 3u) + 1u;
+    if (ls == 3) ls = 4;
+    memset(&hit, 0, sizeof hit);
+    memset(&x, 0, sizeof x);
+    mr_mkv_seek_used_cues = 0;
+
+    /* 1: start points - the Cues index, else the cluster headers */
+    cues = find_cues(m);
+    if (cues && load_cues(m, cues, &x)) mr_mkv_seek_used_cues = 1;
+    else {
+        x.n = 0;
+        if (!walk_clusters(m, target_us, &x)) { st = MR_EFORMAT; goto out; }
+    }
+    for (k = 0; k + 1 < x.n && x.us[k + 1] <= target_us; k++) {}
+
+    /* 2: last IDR at or before the target: from start point k forward over
+     * the clusters that begin before the target, then back over earlier
+     * start points (at most ~2 minutes) */
+    for (pos = x.off[k]; pos < m->segment_end;) {
+        uint64_t tc = 0, end = 0;
+        if (!elem_at(m, pos, m->segment_end, &e) || e.unknown || e.end <= pos) break;
+        if (e.id != 0x1f43b675) { pos = e.end; continue; }
+        if (!scan_cluster(m, pos, target_us, 0, ls, &hit, &tc, &end)) break;
+        if (tc > target_us) break;
+        pos = end;
+    }
+    for (j = k; !hit.found && j-- > 0;) {
+        if (target_us > x.us[j] && target_us - x.us[j] > MKV_SEEK_BACK_US) break;
+        if (!scan_cluster(m, x.off[j], target_us, 0, ls, &hit, NULL, NULL)) break;
+    }
+
+    /* 3: otherwise the first IDR after it */
+    for (pos = x.off[k]; !hit.found && pos < m->segment_end; pos = e.end) {
+        if (!elem_at(m, pos, m->segment_end, &e) || e.unknown || e.end <= pos) break;
+        if (e.id != 0x1f43b675) continue;
+        if (!scan_cluster(m, pos, target_us, 1, ls, &hit, NULL, NULL)) break;
+    }
+    if (!hit.found) { st = MR_EUNSUPPORTED; goto out; }
+
+    m->cursor = hit.elem;
+    m->cluster_end = hit.cluster_end;
+    m->cluster_timecode = hit.cluster_tc;
+    m->lace_count = m->lace_index = 0;
+    if (out_us) *out_us = hit.pts_us;
+out:
+    free(x.off); free(x.us);
+    return st;
 }
 
 void mr_mkv_rewind(mr_mkv *m)

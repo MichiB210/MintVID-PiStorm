@@ -20,8 +20,14 @@ enum {
     MR_GUI_MENU_GUIDE,
     /* The HTTPS TLS preference changed (amiga/mr_tls_pref.h). Already saved;
      * a program that makes its own HTTPS fetches re-applies it. */
-    MR_GUI_MENU_TLS
+    MR_GUI_MENU_TLS,
+    /* P96W73: Paula sound base changed (amiga/mr_paula_pref.h). Saved. */
+    MR_GUI_MENU_PAULA
 };
+
+/* P96W73: set to 1 before mr_gui_menu_open() to get the "Paula sound base"
+ * submenu (MintVID-pi only). */
+extern int mr_gui_menu_with_paula;
 
 int mr_gui_menu_open(mr_gui_menu *menu, struct Window *window);
 void mr_gui_menu_close(mr_gui_menu *menu, struct Window *window);

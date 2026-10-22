@@ -61,6 +61,9 @@ BVP_CTRL_FLUSH        equ 1
 BVP_CTRL_PAUSE        equ 2
 BVP_CTRL_RESUME       equ 3
 BVP_CTRL_RESET        equ 4
+BVP_CTRL_IDLE         equ 5      ; P96W45: keep the window alive (pause)
+BVP_CTRL_TIMESHIFT    equ 6      ; P96W47: D1 = us the caller paused
+BVP_CTRL_CLOCKSTART   equ 7      ; CLK81: D0 = Pi timer when the free clock started (0 = none)
 BVP_PKT_CONFIG        equ 1
 BVP_PKT_FRAME_START   equ 2
 BVP_PKT_FRAME_END     equ 4
@@ -203,6 +206,13 @@ BVP_OS_Open:
         clr.l   bvp_backend_ready
         clr.l   bvp_pending_ptr
         clr.l   bvp_pending_len
+        clr.l   p96w_async_on
+        clr.l   p96w_async_pending
+        clr.l   p96w_coll_bytes
+        clr.l   p96w_coll_samples
+        clr.l   p96w_coll_force
+        clr.l   p96w12_empty
+        clr.l   p96w20_fast
         clr.l   n66_video_pending
         clr.l   n66_video_pending_len
         clr.l   n66_video_pending_flags
@@ -224,6 +234,10 @@ BVP_OS_Open:
         clr.l   n70_late_due_count
         clr.l   n70_early_lead_max_us
         clr.l   n73_scheduler_graph_ready
+        clr.l   n81_tried                 ; CLK81: per stream
+        clr.l   n81_active
+        clr.l   n81_active_sys
+        clr.l   n81_free_mode
         clr.l   n73_clock_armed
         clr.l   n73_first_pcm_published
         clr.l   n73_prime_flushes
@@ -315,6 +329,18 @@ BVP_SV_StateOK:
         bra.w   BVP_SV_Done
 
 BVP_SV_Data:
+        tst.l   bvp_p96_mode
+        beq.s   p96w20_sv_nofast
+        move.l  #1,p96w20_fast
+        jsr     p96w_clk_maybe
+        jsr     p96w38_poll_keys          ; P96W38: Esc/0/close in the video window
+        jsr     p96w_present
+p96w20_sv_nofast:
+        ; P96W4: collect a finished CPU1 AAC batch without waiting.
+        tst.l   p96w_async_on
+        beq.s   p96w_sv_no_poll
+        jsr     p96w_async_poll_nb
+p96w_sv_no_poll:
         tst.l   n79_first_video_trace_state
         bne.s   n79_sv_seen
         move.l  #1,n79_first_video_trace_state
@@ -493,6 +519,11 @@ BVP_CloseStream:
         ; until the official EOS marker arrives. We only require the transport
         ; itself to be idle, then publish EOS and let the common dispatcher reap
         ; both normal returns and the EOS return during bvp_wait_eos.
+        tst.l   p96w_wait_timeouts        ; P96W40: VideoCore dead -> no EOS
+        beq.s   BVP_CS_NoDeadVC
+        moveq   #BVPERR_TIMEOUT,d7
+        bra.w   BVP_CS_ForceCleanup
+BVP_CS_NoDeadVC:
         tst.l   input_bulk_pending
         beq.s   BVP_CS_TransportIdle
         bsr     bvp_wait_video_bulk_done
@@ -556,6 +587,12 @@ BVP_Control:
         beq.s   BVP_CTL_OK
         cmpi.l  #BVP_CTRL_RESET,d0
         beq.s   BVP_CTL_OK
+        cmpi.l  #BVP_CTRL_IDLE,d0
+        beq.s   BVP_CTL_Idle
+        cmpi.l  #BVP_CTRL_TIMESHIFT,d0
+        beq.s   BVP_CTL_TimeShift
+        cmpi.l  #BVP_CTRL_CLOCKSTART,d0
+        beq.s   BVP_CTL_ClockStart
         moveq   #BVPERR_UNSUPPORTED,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
@@ -570,14 +607,62 @@ BVP_CTL_Resume:
         bne.s   BVP_CTL_Bad
         move.l  #BVP_STATE_OPEN,BVP_STATE(a6)
         clr.l   vpx_pause_active
+        bra.s   BVP_CTL_OK
+; P96W47: after a pause mrberry moves its own frame clock forward by the
+; pause time; the library's window pacer (v04_pace_new_frame, absolute grid
+; on vpv98_timer_base_us) must move by the same amount.  Otherwise every
+; later frame is "late" for it, it never waits again, and the window ran
+; into the Pi bulk hang 45-90 s after a pause (cinema: pacer unused, no
+; hang).  Same as VPr8's vpx_pause_release.
+BVP_CTL_TimeShift:
+        add.l   d1,vpv98_timer_base_us
+        add.l   d1,v41e_hr_base
+        add.l   d1,vpx_pause_total_us
+        addq.l  #1,p96w47_shifts
+        ; P96W48: no more sound-clock queries after a pause.  Tests: with the
+        ; queries the Pi bulk engine stalled 45-90 s after a pause (7 of 9
+        ; runs); NOSYNC (no queries) 3 of 3 fine; VPr8 never queries.  The
+        ; window hold goes on with the last clock sample, extrapolated with
+        ; the Pi system timer; the clock stood still while paused, so the
+        ; sample time moves forward by the pause.
+        tst.l   bvp_p96_mode
+        beq.s   BVP_CTL_OK
+        add.l   d1,p96w_sync+16
+        move.l  #1,p96w48_clk_frozen
+        move.l  #1,p96w49_first          ; P96W49: new window after the pause
+        clr.l   p96w49_win_n
 BVP_CTL_OK:
         clr.l   BVP_LAST_ERROR(a6)
         moveq   #BVP_OK,d0
+        rts
+BVP_CTL_ClockStart:
+        clr.l   BVP_LAST_ERROR(a6)
+        move.l  n81_active_sys,d0
         rts
 BVP_CTL_Bad:
         moveq   #BVPERR_BADSTATE,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
+; P96W45: mrberry calls this about every 40 ms while it pauses (it sends no
+; packets then).  In the window: window keys (Esc/0/close/Space), VCHIQ
+; callback service, draw due held frames (P96W46: no clock queries).
+; Cinema mode: nothing to do.
+BVP_CTL_Idle:
+        cmp.l   #BVP_STATE_OPEN,BVP_STATE(a6)
+        bne.s   BVP_CTL_OK
+        tst.l   bvp_p96_mode
+        beq.s   BVP_CTL_OK
+        tst.l   bvp_backend_ready
+        beq.s   BVP_CTL_OK
+        tst.l   p96w_wait_timeouts       ; stream already broken: leave it alone
+        bne.s   BVP_CTL_OK
+        movem.l d2-d7/a2-a6,-(sp)
+        move.l  a6,bvp_libbase_global
+        jsr     p96w38_poll_keys          ; P96W46: no clock queries while paused
+        jsr     bvp_engine_env
+        jsr     p96w9_idle_poll
+        movem.l (sp)+,d2-d7/a2-a6
+        bra.s   BVP_CTL_OK
 
 BVP_GetStatus:
         move.l  a0,d0
@@ -684,9 +769,33 @@ bvp_bi_start:
         clr.l   v10b_input_is_mkv
         clr.l   v10_timecode_scale
         clr.l   v10_first_pts_found
-        ; N79P96 diagnostic: start berryvp.library in VPr8 P96 full-front window mode.
+        ; OpenStream flags select the display mode.
+        ;   10/25/50/75 = VPr8 P96 window (ISP BGR24 -> host -> P96)
+        ;   everything else = direct VideoCore/HVS cinema (unchanged).
+        clr.l   bvp_p96_mode
         move.l  #203,v40j_cli_mode
         move.l  #3,v41_display_style
+        move.l  bvp_libbase_global,a0
+        move.l  BVP_STREAM_FLAGS(a0),d0
+        cmpi.l  #10,d0
+        beq.s   p96w_mode_window
+        cmpi.l  #25,d0
+        beq.s   p96w_mode_window
+        cmpi.l  #50,d0
+        beq.s   p96w_mode_window
+        cmpi.l  #75,d0
+        bne.s   p96w_mode_done
+p96w_mode_window:
+        move.l  d0,v40j_cli_mode
+        clr.l   v41_display_style
+        move.l  #1,bvp_p96_mode
+        lea     p96w_msg_window_mode,a1
+        jsr     n12_log
+        move.l  v40j_cli_mode,d0
+        lea     p96w_pfx_mode,a1
+        jsr     n15_log_hex32
+p96w_mode_done:
+        jsr     p96w_clk_open
         move.l  #1,bvp_library_mode
         clr.l   bvp_n21_feed_retries
 
@@ -916,7 +1025,7 @@ bvp_ldp_fail:
 ;
 ; Both helpers return with shared VCHIQ RAM CPU-owned.
 bvp_wait_video_submit_ready:
-        move.l  #$00040000,bvp_wait_count
+        jsr     p96w_wait_budget          ; P96W35: max ~6 s in the window
 bvp_wvsr_check_now:
         tst.l   input_bulk_pending
         bne.s   bvp_wvsr_need_poll
@@ -932,6 +1041,7 @@ bvp_wvsr_need_poll:
         ; RAM back to DMA/VideoCore before waiting for a callback to arrive.
         jsr     dma_pre_all
 bvp_wvsr_poll:
+        move.l  #1,p96w_where        ; P96W33 hang marker
         jsr     short_delay
         jsr     dma_post_all
         move.l  slot_ptr,a0
@@ -973,8 +1083,11 @@ bvp_wvsr_not_ready:
         jsr     dma_pre_all
 bvp_wvsr_tick:
         subq.l  #1,bvp_wait_count
+        jsr     p96w12_kick_maybe
+        tst.l   bvp_wait_count            ; P96W12: flags for loop test
         bne.w   bvp_wvsr_poll
         jsr     dma_post_all
+        jsr     p96w_dump_state
         lea     n21_msg_submit_timeout,a1
         jsr     n12_log
         moveq   #BVPERR_TIMEOUT,d0
@@ -996,8 +1109,9 @@ bvp_wvsr_ok:
         rts
 
 bvp_wait_video_bulk_done:
-        move.l  #$00040000,bvp_wait_count
+        jsr     p96w_wait_budget          ; P96W35: max ~6 s in the window
 bvp_wvbd_loop:
+        move.l  #2,p96w_where        ; P96W33 hang marker
         jsr     short_delay
         jsr     dma_post_all
         move.l  slot_ptr,a0
@@ -1020,10 +1134,16 @@ bvp_wvbd_loop:
 bvp_wvbd_check:
         tst.l   input_bulk_pending
         beq.s   bvp_wvbd_ok
+        jsr     p96w41_rescue_rx          ; P96W41: break TX/RX standoff
+        tst.l   v10h_error_seen
+        bne.w   bvp_wvbd_fail_backend
         jsr     dma_pre_all
         subq.l  #1,bvp_wait_count
+        jsr     p96w12_kick_maybe
+        tst.l   bvp_wait_count            ; P96W12: flags for loop test
         bne.w   bvp_wvbd_loop
         jsr     dma_post_all
+        jsr     p96w_dump_state
         lea     n21_msg_bulk_timeout,a1
         jsr     n12_log
         moveq   #BVPERR_TIMEOUT,d0
@@ -1231,6 +1351,7 @@ n13_rx_done:
         rts
 
 n13_log_dispatch_status:
+        jsr     p96w_log_err
         movem.l d0-d2/a1,-(sp)
         cmpi.l  #MMAL_SUCCESS,d0
         beq.w   n13_stat_success
@@ -1385,11 +1506,12 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 CLOCK-BEFORE-PCM PTS SCHED (30.09.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS (22.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
 bvp_library_mode:      ds.l 1
+bvp_p96_mode:          ds.l 1
 bvp_backend_ready:     ds.l 1
 bvp_dos_base:          ds.l 1
 bvp_output_handle:     ds.l 1
@@ -3548,6 +3670,8 @@ v15_clear_ctrl_c:
 ; The persistent flag remains set until the process finishes its controlled EOS.
 v15_poll_ctrl_c:
         movem.l d1-d2/a6,-(sp)
+        tst.l   bvp_p96_mode
+        bne.w   p96w43_poll_stop          ; P96W43: window streaming
         clr.l   d2
         moveq   #0,d0
         move.l  #SIGBREAKF_CTRL_C,d1
@@ -4128,10 +4252,12 @@ v41e_hr_n65_audio_done:
         move.l  v41e_hr_target,d3
         move.l  d3,vpv98_timer_target_us
 v41e_hr_wait_loop:
+        move.l  #3,p96w_where        ; P96W33 hang marker
         bsr     v41e_hr_clock_poll
         move.l  d0,d4
         cmp.l   d3,d4
         bcc.s   v41e_hr_reached
+        jsr     p96w9_idle_poll
         bsr     v15_poll_ctrl_c
         tst.l   v15_stop_requested
         bne.s   v41e_hr_reached
@@ -10294,6 +10420,11 @@ v005r4_p96_start_pts_done:
         clr.l   vpv98_timer_target_us
 
 v32r_display_frame_now:
+        ; P96W37: in the window the frame may wait in host RAM until the
+        ; Pi audio clock reaches its PTS (drawn later by p96w_present).
+        jsr     p96w_frame_ready
+        tst.l   d0
+        beq.w   p96w37_frame_queued
         bsr     t31s_stream_current_frame
         tst.l   d0
         bne.w   h30_store_fail
@@ -10319,6 +10450,8 @@ v005r4_p96_latest_done:
         ; only the propagated output PTS and the free-running Pi 1-MHz timer
         ; are sampled, so playback behaviour is unchanged.
         bsr     vpv131_measure_display_timing
+        jsr     p96w_disp_sample
+p96w37_frame_queued:
         addq.l  #1,t8c_display_frame_total
 h8c_rgb_frame_done:
         move.l  output_current_idx,d0
@@ -10817,6 +10950,7 @@ hdmi_v40o_poll_window_next:
         move.l  v32_last_imsg_code,d4
         cmpi.l  #IDCMP_CLOSEWINDOW,d3
         bne.s   v32f_not_close
+        move.l  #1,p96w_sync+72          ; P96W38: tell mrberry
         move.l  #1,v15_stop_requested
         jsr     mkvr7_capture_resume
         moveq   #1,d2
@@ -10878,6 +11012,7 @@ v41_live_key_c:
         bra.w   hdmi_v40o_poll_window_next
 v40j_live_key_stop:
         ; VPv83: defer the actual stop latch until back in central A/V poll.
+        move.l  #1,p96w_sync+72          ; P96W38: tell mrberry
         move.l  #1,vpv81_key_stop_pending
         moveq   #1,d2
         bra.w   hdmi_v40o_poll_window_next
@@ -12415,7 +12550,9 @@ h19_mmal_data:
         beq.w   h19_buffer_to_host
         cmp.l   #MMAL_EVENT_TO_HOST,d0
         beq.w   h19_event
-        bra.w   h19_consume
+        cmp.l   #MMAL_PORT_PARAMETER_GET,d0
+        bne.w   h19_consume
+        jmp     p96w_clk_reply
 
 h19_buffer_to_host:
         ; VPv21T isolation: EXACT HDMI_v41L video BUFFER_TO_HOST path.
@@ -12479,6 +12616,7 @@ h19_buffer_to_host:
         sub.l   #VPV47_AUDIO_CONTEXT_BASE,d1
         cmpi.l  #VPV47_AUDIO_SLOTS,d1
         bcc.s   h19_vpv47_not_audio_return
+        jsr     p96w49_audio_return       ; P96W49: passive sound clock
         ; VPv135: passive audio-renderer wall-clock proof. D1 is the exact
         ; returned slot index and buffer_pts_* belongs to this BUFFER_TO_HOST.
         jsr     vpv135_measure_audio_return
@@ -12643,12 +12781,28 @@ h264rgb2_nonempty_eos_ready:
         move.l  output_bulk_queued,d1
         tst.l   d1
         bne.s   vpv183_defer_output_header
+        ; P96W18: keep strict decode order.  If older headers are still
+        ; waiting in the FIFO, this newer header must queue BEHIND them;
+        ; launching it now would receive the frames out of order and hand
+        ; the wrong MMAL buffer back to the ISP (output pool lost -> stall).
+        tst.l   bvp_p96_mode
+        beq.s   p96w18_fifo_ok
+        tst.l   output_deferred_count
+        bne.s   vpv183_defer_output_header
+p96w18_fifo_ok:
 
         ; mkvr7: host P96 BULK_RX must never start while compressed
         ; VIDEO or PCM AUDIO BULK_TX owns the shared VCHIQ bulk engine.
         ; Raw-H264 legacy behavior is left unchanged.
         tst.l   v10b_input_is_mkv
+        bne.s   p96w15_rx_serial_check
+        ; P96W15: the library never sets v10b_input_is_mkv (mrberry feeds
+        ; the packets), so the VPv174 rule was skipped and a window-frame
+        ; BULK_RX could start on top of an active AUDIO/VIDEO BULK_TX ->
+        ; VideoCore bulk engine deadlock.  Apply the rule in the P96 window.
+        tst.l   bvp_p96_mode
         beq.s   h61_output_bulk_now
+p96w15_rx_serial_check:
         tst.l   input_bulk_pending
         bne.s   vpv183_defer_output_header
         tst.l   vpv39_audio_bulk_pending
@@ -13082,8 +13236,8 @@ h19_after_rx_bell:
         ; Standalone player retains its historical tail-enter into h19_poll.
         tst.l   bvp_library_mode
         beq.s   n79p96c_rx_player_poll
-        cmpi.l  #202,v40j_cli_mode
-        bne.s   n79p96c_rx_player_poll
+        tst.l   bvp_p96_mode
+        beq.s   n79p96c_rx_player_poll
         ; N79P96G: h19_queue_bulk_rx called dma_pre_all before ringing VC.
         ; Public library calls must never return with the shared VCHIQ block
         ; still DMA-owned.  The separate output pagelist/data DMA remains live.
@@ -13211,8 +13365,8 @@ h31s_no_empty_requeue:
 
         tst.l   bvp_library_mode
         beq.w   bvp_h19_consume_legacy
-        cmpi.l  #202,v40j_cli_mode
-        beq.w   n79p96c_library_output_maint
+        tst.l   bvp_p96_mode
+        bne.w   n79p96c_library_output_maint
         moveq   #0,d0
         rts
 
@@ -13256,6 +13410,13 @@ n79p96c_recycle_done:
 n79p96c_try_deferred:
         tst.l   output_deferred_count
         beq.s   n79p96c_library_done
+        ; P96W19: never start a deferred BULK_RX while another window-frame
+        ; BULK_RX is still in flight.  This maintenance runs after EVERY
+        ; consumed message, so without this check a header that was just
+        ; deferred (because an RX was active) got popped at once -> two RX
+        ; outstanding -> VideoCore bulk engine stuck.
+        tst.l   output_bulk_queued
+        bne.s   n79p96c_library_done
         tst.l   input_bulk_pending
         bne.s   n79p96c_library_done
         tst.l   vpv39_audio_bulk_pending
@@ -18035,8 +18196,14 @@ dma_pre_all:
         rts
 
 short_delay:
+        addq.l  #1,p96w_spin              ; P96W33: shows a busy wait in P96STAT
         movem.l d6,-(sp)
         move.l  #POLL_DELAY,d6
+        ; P96W20: while a P96 window stream is running, poll the VideoCore
+        ; 8x more often (pause ~0.5 ms instead of ~4 ms per poll).
+        tst.l   p96w20_fast
+        beq.s   delay_loop
+        move.l  #POLL_DELAY/8,d6
 delay_loop:
         subq.l  #1,d6
         bne.w   delay_loop
@@ -19178,6 +19345,18 @@ v04_paced_frames: ds.l 1
 v04_clock_counter: ds.l 1
 v41e_hr_started:    ds.l 1
 v41e_hr_base:       ds.l 1
+p96w47_shifts:      ds.l 1
+p96w48_clk_frozen:  ds.l 1
+p96w49_k:           ds.l 1     ; clock - returned block PTS (min, us)
+p96w49_k_valid:     ds.l 1
+p96w49_cal_n:       ds.l 1
+p96w49_first:       ds.l 1
+p96w49_win_n:       ds.l 1
+p96w49_win_o:       ds.l 1     ; min (sys - media) in this window
+p96w49_win_media:   ds.l 1
+p96w49_win_sys:     ds.l 1
+p96w49_applies:     ds.l 1
+p96w49_corr_max:    ds.l 1     ; largest |correction| in us
 v41e_hr_last_line:  ds.l 1
 v41e_hr_target:     ds.l 1
 v41e_hr_accum:      ds.l 1
@@ -50550,8 +50729,8 @@ v41l_preopen_style_ready:
         ; the original no-window behaviour.
         tst.l   bvp_library_mode
         beq.s   n79p96_open_movie_window
-        cmpi.l  #202,v40j_cli_mode
-        bne.s   vpv98_c_window_ok_done
+        tst.l   bvp_p96_mode
+        beq.s   vpv98_c_window_ok_done
 n79p96_open_movie_window:
         jsr     hdmi_v40o_open_window
         tst.l   d0
@@ -55394,6 +55573,8 @@ vpv117_probe_clock_ports_scheduler:
         bne.w   vpv117_graph_probe_fail
         move.l  port_last_handle,vpv117_clock_port4
 
+        tst.l   n81_free_mode             ; CLK81: no audio_render
+        bne.s   n81_skip_audio_clock_port
         move.l  vpv01_audio_handle,component_handle
         move.l  #MMAL_PORT_CLOCK,port_query_type
         clr.l   port_query_index
@@ -55401,6 +55582,7 @@ vpv117_probe_clock_ports_scheduler:
         tst.l   d0
         bne.w   vpv117_graph_probe_fail
         move.l  port_last_handle,vpv117_audio_clock_port
+n81_skip_audio_clock_port:
 
         tst.l   vpv117_sched_handle
         bne.s   vpv126_sched_already_created
@@ -55468,6 +55650,8 @@ vpv126_sched_already_created:
         ; VPv121: first real MMAL clock connection.  Keep the proven P96
         ; video path and old A/V scheduler intact; only connect clock port 0
         ; to ril.audio_render CLOCK0 and verify the worker acknowledgement.
+        tst.l   n81_free_mode             ; CLK81: free-running clock
+        bne.w   n81_probe_free_tail
         jsr     vpv121_connect_clock_to_audio
         ; VPv122: prove the second clock fanout leg as a separate isolated
         ; worker CONNECT.  Scheduler still carries no video data in this build.
@@ -55480,6 +55664,14 @@ vpv126_sched_already_created:
         ; VPv126: activate the clock fanout leg used by the scheduler and
         ; start the scheduler component only after audio master is armed.
         jsr     vpv126_activate_scheduler_clock
+        jsr     vpv126_enable_scheduler_component
+        bra.s   vpv117_graph_probe_done
+n81_probe_free_tail:
+        ; CLK81: clock1 -> scheduler only, no audio_render.  The clock is
+        ; started by n81_free_clock_start (REFERENCE + ACTIVE, scale 1.0).
+        jsr     vpv122_connect_clock_to_scheduler
+        jsr     vpv126_activate_scheduler_clock
+        jsr     n81_free_clock_start
         jsr     vpv126_enable_scheduler_component
         bra.s   vpv117_graph_probe_done
 
@@ -67682,8 +67874,18 @@ N16_SA_Done:
 BVP_CloseStreamN9:
         move.l  a6,bvp_libbase_global
         movem.l d1-d7/a0-a5,-(sp)
+        jsr     p96w_clk_close            ; P96W32: before the teardown
+        clr.l   p96w20_fast               ; P96W20: normal pause for teardown
         lea     n11_name_close_in,a1
         jsr     n12_log
+        jsr     p96w_clk_log
+
+        ; P96W40: after a 6-s transfer timeout the VideoCore no longer answers.
+        ; Every further wait below (final AU, TX close, audio flush, CPU1 audio)
+        ; would only time out again or spin (W39: 3 x 6 s, then hung in the
+        ; audio teardown).  Skip straight to the summary and forced cleanup.
+        tst.l   p96w_wait_timeouts
+        bne.w   N65_CS_AudioTransportDone
 
         ; N69: publish the final library-owned compressed AU before video EOS.
         ; The force loop keeps deferred PCM service alive while waiting for its
@@ -67698,6 +67900,7 @@ BVP_CloseStreamN9:
         moveq   #BVPERR_BACKEND,d7
         bra.s   N69_CS_VideoPendingDone
 N69_CS_VideoPendingDone:
+        jsr     p96w8_close_tx
 
         ; N30: flush the final partial VPr8-style AAC batch before video EOS.
         ; Then only the serialized BULK transport must be idle; renderer-owned
@@ -67709,6 +67912,7 @@ N69_CS_VideoPendingDone:
         beq.s   N65_CS_NoPartialBatch
         bsr     n30_flush_audio_batch
 N65_CS_NoPartialBatch:
+        jsr     p96w_async_finish
         tst.l   n65_audio_pending
         beq.s   N65_CS_NoDeferredPCM
         addq.l  #1,n65_audio_forced_waits
@@ -68277,6 +68481,16 @@ n79p96g_sa_a01_done:
         move.l  a0,-(sp)
         move.l  d4,-(sp)
         jsr     bvp_engine_env
+        ; P96W4/P96W22: in the P96 window AAC, AC3 and E-AC3 decode
+        ; asynchronously on CPU1 (same mailbox, buffers and module call).
+        clr.l   p96w_async_on
+        tst.l   bvp_p96_mode
+        beq.s   p96w_sa_async_set
+        move.l  #1,p96w_async_on
+p96w_sa_async_set:
+        jsr     p96w_present              ; P96W37
+        jsr     p96w_async_poll_nb
+        jsr     bvp_engine_env
         jsr     n65_service_pending_audio
         tst.l   d0
         bne.s   N69_SA_ServiceDone
@@ -68315,7 +68529,13 @@ n30_sa_have_pts:
 
         ; Copy this ADTS packet into the already allocated CPU1 input staging
         ; buffer. It remains CPU-owned until n30_flush_audio_batch maps it.
+        ; P96W4: async mode stages into a separate host buffer, because CPU1
+        ; may still be reading vpv48_input_ptr for the previous batch.
         move.l  vpv48_input_ptr,a1
+        tst.l   p96w_async_on
+        beq.s   p96w_stage_sel_done
+        lea     p96w_stage,a1
+p96w_stage_sel_done:
         move.l  n30_batch_bytes,d0
         adda.l  d0,a1
         move.l  a0,a2
@@ -68413,6 +68633,10 @@ N9_SA_Done:
 ; batching alone is still insufficient.
 ; ---------------------------------------------------------------------------
 n30_flush_audio_batch:
+        tst.l   p96w_async_on
+        beq.s   n30_fab_sync
+        jmp     p96w_async_flush
+n30_fab_sync:
         movem.l d1-d7/a0-a3/a6,-(sp)
         tst.l   n30_batch_frames
         bne.s   n30_fab_have
@@ -68555,6 +68779,13 @@ n65_svc_have:
         bne.s   n65_svc_poll_once
         tst.l   vpv39_audio_bulk_pending
         bne.s   n65_svc_poll_once
+        ; P96W11: in the P96 window keep the VPberry/mkvr7 rule strictly:
+        ; NO audio BULK_TX while the window-frame BULK_RX is active.
+        tst.l   bvp_p96_mode
+        beq.s   p96w11_fast_rx_ok
+        tst.l   output_bulk_queued
+        bne.s   n65_svc_poll_once
+p96w11_fast_rx_ok:
         ; N79P96G diagnostic: allow AUDIO BULK_TX while P96 output BULK_RX is
         ; active. VIDEO BULK_TX remains blocked by bvp_wait_video_submit_ready.
         ; This isolates whether the old striping was caused specifically by
@@ -68597,6 +68828,11 @@ n65_svc_after_rx:
         bne.w   n65_svc_defer
         tst.l   vpv39_audio_bulk_pending
         bne.w   n65_svc_defer
+        tst.l   bvp_p96_mode
+        beq.s   p96w11_slow_rx_ok
+        tst.l   output_bulk_queued
+        bne.w   n65_svc_defer
+p96w11_slow_rx_ok:
         ; N79P96G: AUDIO is the one exception to P96 RX serialization.
         ; Do not defer merely because output_bulk_queued is active.
         tst.l   vpv47_slot_state
@@ -68732,7 +68968,11 @@ n66_vsvc_have:
         tst.l   n73_scheduler_graph_ready
         beq.s   n73_vsvc_host_pacer
         tst.l   n73_clock_armed
+        bne.s   n81_vsvc_armed
+        jsr     n81_try_free_clock        ; CLK81: cinema without audio
+        tst.l   n73_clock_armed
         beq.w   n66_vsvc_defer
+n81_vsvc_armed:
         cmpi.l  #1,n79_first_video_trace_state
         bne.s   n79_no_v08
         lea     n79_v08,a1
@@ -68772,6 +69012,16 @@ n66_vsvc_pacer_max_ok:
         addq.l  #1,n63_video_pacer_gt20ms
 
 n66_vsvc_due:
+        ; P96W8: the previous AU's BULK_TX was not waited for at submit time.
+        ; Finish it now (usually already complete), before the next feed.
+        tst.l   bvp_p96_mode
+        beq.s   p96w8_no_late_wait
+        tst.l   input_bulk_pending
+        beq.s   p96w8_no_late_wait
+        jsr     p96w8_finish_tx
+        tst.l   d0
+        bne.w   n66_vsvc_fail
+p96w8_no_late_wait:
         ; Do not introduce a new wait merely because all four decoder inputs are
         ; currently VideoCore-owned. Defer to a later API service opportunity.
         tst.l   input_bulk_pending
@@ -68992,6 +69242,7 @@ n79_no_v06:
         addq.l  #1,n69_dispatch_entries
         move.l  #$00080000,d2
 n69_dispatch_loop:
+        move.l  #4,p96w_where        ; P96W33 hang marker
         tst.l   n66_video_pending
         beq.s   n69_dispatch_ok
         addq.l  #1,n69_dispatch_loops
@@ -69014,9 +69265,11 @@ n79_no_v13:
         bne.s   n69_dispatch_fail
         tst.l   n66_video_pending
         beq.s   n69_dispatch_ok
+        jsr     p96w9_idle_poll
         jsr     short_delay
+        jsr     n81_heartbeat             ; CLK81 test: 1 line/s while waiting
         subq.l  #1,d2
-        bne.s   n69_dispatch_loop
+        bne.w   n69_dispatch_loop
 n69_dispatch_fail:
         addq.l  #1,n69_dispatch_failures
         moveq   #1,d0
@@ -69033,6 +69286,7 @@ n66_force_pending_video:
         movem.l d1-d2,-(sp)
         move.l  #$00080000,d2
 n66_force_video_loop:
+        move.l  #5,p96w_where        ; P96W33 hang marker
         tst.l   n66_video_pending
         beq.s   n66_force_video_ok
         jsr     n65_service_pending_audio
@@ -69043,6 +69297,7 @@ n66_force_video_loop:
         bne.s   n66_force_video_fail
         tst.l   n66_video_pending
         beq.s   n66_force_video_ok
+        jsr     p96w9_idle_poll
         jsr     short_delay
         subq.l  #1,d2
         bne.s   n66_force_video_loop
@@ -69196,7 +69451,7 @@ n29_ars_done:
 ; CPU-owned on entry/return.  Selects a free audio slot into
 ; n29_audio_selected_slot and guarantees no VIDEO/AUDIO BULK_TX is active.
 n29_wait_audio_submit_ready:
-        move.l  #$00040000,bvp_wait_count
+        jsr     p96w_wait_budget          ; P96W35: max ~6 s in the window
 n29_wasr_check:
         bsr     n29_audio_reap_slots
         tst.l   input_bulk_pending
@@ -69211,6 +69466,7 @@ n29_wasr_check:
 n29_wasr_need_poll:
         jsr     dma_pre_all
 n29_wasr_poll:
+        move.l  #6,p96w_where        ; P96W33 hang marker
         jsr     short_delay
         jsr     dma_post_all
         move.l  slot_ptr,a0
@@ -69256,8 +69512,11 @@ n29_wasr_not_ready:
         jsr     dma_pre_all
 n29_wasr_tick:
         subq.l  #1,bvp_wait_count
+        jsr     p96w12_kick_maybe
+        tst.l   bvp_wait_count            ; P96W12: flags for loop test
         bne.w   n29_wasr_poll
         jsr     dma_post_all
+        jsr     p96w_dump_state
         lea     n29_msg_audio_submit_timeout,a1
         jsr     n12_log
         moveq   #BVPERR_TIMEOUT,d0
@@ -69280,8 +69539,9 @@ n29_wasr_fail:
 ; may keep the slot afterwards; its BTH is consumed by later video/audio calls.
 n29_wait_audio_bulk_done:
         addq.l  #1,n29_audio_bulk_waits
-        move.l  #$00040000,bvp_wait_count
+        jsr     p96w_wait_budget          ; P96W35: max ~6 s in the window
 n29_wabd_loop:
+        move.l  #7,p96w_where        ; P96W33 hang marker
         jsr     short_delay
         jsr     dma_post_all
         move.l  slot_ptr,a0
@@ -69306,8 +69566,11 @@ n29_wabd_check:
         beq.s   n29_wabd_ok
         jsr     dma_pre_all
         subq.l  #1,bvp_wait_count
+        jsr     p96w12_kick_maybe
+        tst.l   bvp_wait_count            ; P96W12: flags for loop test
         bne.w   n29_wabd_loop
         jsr     dma_post_all
+        jsr     p96w_dump_state
         lea     n29_msg_audio_bulk_timeout,a1
         jsr     n12_log
         moveq   #BVPERR_TIMEOUT,d0
@@ -69741,6 +70004,8 @@ ac308n_sf_eac3:
         moveq   #1,d0
         rts
 ac309_sf_eac3_running:
+        tst.l   bvp_p96_mode
+        bne.s   p96w23_sf_window
         cmpi.l  #1,n30_batch_frames
         bcs.s   ac307_sf_no
         moveq   #1,d0
@@ -69754,7 +70019,25 @@ ac307_sf_ac3:
         moveq   #1,d0
         rts
 ac307_sf_ac3_normal:
+        tst.l   bvp_p96_mode
+        bne.s   p96w23_sf_window
         cmpi.l  #7,n30_batch_frames
+        bcs.s   ac307_sf_no
+        moveq   #1,d0
+        rts
+; P96W25: in the P96 window AC3/E-AC3 decode asynchronously on CPU1.
+; CPU1 calls stay small (AC3 5 frames, E-AC3 2 frames: P96W23's 10 was
+; refused by both modules); p96w_async_complete collects the PCM of several
+; calls into one ~60-KiB block, so there are as few audio BULK_TX as AAC.
+p96w23_sf_window:
+        cmpi.l  #2,ac307_decoder_kind
+        beq.s   p96w24_sf_eac3
+        cmpi.l  #5,n30_batch_frames
+        bcs.s   ac307_sf_no
+        moveq   #1,d0
+        rts
+p96w24_sf_eac3:
+        cmpi.l  #2,n30_batch_frames
         bcs.s   ac307_sf_no
         moveq   #1,d0
         rts
@@ -70387,6 +70670,20 @@ n70_early_lead_max_us:       ds.l 1
 ; N79 exact VPr8 scheduler startup state (library mode only).
 n73_scheduler_graph_ready:   ds.l 1
 n73_clock_armed:             ds.l 1
+n81_tried:                   ds.l 1   ; CLK81 free-clock test
+n81_active:                  ds.l 1
+n81_active_sys:              ds.l 1
+n81_hb_last:                 ds.l 1
+n81_free_mode:               ds.l 1
+n81_ok:                      ds.l 1
+n81_st_comp:                 ds.l 1
+n81_st_ref:                  ds.l 1
+n81_st_act:                  ds.l 1
+n81_st_sact:                 ds.l 1
+n81_save_comp:               ds.l 1
+n81_save_input:              ds.l 1
+n81_save_qtype:              ds.l 1
+n81_save_qidx:               ds.l 1
 n73_first_pcm_published:     ds.l 1
 n73_prime_flushes:           ds.l 1
 n73_clock_arm_attempts:      ds.l 1
@@ -70407,5 +70704,1708 @@ e4d_line_buffer:
         ds.b    64
 fast13_line_buffer:
         ds.b    80
+
+
+; ============================================================================
+; P96 window mode (P96W2-W20, 14.-16.10.2026): mrberry + berryvp.library in
+; the VPr8 P96 window (OpenStream flags 10/25/50/75).  Helper routines below;
+; the cinema/HVS mode (flags 0) never calls them.
+; ============================================================================
+        section p96w_code,code
+; P96W9: VPberry principle - while the library waits (pacer, dispatcher),
+; keep the VCHIQ callback stream moving: launch/finish the window-frame
+; BULK_RX, recycle output buffers, take input returns, serve deferred PCM.
+; Only in the P96 window.  Entry/exit: shared RAM CPU-owned.  All regs kept.
+p96w9_idle_poll:
+        tst.l   bvp_p96_mode
+        bne.s   p96w9_ip_go
+        rts
+p96w9_ip_go:
+        movem.l d0-d7/a0-a3/a5-a6,-(sp)
+        jsr     dma_post_all
+        move.l  slot_ptr,a0
+        lea     60(a0),a0
+        jsr     load_le32
+        cmp.l   port_rx_pos,d0
+        bls.s   p96w9_ip_nomsg
+        jsr     h26a_map_rx_current
+        tst.l   d0
+        bne.s   p96w9_ip_nomsg
+        move.l  a2,a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_msgid
+        lea     4(a2),a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_size
+        jsr     v9g_h19_dispatch
+        jsr     dma_post_all
+        clr.l   p96w12_empty
+        bra.s   p96w9_ip_after
+p96w9_ip_nomsg:
+        addq.l  #1,p96w12_empty
+        cmpi.l  #32,p96w12_empty
+        bcs.s   p96w9_ip_after
+        clr.l   p96w12_empty
+        jsr     p96w12_kick
+        jsr     dma_post_all
+p96w9_ip_after:
+        tst.l   n65_audio_pending
+        beq.s   p96w9_ip_done
+        tst.l   input_bulk_pending
+        bne.s   p96w9_ip_done
+        jsr     n65_service_pending_audio
+p96w9_ip_done:
+        jsr     p96w_present              ; P96W37
+        movem.l (sp)+,d0-d7/a0-a3/a5-a6
+        rts
+
+; P96W12: VideoCore wake-up kick.  The normal publish path reads the VC
+; 'armed' flag BEFORE flushing its own writes, so a doorbell can be missed;
+; then VC sleeps and nothing completes (seen: audio BULK_TX never done).
+; A spurious doorbell is harmless: VC just rescans its queues.
+; Call with shared RAM DMA-owned; returns DMA-owned.  All regs kept.
+p96w12_kick_maybe:
+        tst.l   bvp_p96_mode
+        beq.s   p96w12_km_ret
+        movem.l d0,-(sp)
+        move.l  bvp_wait_count,d0
+        andi.l  #31,d0
+        movem.l (sp)+,d0
+        bne.s   p96w12_km_ret
+        jsr     dma_post_all
+        jsr     p96w12_kick
+        ; P96W35: a stalled VideoCore transfer ends after ~6 s instead of
+        ; minutes; the caller then takes its normal TIMEOUT path (logged).
+        movem.l d0,-(sp)
+        jsr     vpv98_read_sys_us
+        sub.l   p96w_wait_start,d0
+        cmpi.l  #P96W_WAIT_MAX_US,d0
+        bcs.s   p96w12_km_time_ok
+        clr.l   bvp_wait_count
+        addq.l  #1,p96w_wait_timeouts
+p96w12_km_time_ok:
+        movem.l (sp)+,d0
+p96w12_km_ret:
+        rts
+
+; ----------------------------------------------------------------------------
+; P96W41: rescue for the window stall.  Every W:75 stall dump showed the same
+; picture: our video BULK_TX never completes, the Pi has already announced a
+; finished window frame (header seen, BULK_RX deferred by the P96W19 rule
+; "no RX while a TX is in flight") and then goes silent.  Suspected standoff:
+; the VideoCore wants to hand out that frame first, we wait for our TX first.
+; If the TX has been pending for >= 250 ms and a frame header waits with no
+; RX in flight, start that one deferred BULK_RX anyway.  Normal runs never
+; get here (TX completes within ~10 ms), so nothing else changes.
+; Entry/exit: shared RAM CPU-owned.
+; ----------------------------------------------------------------------------
+P96W41_RESCUE_US     equ 250000
+
+p96w41_rescue_rx:
+        tst.l   bvp_p96_mode
+        beq.s   p96w41_rr_ret
+        tst.l   output_deferred_count
+        beq.s   p96w41_rr_ret
+        tst.l   output_bulk_queued
+        bne.s   p96w41_rr_ret
+        tst.l   output_eos_seen
+        bne.s   p96w41_rr_ret
+        movem.l d0-d7/a0-a6,-(sp)
+        jsr     vpv98_read_sys_us
+        sub.l   p96w_wait_start,d0
+        cmpi.l  #P96W41_RESCUE_US,d0
+        bcs.s   p96w41_rr_skip
+        addq.l  #1,p96w41_rescues
+        jsr     vpv183_pop_deferred_output
+p96w41_rr_skip:
+        movem.l (sp)+,d0-d7/a0-a6
+p96w41_rr_ret:
+        rts
+
+p96w_wait_budget:
+        move.l  #$00040000,bvp_wait_count
+        movem.l d0,-(sp)
+        jsr     vpv98_read_sys_us
+        move.l  d0,p96w_wait_start
+        movem.l (sp)+,d0
+        rts
+
+; Entry CPU-owned, exit DMA-owned.
+p96w12_kick:
+        movem.l d0/a0,-(sp)
+        move.l  slot_ptr,a0
+        lea     MASTER_TRIG_FIR(a0),a0
+        moveq   #1,d0
+        jsr     store_le32
+        jsr     dma_pre_all
+        moveq   #0,d0
+        move.l  d0,VCHIQ_BELL2
+        movem.l (sp)+,d0/a0
+        rts
+
+; P96W8: finish a still running video BULK_TX.  Entry/exit: shared RAM CPU-owned.
+; D0 = BVP_OK or error from bvp_wait_video_bulk_done.
+p96w8_finish_tx:
+        movem.l d1/a0-a1,-(sp)
+        jsr     dma_pre_all
+        jsr     bvp_wait_video_bulk_done
+        movem.l (sp)+,d1/a0-a1
+        rts
+
+p96w8_close_tx:
+        tst.l   bvp_p96_mode
+        beq.s   p96w8_ct_done
+        tst.l   input_bulk_pending
+        beq.s   p96w8_ct_done
+        movem.l d0,-(sp)
+        jsr     p96w8_finish_tx
+        movem.l (sp)+,d0
+p96w8_ct_done:
+        rts
+
+; ----------------------------------------------------------------------------
+; P96W4: asynchronous AAC batch decode on CPU1 (VPberry VPv158 principle) for
+; the P96 window.  SendAudio stages ADTS into p96w_stage; a full batch is
+; copied to vpv48_input_ptr and published to CPU1 without waiting.  The
+; result is collected by p96w_async_poll_nb at the next API entry and handed
+; to the unchanged N65 PCM publisher.  Cinema mode never takes this path.
+; ----------------------------------------------------------------------------
+; D0=0 ok, 1 failure.  Same contract as n30_flush_audio_batch.
+p96w_async_flush:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        tst.l   n30_batch_frames
+        beq.w   p96w_af_ok
+        ; One batch at a time on CPU1: finish the previous one first.
+        tst.l   p96w_async_pending
+        beq.s   p96w_af_launch
+        moveq   #1,d0
+        bsr     p96w_async_complete
+        tst.l   d0
+        bne.w   p96w_af_fail
+p96w_af_launch:
+        tst.l   vpv48_faad_ready
+        beq.w   p96w_af_fail
+        move.l  n30_batch_bytes,d5
+        beq.w   p96w_af_fail
+        cmpi.l  #VPV48_FAAD_INPUT_SIZE,d5
+        bhi.w   p96w_af_fail
+        lea     p96w_stage,a1
+        move.l  vpv48_input_ptr,a0
+        move.l  d5,d3
+        move.l  d3,d2
+        lsr.l   #2,d2
+        beq.s   p96w_af_ct
+p96w_af_cl:
+        move.l  (a1)+,(a0)+
+        subq.l  #1,d2
+        bne.s   p96w_af_cl
+p96w_af_ct:
+        and.l   #3,d3
+        beq.s   p96w_af_cd
+p96w_af_cb:
+        move.b  (a1)+,(a0)+
+        subq.l  #1,d3
+        bne.s   p96w_af_cb
+p96w_af_cd:
+        move.l  d5,d0
+        jsr     vpv48_map_input
+        tst.l   d0
+        bne.w   p96w_af_fail
+        move.l  vpv48_input_phys,vpv48_req_in_phys
+        move.l  d5,vpv48_req_in_len
+        move.l  vpv48_output_phys,vpv48_req_out_phys
+        move.l  #VPV48_FAAD_OUT_SIZE,vpv48_req_out_len
+        move.l  #3,vpv48_req_param0
+        clr.l   vpv48_req_param1
+        move.l  vpv48_work_phys,vpv48_req_work_phys
+        move.l  #VPV48_FAAD_WORK_SIZE,vpv48_req_work_len
+        moveq   #VPV48_CMD_CALL_MODULE,d0
+        jsr     vpv158_send_request_begin
+        tst.l   d0
+        bne.w   p96w_af_begin_fail
+        move.l  d5,p96w_async_bytes
+        move.l  n30_batch_pts_lo,p96w_async_pts_lo
+        move.l  n30_batch_pts_hi,p96w_async_pts_hi
+        move.l  #1,p96w_async_pending
+        move.l  #1,vpv158_faad_pending
+        clr.l   n30_batch_bytes
+        clr.l   n30_batch_frames
+        clr.l   n30_batch_pts_hi
+        clr.l   n30_batch_pts_lo
+p96w_af_ok:
+        moveq   #0,d0
+        bra.s   p96w_af_done
+p96w_af_begin_fail:
+        jsr     vpv48_close_input
+p96w_af_fail:
+        moveq   #1,d0
+p96w_af_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+; Nonblocking poll from API entries.  Saves every register.
+p96w_async_poll_nb:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   p96w_async_on
+        beq.s   p96w_apn_done
+        tst.l   p96w_async_pending
+        beq.s   p96w_apn_done
+        jsr     bvp_engine_env
+        moveq   #0,d0
+        bsr     p96w_async_complete
+p96w_apn_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; Blocking finish (CloseStream).  Saves every register.
+p96w_async_finish:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   p96w_async_pending
+        beq.s   p96w_afi_coll
+        jsr     bvp_engine_env
+        move.l  #1,p96w_coll_force
+        moveq   #1,d0
+        bsr     p96w_async_complete
+        clr.l   p96w_coll_force
+p96w_afi_coll:
+        ; P96W25: publish whatever AC3/E-AC3 PCM is still being collected.
+        tst.l   p96w_coll_bytes
+        beq.s   p96w_afi_done
+        jsr     bvp_engine_env
+        tst.l   n65_audio_pending
+        beq.s   p96w_afi_free
+        jsr     n65_force_pending_audio
+p96w_afi_free:
+        bsr     p96w_coll_publish
+p96w_afi_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; D0 in: 0 = try once, 1 = wait.  D0 out: 0 ok/pending, 1 failure.
+p96w_async_complete:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        move.l  d0,d7
+        tst.l   p96w_async_pending
+        beq.w   p96w_ac_ok
+        ; vpv38_pcm_store must be free before the new PCM is copied into it.
+        tst.l   n65_audio_pending
+        beq.s   p96w_ac_store_free
+        tst.l   d7
+        beq.w   p96w_ac_ok
+        jsr     n65_force_pending_audio
+        tst.l   d0
+        bne.w   p96w_ac_fail
+p96w_ac_store_free:
+        move.l  #$00040000,d6
+p96w_ac_poll:
+        move.l  #8,p96w_where        ; P96W33 hang marker
+        jsr     vpv158_send_request_poll
+        cmpi.l  #1,d0
+        beq.s   p96w_ac_reply
+        cmpi.l  #2,d0
+        beq.w   p96w_ac_bad_reply
+        tst.l   d7
+        beq.w   p96w_ac_ok
+        jsr     short_delay
+        subq.l  #1,d6
+        bne.s   p96w_ac_poll
+        bra.w   p96w_ac_fail
+p96w_ac_reply:
+        clr.l   p96w_async_pending
+        clr.l   vpv158_faad_pending
+        jsr     vpv48_close_input
+        jsr     vpv48_close_output_work
+        clr.l   vpv48_last_consumed
+        clr.l   vpv48_last_pcm_bytes
+        clr.l   vpv48_last_samples_ch
+        move.l  p96w_async_bytes,d5
+        move.l  vpv48_output_ptr,a0
+        tst.l   ac307_decoder_kind
+        bne.w   p96w_ac_ac3
+        cmpi.l  #VPV48_FAAD_OUT_MARKER,0(a0)
+        bne.w   p96w_ac_reopen_fail
+        cmpi.l  #VPV48_FAAD_BATCH_STATUS,4(a0)
+        bne.w   p96w_ac_reopen_fail
+        move.l  8(a0),d0
+        tst.l   d0
+        beq.w   p96w_ac_reopen_fail
+        cmpi.l  #192000,d0
+        bhi.w   p96w_ac_reopen_fail
+        move.l  d0,v19_pcm_rate
+        cmpi.l  #2,12(a0)
+        bne.w   p96w_ac_reopen_fail
+        tst.l   24(a0)
+        bne.w   p96w_ac_reopen_fail
+        move.l  16(a0),d4
+        cmp.l   d5,d4
+        bne.w   p96w_ac_partial
+        move.l  d4,vpv48_last_consumed
+        move.l  28(a0),vpv48_last_frame_index
+        move.l  68(a0),vpv48_last_frames
+        move.l  76(a0),d6
+        move.l  d6,vpv48_last_pcm_bytes
+        cmpi.l  #VPV38_PCM_STORE_BYTES,d6
+        bhi.w   p96w_ac_reopen_fail
+        move.l  20(a0),d2
+        btst    #0,d2
+        bne.w   p96w_ac_reopen_fail
+        lsr.l   #1,d2
+        move.l  d2,vpv48_last_samples_ch
+        tst.l   d6
+        beq.s   p96w_ac_remap
+        move.l  20(a0),d1
+        lsl.l   #1,d1
+        cmp.l   d6,d1
+        bne.w   p96w_ac_reopen_fail
+        lea     256(a0),a1
+        lea     vpv38_pcm_store,a2
+        move.l  d6,d3
+        lsr.l   #1,d3
+p96w_ac_pcm:
+        move.w  (a1)+,d0
+        ror.w   #8,d0
+        move.w  d0,(a2)+
+        subq.l  #1,d3
+        bne.s   p96w_ac_pcm
+        addq.l  #1,vpv48_batch_count
+p96w_ac_remap:
+        jsr     vpv48_map_output_work
+        tst.l   d0
+        bne.w   p96w_ac_fail
+        ; Same bookkeeping as the synchronous n30_flush_audio_batch tail.
+        addq.l  #1,n30_decode_batches
+        move.l  vpv48_last_pcm_bytes,d0
+        cmp.l   n30_pcm_max,d0
+        bls.s   p96w_ac_max_ok
+        move.l  d0,n30_pcm_max
+p96w_ac_max_ok:
+        tst.l   d0
+        beq.w   p96w_ac_ok               ; FAAD priming-only batch
+        move.l  bvp_libbase_global,a0
+        move.l  BVP_AUDIO_RATE(a0),d1
+        cmp.l   v19_pcm_rate,d1
+        bne.w   p96w_ac_fail
+        cmpi.l  #VPV21_PCM_MAX_BYTES,d0
+        bhi.w   p96w_ac_fail
+        tst.l   ac307_decoder_kind
+        bne.w   p96w_coll_add
+        move.l  vpv48_last_pcm_bytes,n65_audio_pending_bytes
+        move.l  vpv48_last_samples_ch,n65_audio_pending_samples
+        move.l  p96w_async_pts_lo,n65_audio_pending_pts_lo
+        move.l  p96w_async_pts_hi,n65_audio_pending_pts_hi
+        move.l  #1,n65_audio_pending
+        addq.l  #1,n65_audio_deferred_blocks
+        jsr     n65_service_pending_audio
+        tst.l   d0
+        bne.s   p96w_ac_fail
+p96w_ac_ok:
+        moveq   #0,d0
+        bra.w   p96w_ac_done
+; P96W22: AC3 (berry_ac3) / E-AC3 (berry_eac3) reply, same checks as the
+; synchronous ac307_ac3_decode_direct.  The whole batch must be consumed,
+; exactly like n30_flush_audio_batch requires.  (No E4D PCM sampling here:
+; it writes to the trace file during playback.)
+p96w_ac_ac3:
+        cmpi.l  #$41433334,(a0)            ; 'AC34'
+        bne.w   p96w_ac_reopen_fail
+        cmpi.l  #4,4(a0)                   ; streaming-batch status
+        bne.w   p96w_ac_reopen_fail
+        move.l  8(a0),d0                   ; sample rate
+        tst.l   d0
+        beq.w   p96w_ac_reopen_fail
+        cmpi.l  #192000,d0
+        bhi.w   p96w_ac_reopen_fail
+        move.l  d0,v19_pcm_rate
+        cmpi.l  #2,12(a0)                  ; module always emits stereo
+        bne.w   p96w_ac_reopen_fail
+        tst.l   72(a0)                     ; error_stage
+        bne.w   p96w_ac_reopen_fail
+        move.l  36(a0),d4                  ; bytes_consumed
+        cmp.l   d5,d4
+        bne.w   p96w_ac_partial
+        move.l  d4,vpv48_last_consumed
+        move.l  24(a0),vpv48_last_frames   ; frames_decoded
+        move.l  32(a0),d6                  ; pcm_bytes
+        move.l  d6,vpv48_last_pcm_bytes
+        cmpi.l  #VPV38_PCM_STORE_BYTES,d6
+        bhi.w   p96w_ac_reopen_fail
+        move.l  28(a0),d2                  ; samples_per_channel
+        move.l  d2,vpv48_last_samples_ch
+        tst.l   d6
+        beq.w   p96w_ac_remap
+        move.l  d2,d1
+        lsl.l   #2,d1                      ; samples/ch * 2ch * 2 bytes
+        cmp.l   d6,d1
+        bne.w   p96w_ac_reopen_fail
+        move.l  p96w_coll_bytes,d1         ; P96W25: append to collected PCM
+        add.l   d6,d1
+        cmpi.l  #VPV38_PCM_STORE_BYTES,d1
+        bhi.w   p96w_ac_reopen_fail
+        lea     256(a0),a1
+        lea     vpv38_pcm_store,a2
+        adda.l  p96w_coll_bytes,a2
+        move.l  d6,d3
+        lsr.l   #1,d3
+p96w_ac_ac3_pcm:
+        move.w  (a1)+,d0
+        ror.w   #8,d0                      ; CPU1 BE PCM -> MMAL LE PCM
+        move.w  d0,(a2)+
+        subq.l  #1,d3
+        bne.s   p96w_ac_ac3_pcm
+        addq.l  #1,vpv48_batch_count
+        bra.w   p96w_ac_remap
+
+; P96W25: AC3/E-AC3 PCM collector.  D0 = PCM bytes of this CPU1 call, already
+; appended at vpv38_pcm_store+p96w_coll_bytes.  Publish when the first PCM has
+; not armed the clock yet, at CloseStream, or when another call of this size
+; would no longer fit into the 64-KiB store.
+p96w_coll_add:
+        tst.l   p96w_coll_bytes
+        bne.s   p96w_coll_have_pts
+        move.l  p96w_async_pts_lo,p96w_coll_pts_lo
+        move.l  p96w_async_pts_hi,p96w_coll_pts_hi
+p96w_coll_have_pts:
+        add.l   d0,p96w_coll_bytes
+        move.l  vpv48_last_samples_ch,d1
+        add.l   d1,p96w_coll_samples
+        tst.l   n73_first_pcm_published
+        beq.s   p96w_coll_now
+        tst.l   p96w_coll_force
+        bne.s   p96w_coll_now
+        move.l  #VPV38_PCM_STORE_BYTES,d1
+        sub.l   p96w_coll_bytes,d1
+        cmp.l   d0,d1
+        bcc.w   p96w_ac_ok
+p96w_coll_now:
+        bsr     p96w_coll_publish
+        tst.l   d0
+        bne.w   p96w_ac_fail
+        bra.w   p96w_ac_ok
+
+; Hand the collected block to the unchanged N65 publisher.  D0=0 ok, 1 fail.
+p96w_coll_publish:
+        move.l  p96w_coll_bytes,n65_audio_pending_bytes
+        move.l  p96w_coll_samples,n65_audio_pending_samples
+        move.l  p96w_coll_pts_lo,n65_audio_pending_pts_lo
+        move.l  p96w_coll_pts_hi,n65_audio_pending_pts_hi
+        clr.l   p96w_coll_bytes
+        clr.l   p96w_coll_samples
+        move.l  #1,n65_audio_pending
+        addq.l  #1,n65_audio_deferred_blocks
+        jsr     n65_service_pending_audio
+        rts
+
+p96w_ac_partial:
+        addq.l  #1,n30_partial_consumes
+p96w_ac_reopen_fail:
+        jsr     vpv48_map_output_work
+        bra.s   p96w_ac_fail
+p96w_ac_bad_reply:
+        clr.l   p96w_async_pending
+        clr.l   vpv158_faad_pending
+        jsr     vpv48_close_input
+        jsr     vpv48_close_output_work
+        jsr     vpv48_map_output_work
+p96w_ac_fail:
+        moveq   #1,d0
+p96w_ac_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+; ----------------------------------------------------------------------------
+; P96W32: audio clock for the P96 window (A/V sync).
+; In the cinema mode the Pi's video_scheduler shows each frame against the
+; audio-master clock.  The window has no scheduler, so mrberry paces by host
+; time and the picture came ~0.45 s before the sound.  Here the library asks
+; the Pi's clock for its media time (MMAL PORT_PARAMETER_GET CLOCK_TIME) a few
+; times per second WITHOUT waiting: the reply is picked up by the normal
+; VCHIQ dispatcher (h19_mmal_data).  Every window blit records the displayed
+; PTS.  Both samples are published at libbase+120 -> p96w_sync for mrberry,
+; which moves its frame grid until displayed PTS == audio clock.
+; p96w_sync layout (longs):
+;   0 magic 'P96S'   4 clk_seq   8 clk_hi   12 clk_lo   16 clk_sys
+;  20 disp_seq      24 disp_hi  28 disp_lo  32 disp_sys
+;  36 requests      40 replies  44 failures 48 last_status 52 timeouts
+;  56 rtt_max       60 port_mode (0 clock comp, 1 audio_render, 2 off)
+;  64 written by mrberry: non-zero = do not query the clock (P96W36)
+;  68 written by mrberry: AV offset us, signed, + = picture later (P96W37)
+;  72 written by the library: non-zero = user stop in the video window
+;     (Esc, 0 or close gadget, P96W38).  mrberry polls it like its own Esc.
+; ----------------------------------------------------------------------------
+P96W_CLK_CTX         equ $A96C0000
+P96W_CLK_PERIOD_US   equ 200000
+P96W_WAIT_MAX_US     equ 6000000      ; P96W35: stalled transfer -> timeout
+P96W_CLK_SLOW_US     equ 1000000      ; P96W34: after the first 25 queries
+P96W_CLK_START_US    equ 1500000
+P96W_CLK_TIMEOUT_US  equ 1000000
+
+p96w_clk_open:
+        movem.l d0/a0,-(sp)
+        lea     p96w_sync,a0
+        moveq   #19,d0
+p96w_co_clr:
+        clr.l   (a0)+
+        dbra    d0,p96w_co_clr
+        move.l  #$50393653,p96w_sync      ; 'P96S'
+        clr.l   p96w_clk_pending
+        clr.l   p96w_clk_started
+        clr.l   p96w_clk_enabled
+        clr.l   p96w_ring_count
+        clr.l   p96w_ring_head
+        clr.l   p96w_ring_off
+        clr.l   p96w_ring_queued
+        clr.l   p96w_ring_shown
+        clr.l   p96w_ring_dropped
+        clr.l   p96w_ring_forced
+        clr.l   p96w_ring_peak
+        clr.l   p96w_wait_timeouts       ; P96W39: per stream
+        clr.l   p96w41_rescues
+        clr.l   p96w47_shifts            ; P96W47: per stream
+        clr.l   p96w48_clk_frozen        ; P96W48: per stream
+        clr.l   p96w49_k_valid           ; P96W49: per stream
+        clr.l   p96w49_cal_n
+        clr.l   p96w49_first
+        clr.l   p96w49_win_n
+        clr.l   p96w49_applies
+        clr.l   p96w49_corr_max
+        move.l  bvp_libbase_global,a0
+        clr.l   120(a0)
+        move.l  #p96w_diag,124(a0)       ; P96W33: live state for P96STAT
+        clr.l   p96w_where
+        tst.l   bvp_p96_mode
+        beq.s   p96w_co_done
+        move.l  #1,p96w_clk_enabled
+        move.l  #p96w_sync,120(a0)
+p96w_co_done:
+        movem.l (sp)+,d0/a0
+        rts
+
+; P96W49: passive sound clock from the audio_render buffer returns ("clock
+; comparison" without asking the Pi).  Each returned PCM block carries its
+; PTS; the time we see the return is known.  While clock queries still run
+; (before the first pause) learn K = clock - returned PTS; late processing
+; only makes K larger, so keep the minimum.  After a pause (no queries,
+; P96W48) every return gives clock = PTS + K at that moment; per window of
+; 8 returns the earliest-looking one (min sys - media) re-anchors the
+; extrapolated clock (p96w_sync+12/+16) used by the window hold.  Right
+; after the pause each new minimum is applied at once.  All regs kept.
+P96W49_WIN equ 8
+p96w49_audio_return:
+        tst.l   bvp_p96_mode
+        bne.s   p96w49_ar_go
+        rts
+p96w49_ar_go:
+        movem.l d0-d4,-(sp)
+        tst.l   buffer_pts_hi
+        bmi.w   p96w49_ar_done            ; no valid PTS
+        tst.l   p96w_sync+4               ; any clock sample yet?
+        beq.w   p96w49_ar_done
+        jsr     vpv98_read_sys_us
+        move.l  d0,d2                     ; d2 = now (sys us)
+        move.l  buffer_pts_lo,d3          ; d3 = returned block PTS
+        tst.l   p96w48_clk_frozen
+        bne.s   p96w49_ar_after
+        ; calibration: K = clock(now) - PTS, keep the minimum
+        move.l  d2,d0
+        sub.l   p96w_sync+16,d0
+        add.l   p96w_sync+12,d0           ; clock now (extrapolated sample)
+        sub.l   d3,d0                     ; K_i
+        tst.l   p96w49_k_valid
+        beq.s   p96w49_ar_k_new
+        cmp.l   p96w49_k,d0
+        bge.s   p96w49_ar_k_cnt
+p96w49_ar_k_new:
+        move.l  d0,p96w49_k
+        move.l  #1,p96w49_k_valid
+p96w49_ar_k_cnt:
+        addq.l  #1,p96w49_cal_n
+        bra.w   p96w49_ar_done
+p96w49_ar_after:
+        tst.l   p96w49_k_valid
+        beq.w   p96w49_ar_done
+        move.l  d3,d1
+        add.l   p96w49_k,d1               ; d1 = media now (estimate)
+        move.l  d2,d0
+        sub.l   d1,d0                     ; d0 = O_i = sys - media
+        tst.l   p96w49_win_n
+        beq.s   p96w49_ar_take
+        cmp.l   p96w49_win_o,d0
+        bge.s   p96w49_ar_count
+p96w49_ar_take:
+        move.l  d0,p96w49_win_o
+        move.l  d1,p96w49_win_media
+        move.l  d2,p96w49_win_sys
+        tst.l   p96w49_first
+        beq.s   p96w49_ar_count
+        bsr.s   p96w49_apply              ; first window: apply each new min
+p96w49_ar_count:
+        addq.l  #1,p96w49_win_n
+        cmpi.l  #P96W49_WIN,p96w49_win_n
+        bcs.s   p96w49_ar_done
+        bsr.s   p96w49_apply
+        clr.l   p96w49_win_n
+        clr.l   p96w49_first
+p96w49_ar_done:
+        movem.l (sp)+,d0-d4
+        rts
+
+; set the clock sample to the window minimum; remember the correction size
+p96w49_apply:
+        movem.l d0-d1,-(sp)
+        ; old estimate at win_sys minus new media = correction
+        move.l  p96w49_win_sys,d0
+        sub.l   p96w_sync+16,d0
+        add.l   p96w_sync+12,d0
+        sub.l   p96w49_win_media,d0
+        bpl.s   p96w49_ap_abs
+        neg.l   d0
+p96w49_ap_abs:
+        cmp.l   p96w49_corr_max,d0
+        bls.s   p96w49_ap_set
+        move.l  d0,p96w49_corr_max
+p96w49_ap_set:
+        move.l  p96w49_win_media,p96w_sync+12
+        move.l  p96w49_win_sys,p96w_sync+16
+        addq.l  #1,p96w49_applies
+        movem.l (sp)+,d0-d1
+        rts
+
+; P96W38: the video window is activated when it opens and also whenever the
+; user clicks it, so Esc then reaches this window instead of mrberry's 1x1
+; input window.  Read its IDCMP port here (Exec only, no VCHIQ/MMAL traffic)
+; and publish a stop request at p96w_sync+72.  Other keys are ignored; the
+; standalone player's 1/2/C/Space handling is not used in library mode.
+p96w38_poll_keys:
+        movem.l d0-d3/a0-a2/a6,-(sp)
+        move.l  hdmi_v40o_window_ptr,d0
+        beq.s   p96w38_pk_done
+        move.l  d0,a2
+        move.l  WIN_UserPort(a2),d0
+        beq.s   p96w38_pk_done
+        move.l  4.w,a6
+p96w38_pk_next:
+        move.l  WIN_UserPort(a2),a0
+        jsr     GetMsg(a6)
+        tst.l   d0
+        beq.s   p96w38_pk_done
+        move.l  d0,a1
+        move.l  IMSG_Class(a1),d2
+        moveq   #0,d3
+        move.w  IMSG_Qualifier(a1),d3  ; P96W45: qualifier in the high word
+        swap    d3
+        move.w  IMSG_Code(a1),d3       ; code in the low word (cmpi.w below)
+        jsr     ReplyMsg(a6)
+        cmpi.l  #IDCMP_CLOSEWINDOW,d2
+        beq.s   p96w38_pk_stop
+        cmpi.l  #IDCMP_RAWKEY,d2
+        bne.s   p96w38_pk_vanilla
+        cmpi.w  #$0045,d3              ; raw Esc, key down only
+        beq.s   p96w38_pk_stop
+        cmpi.w  #$0040,d3              ; P96W45: raw Space, key down
+        beq.s   p96w45_pk_space
+        bra.s   p96w38_pk_next
+p96w38_pk_vanilla:
+        cmpi.l  #IDCMP_VANILLAKEY,d2
+        bne.s   p96w38_pk_next
+        cmpi.w  #$0020,d3              ; P96W45: Space
+        beq.s   p96w45_pk_space
+        cmpi.w  #$001B,d3              ; Esc
+        beq.s   p96w38_pk_stop
+        cmpi.w  #$0030,d3              ; '0'
+        bne.s   p96w38_pk_next
+p96w38_pk_stop:
+        tst.l   p96w_sync+72
+        bne.s   p96w38_pk_next
+        move.l  #1,p96w_sync+72
+        bra.s   p96w38_pk_next
+; P96W45: Space = pause/continue.  Count presses at p96w_sync+76; mrberry
+; toggles once per change and merges a RAWKEY+VANILLAKEY pair (250 ms).
+; Key auto-repeat (qualifier bit 9) is ignored.
+p96w45_pk_space:
+        btst    #25,d3                 ; qualifier bit 9 = key repeat
+        bne.s   p96w38_pk_next
+        addq.l  #1,p96w_sync+76
+        bra.s   p96w38_pk_next
+p96w38_pk_done:
+        movem.l (sp)+,d0-d3/a0-a2/a6
+        rts
+
+; P96W44: v15_poll_ctrl_c in the window (bvp_p96_mode).  The old VPr8 stop
+; (v15_stop_requested) does not fit mrberry streaming (Pi stalls, 6-s
+; timeout).  Ctrl-C (MintVID-pi [] button) is handled exactly like Esc:
+; the break bit is consumed here and only p96w_sync+72 is set (2 = Ctrl-C,
+; 1 = Esc/0/close).  W43 left the bit set; libnix read()/write() in mrberry
+; then saw it (__chkabort) and killed mrberry without CloseStream.
+; The window port is read by p96w38_poll_keys.  D0=0: no old stop.
+p96w43_poll_stop:
+        moveq   #0,d0
+        move.l  #SIGBREAKF_CTRL_C,d1
+        move.l  4.w,a6
+        jsr     SetSignal(a6)            ; read AND clear Ctrl-C
+        andi.l  #SIGBREAKF_CTRL_C,d0
+        beq.s   p96w43_ps_keys
+        tst.l   p96w_sync+72
+        bne.s   p96w43_ps_keys
+        move.l  #2,p96w_sync+72
+p96w43_ps_keys:
+        jsr     p96w38_poll_keys
+        moveq   #0,d0
+        movem.l (sp)+,d1-d2/a6
+        rts
+
+; SendVideo entry in the window.  Shared RAM CPU-owned on entry and exit.
+p96w_clk_maybe:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   p96w_clk_enabled
+        beq.w   p96w_cm_done
+        tst.l   p96w48_clk_frozen         ; P96W48: no queries after a pause
+        bne.w   p96w_cm_done
+        tst.l   p96w_sync+64             ; P96W36: mrberry NOSYNC -> no queries
+        bne.w   p96w_cm_done
+        cmpi.l  #2,p96w_sync+60
+        beq.w   p96w_cm_done
+        tst.l   n73_first_pcm_published
+        beq.w   p96w_cm_done
+        tst.l   n73_clock_armed
+        beq.w   p96w_cm_done
+        jsr     vpv98_read_sys_us
+        move.l  d0,d2
+        tst.l   p96w_clk_started
+        bne.s   p96w_cm_started
+        move.l  #1,p96w_clk_started
+        add.l   #P96W_CLK_START_US,d0
+        move.l  d0,p96w_clk_next_sys
+        bra.w   p96w_cm_done
+p96w_cm_started:
+        tst.l   p96w_clk_pending
+        beq.s   p96w_cm_free
+        move.l  d2,d0
+        sub.l   p96w_clk_req_sys,d0
+        cmpi.l  #P96W_CLK_TIMEOUT_US,d0
+        bcs.w   p96w_cm_done
+        clr.l   p96w_clk_pending
+        addq.l  #1,p96w_sync+52
+        cmpi.l  #5,p96w_sync+52
+        bcs.w   p96w_cm_done
+        move.l  #2,p96w_sync+60          ; too many lost replies: give up
+        bra.w   p96w_cm_done
+p96w_cm_free:
+        move.l  d2,d0
+        sub.l   p96w_clk_next_sys,d0
+        bmi.w   p96w_cm_done
+        move.l  d2,d0
+        add.l   #P96W_CLK_PERIOD_US,d0
+        cmpi.l  #25,p96w_sync+36
+        bcs.s   p96w_cm_fast
+        add.l   #P96W_CLK_SLOW_US-P96W_CLK_PERIOD_US,d0
+p96w_cm_fast:
+        move.l  d0,p96w_clk_next_sys
+        jsr     bvp_engine_env
+        jsr     dma_post_all
+        move.l  #48,d0
+        jsr     h26a_reserve_tx
+        tst.l   d0
+        bne.w   p96w_cm_off
+        move.l  a2,a0
+        moveq   #11,d7
+p96w_cm_clear:
+        clr.l   (a0)+
+        dbra    d7,p96w_cm_clear
+        move.l  a2,a0
+        move.l  #VCHIQ_MSG_DATA,d0
+        or.l    v12f_local_bits,d0
+        move.l  mmal_remote_port,d1
+        and.l   #$00000fff,d1
+        or.l    d1,d0
+        jsr     store_le32
+        lea     4(a2),a0
+        moveq   #40,d0
+        jsr     store_le32
+        lea     8(a2),a0
+        move.l  #MMAL_MAGIC,d0
+        jsr     store_le32
+        lea     12(a2),a0
+        move.l  #MMAL_PORT_PARAMETER_GET,d0
+        jsr     store_le32
+        move.l  p96w_sync+36,d0
+        andi.l  #$0000ffff,d0
+        ori.l   #P96W_CLK_CTX,d0
+        move.l  d0,p96w_clk_ctx
+        lea     20(a2),a0
+        jsr     store_le32
+        move.l  vpv116_clock_handle,d0
+        move.l  vpv117_clock_port0,d1
+        tst.l   p96w_sync+60
+        beq.s   p96w_cm_port_ok
+        move.l  vpv01_audio_handle,d0
+        move.l  vpv117_audio_clock_port,d1
+p96w_cm_port_ok:
+        lea     32(a2),a0
+        jsr     store_le32
+        lea     36(a2),a0
+        move.l  d1,d0
+        jsr     store_le32
+        lea     40(a2),a0
+        move.l  #MMAL_PARAMETER_CLOCK_TIME,d0
+        jsr     store_le32
+        lea     44(a2),a0
+        moveq   #16,d0
+        jsr     store_le32
+        add.l   #48,port_tx_pos
+        move.l  slot_ptr,a0
+        lea     SLAVE_TXPOS(a0),a0
+        move.l  port_tx_pos,d0
+        jsr     store_le32
+        jsr     vpv98_read_sys_us
+        move.l  d0,p96w_clk_req_sys
+        move.l  #1,p96w_clk_pending
+        addq.l  #1,p96w_sync+36
+        jsr     p96w12_kick              ; flush + doorbell (DMA-owned)
+        jsr     dma_post_all
+        bra.s   p96w_cm_done
+p96w_cm_off:
+        move.l  #2,p96w_sync+60
+p96w_cm_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; From h19_mmal_data with A2 = message (8-byte VCHIQ header first).
+p96w_clk_reply:
+        movem.l d1-d3,-(sp)
+        lea     20(a2),a0
+        jsr     load_le32
+        move.l  d0,d1
+        andi.l  #$ffff0000,d1
+        cmpi.l  #P96W_CLK_CTX,d1
+        bne.w   p96w_cr_out              ; not ours
+        tst.l   p96w_clk_pending
+        beq.w   p96w_cr_out              ; late reply after a timeout
+        cmp.l   p96w_clk_ctx,d0
+        bne.w   p96w_cr_out
+        clr.l   p96w_clk_pending
+        jsr     vpv98_read_sys_us
+        move.l  d0,d3
+        sub.l   p96w_clk_req_sys,d0      ; round trip
+        cmp.l   p96w_sync+56,d0
+        bls.s   p96w_cr_rtt
+        move.l  d0,p96w_sync+56
+p96w_cr_rtt:
+        lsr.l   #1,d0
+        add.l   p96w_clk_req_sys,d0
+        move.l  d0,d3                    ; sample time = middle of round trip
+        move.l  bulk_rx_size,d0
+        cmpi.l  #44,d0
+        bcs.s   p96w_cr_fail
+        lea     32(a2),a0
+        jsr     load_le32
+        move.l  d0,p96w_sync+48
+        tst.l   d0
+        bne.s   p96w_cr_fail
+        lea     48(a2),a0
+        jsr     load_le32
+        move.l  d0,d1                    ; media time hi
+        bmi.s   p96w_cr_fail             ; MMAL_TIME_UNKNOWN / negative
+        lea     44(a2),a0
+        jsr     load_le32
+        move.l  d1,p96w_sync+8
+        move.l  d0,p96w_sync+12
+        move.l  d3,p96w_sync+16
+        addq.l  #1,p96w_sync+40
+        addq.l  #1,p96w_sync+4
+        bra.s   p96w_cr_out
+p96w_cr_fail:
+        addq.l  #1,p96w_sync+44
+        tst.l   p96w_sync+40
+        bne.s   p96w_cr_out              ; worked before: keep this port
+        addq.l  #1,p96w_sync+60          ; clock comp -> audio_render -> off
+p96w_cr_out:
+        movem.l (sp)+,d1-d3
+        jmp     h19_consume
+
+; After a window blit: output_current_pts_* is the frame just shown.
+p96w_disp_sample:
+        tst.l   bvp_p96_mode
+        beq.s   p96w_ds_done
+        movem.l d0,-(sp)
+        move.l  output_current_pts_hi,d0
+        bmi.s   p96w_ds_skip
+        move.l  d0,p96w_sync+24
+        move.l  output_current_pts_lo,p96w_sync+28
+        jsr     vpv98_read_sys_us
+        move.l  d0,p96w_sync+32
+        addq.l  #1,p96w_sync+20
+p96w_ds_skip:
+        movem.l (sp)+,d0
+p96w_ds_done:
+        rts
+
+; CloseStream: no new queries; let an outstanding reply arrive first so no
+; later synchronous teardown step mistakes it for its own answer.
+p96w_clk_close:
+        movem.l d0-d2,-(sp)
+        jsr     p96w_ring_free            ; P96W37
+        clr.l   p96w_clk_enabled
+        tst.l   bvp_p96_mode
+        beq.s   p96w_cc_done
+        ; P96W34: after a backend error the RX stream is not trustworthy;
+        ; do not dispatch anything more here (W33 hung/crashed in this loop).
+        tst.l   v10h_error_seen
+        bne.s   p96w_cc_drop
+        ; P96W39: same after a 6-s transfer timeout.  The VideoCore stopped
+        ; answering, so a pending clock reply never comes and polling the
+        ; dead RX stream crashed mrberry (W38 W:75: line-F exception).
+        tst.l   p96w_wait_timeouts
+        bne.s   p96w_cc_drop
+        move.l  #200,d2
+p96w_cc_loop:
+        move.l  #9,p96w_where        ; P96W33 hang marker
+        tst.l   p96w_clk_pending
+        beq.s   p96w_cc_done
+        jsr     p96w9_idle_poll
+        jsr     short_delay
+        subq.l  #1,d2
+        bne.s   p96w_cc_loop
+p96w_cc_drop:
+        tst.l   p96w_clk_pending
+        beq.s   p96w_cc_done
+        clr.l   p96w_clk_pending
+        addq.l  #1,p96w_sync+52
+p96w_cc_done:
+        movem.l (sp)+,d0-d2
+        rts
+
+; ----------------------------------------------------------------------------
+; P96W37: hold finished window frames in host RAM until the Pi audio clock
+; reaches their PTS, then draw them.  The VideoCore transport stays exactly as
+; in NOSYNC (proven stable); only the P96 blit happens later.  W32-W36 moved
+; mrberry's feed instead and that made the old VCHIQ stall much more likely.
+; p96w_sync+64: mrberry NOSYNC (no clock -> draw at once, ring unused)
+; p96w_sync+68: AV offset in us (signed, + = picture later), from mrberry.
+; ----------------------------------------------------------------------------
+P96W_RING_SLOTS      equ 16
+P96W_PRESENT_LEAD_US equ 8000          ; draw up to 8 ms before the audio clock
+P96W_RING_MAX_US     equ 2000000       ; hold longer than 2 s = bogus, draw
+
+; D0 out: 0 = frame copied into the ring (caller skips the blit), 1 = draw now.
+p96w_frame_ready:
+        tst.l   bvp_p96_mode
+        beq.w   p96w_fr_now
+        tst.l   p96w_clk_enabled
+        beq.w   p96w_fr_now
+        tst.l   p96w_sync+64              ; NOSYNC
+        bne.w   p96w_fr_now
+        tst.l   p96w_ring_off
+        bne.w   p96w_fr_now
+        tst.l   p96w_sync+4               ; no audio clock sample yet
+        beq.w   p96w_fr_now
+        tst.l   output_current_pts_hi
+        bmi.w   p96w_fr_now               ; frame without PTS
+        movem.l d1-d7/a0-a6,-(sp)
+        move.l  output_bulk_actual,d5
+        beq.w   p96w_fr_now_pop
+        tst.l   p96w_ring_size
+        bne.s   p96w_fr_have_mem
+        move.l  d5,d0
+        jsr     p96w_ring_alloc
+        tst.l   d0
+        bne.w   p96w_fr_disable
+p96w_fr_have_mem:
+        cmp.l   p96w_ring_size,d5
+        bhi.w   p96w_fr_disable           ; window size changed: stop holding
+        ; ring full -> draw the oldest frame now to make room
+        cmpi.l  #P96W_RING_SLOTS,p96w_ring_count
+        bcs.s   p96w_fr_room
+        addq.l  #1,p96w_ring_forced
+        jsr     p96w_draw_head
+p96w_fr_room:
+        move.l  p96w_ring_head,d1
+        add.l   p96w_ring_count,d1
+        andi.l  #P96W_RING_SLOTS-1,d1
+        lsl.l   #2,d1
+        lea     p96w_ring_ptr,a0
+        move.l  0(a0,d1.l),a1             ; destination slot
+        lea     p96w_ring_pts_lo,a0
+        move.l  output_current_pts_lo,0(a0,d1.l)
+        lea     p96w_ring_pts_hi,a0
+        move.l  output_current_pts_hi,0(a0,d1.l)
+        lea     p96w_ring_len,a0
+        move.l  d5,0(a0,d1.l)
+        move.l  output_data_ptr,a0
+        move.l  d5,d0
+        lsr.l   #5,d0                     ; 32 bytes per pass
+        beq.s   p96w_fr_tail
+p96w_fr_copy:
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        move.l  (a0)+,(a1)+
+        subq.l  #1,d0
+        bne.s   p96w_fr_copy
+p96w_fr_tail:
+        move.l  d5,d0
+        andi.l  #31,d0
+        beq.s   p96w_fr_copied
+p96w_fr_tb:
+        move.b  (a0)+,(a1)+
+        subq.l  #1,d0
+        bne.s   p96w_fr_tb
+p96w_fr_copied:
+        addq.l  #1,p96w_ring_count
+        addq.l  #1,p96w_ring_queued
+        move.l  p96w_ring_count,d0
+        cmp.l   p96w_ring_peak,d0
+        bls.s   p96w_fr_pk
+        move.l  d0,p96w_ring_peak
+p96w_fr_pk:
+        movem.l (sp)+,d1-d7/a0-a6
+        jsr     p96w_present
+        moveq   #0,d0
+        rts
+p96w_fr_disable:
+        move.l  #1,p96w_ring_off
+p96w_fr_now_pop:
+        movem.l (sp)+,d1-d7/a0-a6
+p96w_fr_now:
+        moveq   #1,d0
+        rts
+
+; D0 = slot size.  Allocates all slots (Fast RAM).  D0 out 0 ok, 1 fail.
+p96w_ring_alloc:
+        movem.l d1-d4/a0-a1/a6,-(sp)
+        addi.l  #15,d0
+        andi.l  #$fffffff0,d0
+        move.l  d0,d4
+        move.l  bvp_libbase_global,a0
+        move.l  BVP_SYSBASE(a0),a6
+        moveq   #0,d3
+p96w_ra_loop:
+        move.l  d4,d0
+        move.l  #MEMF_FAST,d1
+        jsr     AllocMem(a6)
+        tst.l   d0
+        beq.s   p96w_ra_fail
+        lea     p96w_ring_ptr,a0
+        move.l  d3,d2
+        lsl.l   #2,d2
+        move.l  d0,0(a0,d2.l)
+        addq.l  #1,d3
+        cmpi.l  #P96W_RING_SLOTS,d3
+        bcs.s   p96w_ra_loop
+        move.l  d4,p96w_ring_size
+        moveq   #0,d0
+        bra.s   p96w_ra_done
+p96w_ra_fail:
+        move.l  d4,p96w_ring_size         ; free what we got
+        jsr     p96w_ring_free
+        moveq   #1,d0
+p96w_ra_done:
+        movem.l (sp)+,d1-d4/a0-a1/a6
+        rts
+
+p96w_ring_free:
+        movem.l d0-d3/a0-a1/a6,-(sp)
+        move.l  p96w_ring_size,d3
+        beq.s   p96w_rf_done
+        move.l  bvp_libbase_global,a0
+        move.l  BVP_SYSBASE(a0),a6
+        moveq   #0,d2
+p96w_rf_loop:
+        lea     p96w_ring_ptr,a0
+        move.l  d2,d1
+        lsl.l   #2,d1
+        move.l  0(a0,d1.l),d0
+        beq.s   p96w_rf_next
+        clr.l   0(a0,d1.l)
+        move.l  d0,a1
+        move.l  d3,d0
+        jsr     FreeMem(a6)
+p96w_rf_next:
+        addq.l  #1,d2
+        cmpi.l  #P96W_RING_SLOTS,d2
+        bcs.s   p96w_rf_loop
+        clr.l   p96w_ring_size
+p96w_rf_done:
+        clr.l   p96w_ring_count
+        clr.l   p96w_ring_head
+        movem.l (sp)+,d0-d3/a0-a1/a6
+        rts
+
+; Draw every frame whose time has come; if several are due, show only the
+; newest (the older ones are dropped).  Saves all registers.
+p96w_present:
+        tst.l   p96w_ring_count
+        bne.s   p96w_pr_go
+        rts
+p96w_pr_go:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   p96w_in_present
+        bne.w   p96w_pr_out              ; no recursion via the blit path
+        move.l  #1,p96w_in_present
+p96w_pr_loop:
+        tst.l   p96w_ring_count
+        beq.w   p96w_pr_end
+        ; audio clock now (low 32 bits are enough for the comparison)
+        jsr     vpv98_read_sys_us
+        sub.l   p96w_sync+16,d0
+        add.l   p96w_sync+12,d0
+        move.l  d0,d6                    ; audio media time now
+        move.l  p96w_ring_head,d1
+        lsl.l   #2,d1
+        lea     p96w_ring_pts_lo,a0
+        move.l  0(a0,d1.l),d2
+        add.l   p96w_sync+68,d2           ; AV offset
+        sub.l   d6,d2                     ; >0: still early
+        cmpi.l  #P96W_RING_MAX_US,d2
+        bgt.s   p96w_pr_draw              ; bogus wait: draw
+        cmpi.l  #P96W_PRESENT_LEAD_US,d2
+        bgt.w   p96w_pr_end               ; not yet
+        ; due.  Is the next one due as well?  Then drop this one.
+        cmpi.l  #2,p96w_ring_count
+        bcs.s   p96w_pr_draw
+        move.l  p96w_ring_head,d1
+        addq.l  #1,d1
+        andi.l  #P96W_RING_SLOTS-1,d1
+        lsl.l   #2,d1
+        lea     p96w_ring_pts_lo,a0
+        move.l  0(a0,d1.l),d2
+        add.l   p96w_sync+68,d2
+        sub.l   d6,d2
+        cmpi.l  #P96W_PRESENT_LEAD_US,d2
+        bgt.s   p96w_pr_draw
+        addq.l  #1,p96w_ring_dropped
+        jsr     p96w_pop_head
+        bra.w   p96w_pr_loop
+p96w_pr_draw:
+        jsr     p96w_draw_head
+        bra.w   p96w_pr_loop
+p96w_pr_end:
+        clr.l   p96w_in_present
+p96w_pr_out:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+p96w_pop_head:
+        move.l  d0,-(sp)
+        move.l  p96w_ring_head,d0
+        addq.l  #1,d0
+        andi.l  #P96W_RING_SLOTS-1,d0
+        move.l  d0,p96w_ring_head
+        subq.l  #1,p96w_ring_count
+        move.l  (sp)+,d0
+        rts
+
+; Blit the oldest ring frame with the normal window blit.  Saves all regs.
+p96w_draw_head:
+        movem.l d0-d7/a0-a6,-(sp)
+        move.l  output_data_ptr,-(sp)
+        move.l  output_current_pts_lo,-(sp)
+        move.l  output_current_pts_hi,-(sp)
+        move.l  p96w_ring_head,d1
+        lsl.l   #2,d1
+        lea     p96w_ring_ptr,a0
+        move.l  0(a0,d1.l),output_data_ptr
+        lea     p96w_ring_pts_lo,a0
+        move.l  0(a0,d1.l),output_current_pts_lo
+        lea     p96w_ring_pts_hi,a0
+        move.l  0(a0,d1.l),output_current_pts_hi
+        jsr     bvp_engine_env
+        jsr     t31s_stream_current_frame
+        jsr     p96w_disp_sample
+        addq.l  #1,p96w_ring_shown
+        move.l  (sp)+,output_current_pts_hi
+        move.l  (sp)+,output_current_pts_lo
+        move.l  (sp)+,output_data_ptr
+        jsr     p96w_pop_head
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; P96W34: details of the message that broke the dispatcher (error path only).
+p96w_log_err:
+        movem.l d0/a1,-(sp)
+        move.l  v10h_error_status,d0
+        lea     p96w_pfx_e_status,a1
+        jsr     n15_log_hex32
+        move.l  bulk_rx_msgid,d0
+        lea     p96w_pfx_e_msgid,a1
+        jsr     n15_log_hex32
+        move.l  bulk_rx_size,d0
+        lea     p96w_pfx_e_size,a1
+        jsr     n15_log_hex32
+        move.l  buffer_mmal_type,d0
+        lea     p96w_pfx_e_type,a1
+        jsr     n15_log_hex32
+        move.l  buffer_drv_context,d0
+        lea     p96w_pfx_e_ctx,a1
+        jsr     n15_log_hex32
+        move.l  buffer_cmd,d0
+        lea     p96w_pfx_e_cmd,a1
+        jsr     n15_log_hex32
+        move.l  p96w_where,d0
+        lea     p96w_pfx_e_where,a1
+        jsr     n15_log_hex32
+        move.l  p96w_clk_pending,d0
+        lea     p96w_pfx_e_clk,a1
+        jsr     n15_log_hex32
+        movem.l (sp)+,d0/a1
+        jsr     p96w_dump_state
+        rts
+
+; P96W35: write the whole P96STAT table into N79_TRACE (error paths only).
+p96w_dump_state:
+        movem.l d0-d2/a0-a3,-(sp)
+        lea     p96w_msg_dump,a1
+        jsr     n12_log
+        lea     p96w_diag+4,a3
+p96w_dump_loop:
+        move.l  (a3)+,d1                 ; kind
+        cmpi.l  #-1,d1
+        beq.s   p96w_dump_done
+        move.l  (a3)+,a1                 ; name
+        move.l  (a3)+,a2                 ; address
+        move.l  (a3)+,d2                 ; offset
+        tst.l   d1
+        bne.s   p96w_dump_le
+        move.l  (a2),d0
+        bra.s   p96w_dump_put
+p96w_dump_le:
+        move.l  (a2),a0
+        adda.l  d2,a0
+        jsr     load_le32
+p96w_dump_put:
+        jsr     n15_log_hex32
+        bra.s   p96w_dump_loop
+p96w_dump_done:
+        movem.l (sp)+,d0-d2/a0-a3
+        rts
+
+p96w_clk_log:
+        tst.l   bvp_p96_mode
+        beq.s   p96w_cl_done
+        movem.l d0/a1,-(sp)
+        move.l  p96w_sync+36,d0
+        lea     p96w_pfx_clk_req,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+40,d0
+        lea     p96w_pfx_clk_ok,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+44,d0
+        lea     p96w_pfx_clk_fail,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+48,d0
+        lea     p96w_pfx_clk_status,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+52,d0
+        lea     p96w_pfx_clk_timeout,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+56,d0
+        lea     p96w_pfx_clk_rtt,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+60,d0
+        lea     p96w_pfx_clk_port,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+20,d0
+        lea     p96w_pfx_clk_disp,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_queued,d0
+        lea     p96w_pfx_r_q,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_shown,d0
+        lea     p96w_pfx_r_s,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_dropped,d0
+        lea     p96w_pfx_r_d,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_forced,d0
+        lea     p96w_pfx_r_f,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_peak,d0
+        lea     p96w_pfx_r_p,a1
+        jsr     n15_log_hex32
+        move.l  p96w_ring_off,d0
+        lea     p96w_pfx_r_o,a1
+        jsr     n15_log_hex32
+        move.l  p96w_sync+72,d0
+        lea     p96w_pfx_win_stop,a1
+        jsr     n15_log_hex32
+        move.l  p96w41_rescues,d0
+        lea     p96w_pfx_rescue,a1
+        jsr     n15_log_hex32
+        move.l  p96w47_shifts,d0
+        lea     p96w_pfx_shift,a1
+        jsr     n15_log_hex32
+        move.l  p96w49_cal_n,d0
+        lea     p96w_pfx_p49cal,a1
+        jsr     n15_log_hex32
+        move.l  p96w49_k,d0
+        lea     p96w_pfx_p49k,a1
+        jsr     n15_log_hex32
+        move.l  p96w49_applies,d0
+        lea     p96w_pfx_p49app,a1
+        jsr     n15_log_hex32
+        move.l  p96w49_corr_max,d0
+        lea     p96w_pfx_p49max,a1
+        jsr     n15_log_hex32
+        movem.l (sp)+,d0/a1
+p96w_cl_done:
+        rts
+
+        section p96w_data,data
+p96w_msg_window_mode: dc.b "P96W WINDOW MODE (ISP BGR24 -> P96)",0
+p96w_pfx_mode:        dc.b "P96W CLI_MODE=",0
+p96w_pfx_clk_req:     dc.b "P96W32 CLK_REQUESTS=",0
+p96w_pfx_r_q:         dc.b "P96W37 HOLD_QUEUED=",0
+p96w_pfx_r_s:         dc.b "P96W37 HOLD_SHOWN=",0
+p96w_pfx_r_d:         dc.b "P96W37 HOLD_DROPPED_LATE=",0
+p96w_pfx_r_f:         dc.b "P96W37 HOLD_FORCED_FULL=",0
+p96w_pfx_r_p:         dc.b "P96W37 HOLD_PEAK=",0
+p96w_pfx_r_o:         dc.b "P96W37 HOLD_OFF=",0
+p96w_pfx_win_stop:    dc.b "P96W38 WINDOW_STOP=",0
+p96w_pfx_rescue:      dc.b "P96W41 RX_RESCUES=",0
+p96w_pfx_shift:       dc.b "P96W47 PACER_SHIFTS=",0
+p96w_pfx_p49cal:      dc.b "P96W49 CAL_SAMPLES=",0
+p96w_pfx_p49k:        dc.b "P96W49 K_US=",0
+p96w_pfx_p49app:      dc.b "P96W49 RESYNCS=",0
+p96w_pfx_p49max:      dc.b "P96W49 MAX_CORR_US=",0
+p96w_msg_dump:        dc.b "P96W35 STATE DUMP (same as P96STAT):",0
+p96w_pfx_e_status:    dc.b "P96W34 ERR STATUS=",0
+p96w_pfx_e_msgid:     dc.b "P96W34 ERR LAST_MSGID=",0
+p96w_pfx_e_size:      dc.b "P96W34 ERR LAST_SIZE=",0
+p96w_pfx_e_type:      dc.b "P96W34 ERR LAST_MMAL_TYPE=",0
+p96w_pfx_e_ctx:       dc.b "P96W34 ERR LAST_CONTEXT=",0
+p96w_pfx_e_cmd:       dc.b "P96W34 ERR LAST_CMD=",0
+p96w_pfx_e_where:     dc.b "P96W34 ERR WHERE=",0
+p96w_pfx_e_clk:       dc.b "P96W34 ERR CLK_PENDING=",0
+p96w_pfx_clk_ok:      dc.b "P96W32 CLK_REPLIES=",0
+p96w_pfx_clk_fail:    dc.b "P96W32 CLK_FAILURES=",0
+p96w_pfx_clk_status:  dc.b "P96W32 CLK_LAST_STATUS=",0
+p96w_pfx_clk_timeout: dc.b "P96W32 CLK_TIMEOUTS=",0
+p96w_pfx_clk_rtt:     dc.b "P96W32 CLK_RTT_MAX_US=",0
+p96w_pfx_clk_port:    dc.b "P96W32 CLK_PORT_MODE=",0
+p96w_pfx_clk_disp:    dc.b "P96W32 DISPLAYED_FRAMES=",0
+        cnop    0,2
+
+; P96W33: table for the P96STAT tool (libbase+124).  Entries: kind, name,
+; address, offset.  kind 0 = long at address, kind 1 = little-endian long at
+; (*address)+offset (VCHIQ shared slot memory), -1 = end.
+        cnop    0,4
+p96w_diag:
+        dc.l    $50393644                ; 'P96D'
+        dc.l    0,p96wd_n01,p96w_where,0
+        dc.l    0,p96wd_n02,p96w_spin,0
+        dc.l    0,p96wd_n03,t8c_display_frame_total,0
+        dc.l    0,p96wd_n04,input_bulk_pending,0
+        dc.l    0,p96wd_n05,output_bulk_queued,0
+        dc.l    0,p96wd_n06,output_bulk_done,0
+        dc.l    0,p96wd_n07,output_deferred_count,0
+        dc.l    0,p96wd_n08,vpv39_audio_bulk_pending,0
+        dc.l    0,p96wd_n09,n65_audio_pending,0
+        dc.l    0,p96wd_n10,n66_video_pending,0
+        dc.l    0,p96wd_n11,vpv47_inflight,0
+        dc.l    0,p96wd_n12,input_in_use_count,0
+        dc.l    0,p96wd_n13,p96w_async_pending,0
+        dc.l    0,p96wd_n14,p96w_clk_pending,0
+        dc.l    0,p96wd_n15,vpv66_audio_returns,0
+        dc.l    0,p96wd_n16,n30_pcm_submits,0
+        dc.l    0,p96wd_n17,bvp_wait_count,0
+        dc.l    0,p96wd_n18,port_rx_pos,0
+        dc.l    0,p96wd_n19,port_tx_pos,0
+        dc.l    1,p96wd_n20,slot_ptr,MASTER_TXPOS
+        dc.l    1,p96wd_n21,slot_ptr,MASTER_TRIG_ARM
+        dc.l    0,p96wd_n22,p96w_sync+36,0
+        dc.l    0,p96wd_n23,p96w_sync+40,0
+        dc.l    0,p96wd_n24,output_eos_seen,0
+        dc.l    0,p96wd_n25,output_current_idx,0
+        dc.l    0,p96wd_n26,output_bulk_len,0
+        dc.l    0,p96wd_n27,output_frame_bytes_expected,0
+        dc.l    0,p96wd_n28,output_buffer_seen,0
+        dc.l    0,p96wd_n29,rx_recycle_total,0
+        dc.l    1,p96wd_n30,slot_ptr,MASTER_RECYCLEQ
+        dc.l    1,p96wd_n31,slot_ptr,MASTER_RECYCLE_ARM
+        dc.l    1,p96wd_n32,slot_ptr,SLAVE_RECYCLEQ
+        dc.l    1,p96wd_n33,slot_ptr,SLAVE_FIRST
+        dc.l    1,p96wd_n34,slot_ptr,SLAVE_LAST
+        dc.l    1,p96wd_n35,slot_ptr,MASTER_FIRST
+        dc.l    1,p96wd_n36,slot_ptr,MASTER_LAST
+        dc.l    0,p96wd_n37,h26a_padding_count,0
+        dc.l    0,p96wd_n38,p96w_wait_timeouts,0
+        dc.l    0,p96wd_n39,bulk_rx_msgid,0
+        dc.l    0,p96wd_n40,buffer_mmal_type,0
+        dc.l    0,p96wd_n41,p96w_ring_count,0
+        dc.l    0,p96wd_n42,p96w_ring_shown,0
+        dc.l    0,p96wd_n43,p96w41_rescues,0
+        dc.l    -1
+p96wd_n01: dc.b "where (1 vid-submit 2 vid-bulk 3 pacer 4 dispatch 5 force 6 aud-submit 7 aud-bulk 8 aud-cpu1 9 close)",0
+p96wd_n02: dc.b "busy-wait ticks",0
+p96wd_n03: dc.b "frames shown",0
+p96wd_n04: dc.b "video BULK_TX pending",0
+p96wd_n05: dc.b "frame BULK_RX queued",0
+p96wd_n06: dc.b "frame BULK_RX done",0
+p96wd_n07: dc.b "frame headers waiting",0
+p96wd_n08: dc.b "audio BULK_TX pending",0
+p96wd_n09: dc.b "PCM block waiting",0
+p96wd_n10: dc.b "video AU waiting",0
+p96wd_n11: dc.b "audio blocks at Pi",0
+p96wd_n12: dc.b "decoder inputs in use",0
+p96wd_n13: dc.b "CPU1 audio job running",0
+p96wd_n14: dc.b "clock reply pending",0
+p96wd_n15: dc.b "audio returns",0
+p96wd_n16: dc.b "PCM blocks sent",0
+p96wd_n17: dc.b "wait counter",0
+p96wd_n18: dc.b "host RX pos",0
+p96wd_n19: dc.b "host TX pos",0
+p96wd_n20: dc.b "Pi TX pos",0
+p96wd_n21: dc.b "Pi doorbell armed",0
+p96wd_n22: dc.b "clock requests",0
+p96wd_n23: dc.b "clock replies",0
+p96wd_n24: dc.b "decoder EOS seen",0
+p96wd_n25: dc.b "frame buffer index",0
+p96wd_n26: dc.b "frame BULK_RX length",0
+p96wd_n27: dc.b "frame bytes expected",0
+p96wd_n28: dc.b "frame header seen",0
+p96wd_n29: dc.b "host RX slots recycled",0
+p96wd_n30: dc.b "Pi RX recycle queue",0
+p96wd_n31: dc.b "Pi waits for recycle",0
+p96wd_n32: dc.b "host TX slots recycled by Pi",0
+p96wd_n33: dc.b "host TX first slot",0
+p96wd_n34: dc.b "host TX last slot",0
+p96wd_n35: dc.b "Pi TX first slot",0
+p96wd_n36: dc.b "Pi TX last slot",0
+p96wd_n37: dc.b "TX paddings",0
+p96wd_n38: dc.b "window wait timeouts",0
+p96wd_n39: dc.b "last msgid",0
+p96wd_n40: dc.b "last MMAL type",0
+p96wd_n41: dc.b "frames waiting for the sound",0
+p96wd_n42: dc.b "held frames shown",0
+p96wd_n43: dc.b "RX rescues (W41)",0
+        cnop    0,2
+
+        section p96w_bss,bss
+p96w_async_on:        ds.l 1
+p96w_async_pending:   ds.l 1
+p96w_async_bytes:     ds.l 1
+p96w_async_pts_lo:    ds.l 1
+p96w_async_pts_hi:    ds.l 1
+p96w_coll_bytes:      ds.l 1
+p96w_coll_samples:    ds.l 1
+p96w_coll_pts_lo:     ds.l 1
+p96w_coll_pts_hi:     ds.l 1
+p96w_coll_force:      ds.l 1
+p96w12_empty:         ds.l 1
+p96w20_fast:          ds.l 1
+p96w_clk_enabled:     ds.l 1
+p96w_clk_started:     ds.l 1
+p96w_clk_pending:     ds.l 1
+p96w_clk_req_sys:     ds.l 1
+p96w_clk_next_sys:    ds.l 1
+p96w_clk_ctx:         ds.l 1
+p96w_where:           ds.l 1
+p96w_wait_start:      ds.l 1
+p96w_wait_timeouts:   ds.l 1
+p96w41_rescues:       ds.l 1
+p96w_ring_count:      ds.l 1
+p96w_ring_head:       ds.l 1
+p96w_ring_size:       ds.l 1
+p96w_ring_off:        ds.l 1
+p96w_ring_queued:     ds.l 1
+p96w_ring_shown:      ds.l 1
+p96w_ring_dropped:    ds.l 1
+p96w_ring_forced:     ds.l 1
+p96w_ring_peak:       ds.l 1
+p96w_in_present:      ds.l 1
+p96w_ring_ptr:        ds.l 16
+p96w_ring_pts_lo:     ds.l 16
+p96w_ring_pts_hi:     ds.l 16
+p96w_ring_len:        ds.l 16
+p96w_spin:            ds.l 1
+p96w_sync:            ds.l 20
+        cnop    0,4
+p96w_stage:           ds.b VPV48_FAAD_INPUT_SIZE
+
+
+; ===========================================================================
+; CLK81 (22.10.2026) - test: cinema without audio.  Without ConfigAudio the
+; scheduler graph waits forever for the Audio-Master clock.  Here, at the
+; first pending video AU (no buffer in flight yet), the central clock is
+; built WITHOUT audio_render, tunnelled to the scheduler only, and started
+; free-running: CLOCK_REFERENCE + CLOCK_ACTIVE on clock port 1 (scale stays
+; 1.0).  The scheduler then shows frames by PTS.  No clock queries later.
+; ===========================================================================
+        section n81_code,code
+n81_try_free_clock:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   n81_tried
+        bne.w   n81_try_done
+        move.l  #1,n81_tried
+        tst.l   n9_audio_ready            ; audio path: never here
+        bne.w   n81_try_done
+        move.l  bvp_libbase_global,a0
+        tst.l   BVP_STREAM_FLAGS(a0)      ; P96 window: not this test
+        bne.w   n81_try_done
+        lea     n81_msg_begin,a1
+        jsr     n12_log
+        move.l  component_handle,n81_save_comp
+        move.l  input_port_handle,n81_save_input
+        move.l  port_query_type,n81_save_qtype
+        move.l  port_query_index,n81_save_qidx
+        clr.l   n81_ok
+        move.l  #1,n81_free_mode
+        move.l  #1,vpv116_clock_probe_done
+        jsr     vpv116_probe_clock_component
+        clr.l   n81_free_mode
+        move.l  n81_save_comp,component_handle
+        move.l  n81_save_input,input_port_handle
+        move.l  n81_save_qtype,port_query_type
+        move.l  n81_save_qidx,port_query_index
+        move.l  vpv117_graph_probe_ok,d0
+        lea     n81_pfx_graph,a1
+        jsr     n15_log_hex32
+        move.l  vpv122_sched_clock_tunnel_ok,d0
+        lea     n81_pfx_tunnel,a1
+        jsr     n15_log_hex32
+        move.l  vpv126_sched_clock_armed,d0
+        lea     n81_pfx_sched_clock,a1
+        jsr     n15_log_hex32
+        move.l  vpv126_sched_component_enabled,d0
+        lea     n81_pfx_sched_comp,a1
+        jsr     n15_log_hex32
+        move.l  n81_st_comp,d0
+        lea     n81_pfx_st_comp,a1
+        jsr     n15_log_hex32
+        move.l  n81_st_ref,d0
+        lea     n81_pfx_st_ref,a1
+        jsr     n15_log_hex32
+        move.l  n81_st_act,d0
+        lea     n81_pfx_st_act,a1
+        jsr     n15_log_hex32
+        move.l  n81_st_sact,d0
+        lea     n81_pfx_st_sact,a1
+        jsr     n15_log_hex32
+        tst.l   vpv117_graph_probe_ok
+        beq.s   n81_try_fail
+        tst.l   vpv122_sched_clock_tunnel_ok
+        beq.s   n81_try_fail
+        tst.l   vpv126_sched_clock_armed
+        beq.s   n81_try_fail
+        tst.l   vpv126_sched_component_enabled
+        beq.s   n81_try_fail
+        tst.l   n81_ok
+        beq.s   n81_try_fail
+        move.l  #1,n73_clock_armed
+        move.l  #1,n81_active
+        jsr     vpv98_read_sys_us
+        move.l  d0,n81_hb_last
+        lea     n81_msg_ok,a1
+        jsr     n12_log
+        bra.s   n81_try_done
+n81_try_fail:
+        lea     n81_msg_fail,a1
+        jsr     n12_log
+n81_try_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; Enable the clock component, then make clock port 1 the reference and
+; start it.  If the source port refuses ACTIVE, try the scheduler's own
+; clock port.  n81_ok = 1 when ACTIVE was accepted somewhere.
+n81_free_clock_start:
+        movem.l d0-d7/a0-a3,-(sp)
+        move.l  #$FFFFFFFF,n81_st_comp
+        move.l  #$FFFFFFFF,n81_st_ref
+        move.l  #$FFFFFFFF,n81_st_act
+        move.l  #$FFFFFFFF,n81_st_sact
+        tst.l   vpv126_sched_clock_armed
+        beq.w   n81_fcs_done
+        move.l  vpv116_clock_handle,component_handle
+        move.l  v12f_local_bits,port_query_index
+        move.l  #MMAL_COMPONENT_ENABLE,d0
+        jsr     v9_component_cmd
+        move.l  d0,n81_st_comp
+        move.l  vpv116_clock_handle,d0
+        move.l  vpv117_clock_port1,d1
+        move.l  #MMAL_PARAMETER_CLOCK_REFERENCE,d2
+        moveq   #1,d3
+        jsr     vpv124_set_clock_bool
+        bsr     n81_param_result
+        move.l  d1,n81_st_ref
+        move.l  vpv116_clock_handle,d0
+        move.l  vpv117_clock_port1,d1
+        move.l  #MMAL_PARAMETER_CLOCK_ACTIVE,d2
+        moveq   #1,d3
+        jsr     vpv124_set_clock_bool
+        bsr     n81_param_result
+        move.l  d1,n81_st_act
+        tst.l   d0
+        beq.s   n81_fcs_ok
+        move.l  vpv117_sched_handle,d0
+        move.l  vpv117_sched_clock0,d1
+        move.l  #MMAL_PARAMETER_CLOCK_ACTIVE,d2
+        moveq   #1,d3
+        jsr     vpv124_set_clock_bool
+        bsr     n81_param_result
+        move.l  d1,n81_st_sact
+        tst.l   d0
+        bne.s   n81_fcs_done
+n81_fcs_ok:
+        move.l  #1,n81_ok
+        jsr     vpv98_read_sys_us
+        move.l  d0,n81_active_sys
+n81_fcs_done:
+        movem.l (sp)+,d0-d7/a0-a3
+        rts
+
+; d0 from vpv124_set_clock_bool -> d1: 0 = OK, else the MMAL status of
+; the reply, or $EEEE0001 when no valid reply came back.  d0 unchanged.
+n81_param_result:
+        moveq   #0,d1
+        tst.l   d0
+        beq.s   n81_pr_done
+        move.l  vpv124_param_status,d1
+        bne.s   n81_pr_done
+        move.l  #$EEEE0001,d1
+n81_pr_done:
+        rts
+
+; CLK81 test heartbeat: while a SendVideo waits in the N69 dispatcher, log
+; once per second how often it looped and how often video service ran.
+n81_heartbeat:
+        tst.l   n81_active
+        beq.s   n81_hb_rts
+        movem.l d0-d1/a1,-(sp)
+        jsr     vpv98_read_sys_us
+        move.l  d0,d1
+        sub.l   n81_hb_last,d1
+        cmpi.l  #1000000,d1
+        bcs.s   n81_hb_done
+        move.l  d0,n81_hb_last
+        move.l  n69_dispatch_loops,d0
+        lea     n81_pfx_hb_loops,a1
+        jsr     n15_log_hex32
+        move.l  n66_video_service_calls,d0
+        lea     n81_pfx_hb_vsvc,a1
+        jsr     n15_log_hex32
+n81_hb_done:
+        movem.l (sp)+,d0-d1/a1
+n81_hb_rts:
+        rts
+
+        section n81_data,data
+n81_pfx_hb_loops: dc.b "CLK81 HB WAIT_LOOPS=",0
+n81_pfx_hb_vsvc:  dc.b "CLK81 HB VIDEO_SERVICE_CALLS=",0
+n81_msg_begin: dc.b "CLK81_FREE_CLOCK_BEGIN (cinema, no audio)",0
+n81_msg_ok:    dc.b "CLK81_FREE_CLOCK_ARMED",0
+n81_msg_fail:  dc.b "CLK81_FREE_CLOCK_FAILED",0
+n81_pfx_graph: dc.b "CLK81 GRAPH_OK=",0
+n81_pfx_tunnel: dc.b "CLK81 CLOCK1_SCHED_TUNNEL=",0
+n81_pfx_sched_clock: dc.b "CLK81 SCHED_CLOCK_ENABLED=",0
+n81_pfx_sched_comp: dc.b "CLK81 SCHED_COMPONENT=",0
+n81_pfx_st_comp: dc.b "CLK81 CLOCK_COMPONENT_ENABLE_ST=",0
+n81_pfx_st_ref: dc.b "CLK81 CLOCK1_REFERENCE_ST=",0
+n81_pfx_st_act: dc.b "CLK81 CLOCK1_ACTIVE_ST=",0
+n81_pfx_st_sact: dc.b "CLK81 SCHED_CLOCK0_ACTIVE_ST=",0
+        even
 
         end

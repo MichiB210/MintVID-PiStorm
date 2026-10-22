@@ -38,10 +38,11 @@ includes it in full (MIT licence). MintVID's own README is in
 | | Format | Decoded by | Output |
 |---|---|---|---|
 | Video | **H.264 / AVC up to 1920x1080** | Raspberry Pi VideoCore (MMAL) | HDMI hard full screen ("PiStorm / VC Hard Fullscreen", mrberry), real time, A/V sync |
-| Video | same | Raspberry Pi VideoCore (MMAL) | P96 window on the Workbench ("PiStorm / VC Hard Fenster", VPberry); AAC and AC3 only |
+| Video | same | Raspberry Pi VideoCore (MMAL) | P96 window on the Workbench ("PiStorm / VC Hard Fenster", mrberry W=10/25/50/75) |
 | Audio | **AAC-LC** | FAAD2 on CPU1 of the Pi | stereo PCM over the Pi's HDMI |
 | Audio | **AC3 (Dolby Digital)**, up to 5.1 | liba52 on CPU1 | stereo downmix over HDMI |
 | Audio | **E-AC3 (Dolby Digital Plus)**, stereo | FFmpeg on CPU1 | stereo PCM over HDMI |
+| Audio | AAC, MP3, MP2, AC3, PCM | Amiga (Paula player by Darren 'boingball' Banfi) | Paula, full screen only ("PiStorm / VC Hard Fullscreen (Paula)", mrberry PAULA) |
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
 
 Multichannel E-AC3 (5.1) is refused, because the CPU1 decoder is not fast
@@ -54,22 +55,27 @@ From the Shell:
 
     mrberry movie.mkv
 
-Or from the MintVID GUI: pick a film and choose the display mode
-**PiStorm / VC Hard Fullscreen** (MintVID starts mrberry) or
-**PiStorm / VC Hard Fenster** (MintVID starts VPberry in a window).
+Window, start time, resume and Paula sound:
 
-VPberry can also be used on its own from the Shell, with window sizes,
-start time and resume:
+    mrberry movie.mkv W=50
+    mrberry movie.mkv T=1:10
+    mrberry movie.mkv R
+    mrberry movie.mkv PAULA
 
-    VPberry movie.mkv W:50 T:01:10:00
+Or with the GUI **MintVID-pi**: pick a film and choose the display mode
+**PiStorm / VC Hard Fullscreen**, **PiStorm / VC Hard Fenster** or
+**PiStorm / VC Hard Fullscreen (Paula)**. MintVID-pi has Play/Pause,
+Stop, a time line and ">>" to jump to the time set on the slider.
+The Paula sound offset base is set in the menu ("Paula sound base");
+during playback + and - fine-tune it per film.
 
-See [`pistorm/vpberry/README.md`](pistorm/vpberry/README.md). All other MintVID playback modes work
-as in upstream MintVID.
+Since v96.76 VPberry is no longer needed. All other MintVID playback
+modes work as in upstream MintVID.
 
 ## Installation
 
-1. Copy `mrberry`, `VPberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the same drawer.
-   - Add `MintVID` too if you want the GUI.
+1. Copy `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the same drawer.
+   - Add `MintVID-pi` too if you want the GUI.
 2. **Required:** replace the Emu68 kernel on the PiStorm's SD card (`Emu68-pistorm`) with the patched `Emu68-pistorm-BerryCore`.
    - This is Emu68 1.0.7 for PiStorm Classic / Raspberry Pi 3A+, with the BerryCore service on CPU1.
    - Without it, nothing plays.
@@ -96,7 +102,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 | Part | Directory |
 |---|---|
 | mrberry | `pistorm/mrberry` |
-| VPberry (window player) | `pistorm/vpberry` |
+| VPberry (old window player, not needed since v96.76) | `pistorm/vpberry` |
 | berryvp.library (68k assembler) | `pistorm/berryvp_library` |
 | CPU1 audio modules | `pistorm/modules` |
 | Emu68 BerryCore kernel patch | `pistorm/emu68_berrycore` |
@@ -104,7 +110,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released P35
+This builds all runtime files and compares them with the released v96.76
 binaries. Tools needed:
 
 - m68k-amigaos-gcc
@@ -137,7 +143,8 @@ Details are in [`pistorm/LICENSES.md`](pistorm/LICENSES.md) and
 **Deutsch:** MintVID-PiStorm spielt H.264-Videos bis 1080p in Echtzeit und
 synchron auf einem Amiga mit PiStorm ab:
 
-- Das Bild entschlüsselt die VideoCore des Raspberry Pi. Es erscheint als Vollbild am HDMI-Ausgang des Pi oder im P96-Fenster auf der Workbench (VPberry, AAC und AC3).
+- Das Bild entschlüsselt die VideoCore des Raspberry Pi. Es erscheint als Vollbild am HDMI-Ausgang des Pi oder im P96-Fenster auf der Workbench (mrberry).
+- Im Vollbild kann der Ton auch über Paula laufen (Paula-Player von Darren 'boingball' Banfi).
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
 
 **Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.

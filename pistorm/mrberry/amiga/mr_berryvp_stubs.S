@@ -154,3 +154,28 @@ ac309i_read_sys_us:
 	swap %d0
 	ror.w #8,%d0
 	rts
+
+/* P96W45: BVP_Control(cmd) - LVO -78, D0 = command. */
+	.globl _bvp_call_control
+	.globl bvp_call_control
+_bvp_call_control:
+bvp_call_control:
+	move.l %a6,-(%sp)
+	movea.l 8(%sp),%a6
+	move.l 12(%sp),%d0
+	jsr -78(%a6)
+	movea.l (%sp)+,%a6
+	rts
+
+/* P96W47: BVP_Control(cmd, arg) - D0 = command, D1 = argument. */
+	.globl _bvp_call_control2
+	.globl bvp_call_control2
+_bvp_call_control2:
+bvp_call_control2:
+	move.l %a6,-(%sp)
+	movea.l 8(%sp),%a6
+	move.l 12(%sp),%d0
+	move.l 16(%sp),%d1
+	jsr -78(%a6)
+	movea.l (%sp)+,%a6
+	rts

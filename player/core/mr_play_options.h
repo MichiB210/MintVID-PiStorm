@@ -72,7 +72,11 @@ typedef enum {
      * MintVID display value keeps its numeric meaning. The classic mrplay
      * executable never receives this selector. */
     MR_DISPLAY_PISTORM_HARD_FULLSCREEN,
-    MR_DISPLAY_PISTORM_HARD_WINDOW
+    MR_DISPLAY_PISTORM_HARD_WINDOW,
+    /* MintVID-pi P96W59: Michael's h264rgb (Pi decodes H.264, picture as
+     * HAM6 192x144 on the Amiga's own RGB output, no sound). */
+    MR_DISPLAY_PISTORM_RGB,
+    MR_DISPLAY_PISTORM_PAULA   /* P96W71: cinema, sound through Paula */
 } mr_display_mode;
 
 typedef enum {

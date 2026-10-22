@@ -4,6 +4,7 @@
  * on ARM CPU1 and sent as PCM16 to MMAL audio_render/HDMI. */
 #include "../core/mr_demux.h"
 #include "mr_berryvp.h"
+#include "mrb_paula.h"
 #include <exec/types.h>
 #include <dos/dos.h>
 #include <intuition/intuition.h>
@@ -131,26 +132,73 @@ static int p05_input_open(void)
     return p05_input_window != NULL;
 }
 
+static FILE *n76_hostlog;
+static void n76_hlog(const char *s);
+
+/* P96W38: the library's P96 video window takes the keyboard focus when it
+ * opens or is clicked.  The library then reports Esc / 0 / close gadget in
+ * its sync block (libbase+120, 'P96S', long 18 = byte offset 72). */
+static int p96w38_window_stop(void)
+{
+    unsigned long v;
+    if (!g_bvp.lib) return 0;
+    v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
+    if (!v || ((volatile unsigned long *)v)[0] != 0x50393653UL) return 0;   /* 'P96S' */
+    return ((volatile unsigned long *)v)[18] != 0;
+}
+
+/* P96W44: libnix read()/write() call __chkabort(), which ends the program
+ * on Ctrl-C without closing the BerryVP stream (window stays, Pi stuck).
+ * mrberry checks Ctrl-C itself and always stops through CloseStream. */
+void __chkabort(void)
+{
+}
+
+/* P96W45: pause.  Space in mrberry's 1x1 input window (cinema) is noted
+ * here by p05_input_poll_stop. */
+static int p45_key_space;
+
+/* P96W70: Paula sound offset = fixed base (-500 ms) + fine value per film.
+ * The fine value comes from AV= (Shell), else from the film's .t (P:ms),
+ * else 0; '+'/'-' change it by 50 ms while the film plays; it is written
+ * to the .t as P:ms. */
+static long p70_key_delta;
+static long p70_fine_ms;
+static int p70_fine_changed;
 static int p05_input_poll_stop(void)
 {
     struct IntuiMessage *msg;
     int stop = 0;
 
+    if (p96w38_window_stop()) {
+        static int p96w38_logged;
+        if (!p96w38_logged) { p96w38_logged = 1; n76_hlog("P96W38_WINDOW_STOP"); }
+        return 1;
+    }
     if (!p05_input_window || !p05_input_window->UserPort)
         return 0;
 
     while ((msg = (struct IntuiMessage *)GetMsg(p05_input_window->UserPort)) != NULL) {
         ULONG cls = msg->Class;
         UWORD code = msg->Code;
+        UWORD qual = msg->Qualifier;
         ReplyMsg((struct Message *)msg);
 
         if (cls == IDCMP_RAWKEY) {
             /* Amiga raw key 0x45 = ESC. Ignore key-up (bit 7 set). */
             if ((code & 0x80u) == 0 && ((code & 0x7fu) == 0x45u))
                 stop = 1;
+            /* P96W45: raw 0x40 = Space (key down, no auto-repeat) */
+            if (code == 0x40u && !(qual & IEQUALIFIER_REPEAT))
+                p45_key_space = 1;
         } else if (cls == IDCMP_VANILLAKEY) {
             if (code == 0x1bu || code == '0')
                 stop = 1;
+            if (code == ' ' && !(qual & IEQUALIFIER_REPEAT))
+                p45_key_space = 1;
+            /* P96W70: Paula fine offset, 50 ms per press */
+            if (code == '+') p70_key_delta += 50;
+            if (code == '-') p70_key_delta -= 50;
         }
     }
     return stop;
@@ -232,7 +280,6 @@ static void p06_status_write(LONG state, const char *codec, const char *text)
     }
 }
 
-static FILE *n76_hostlog;
 static void n76_hlog(const char *s)
 {
     if (n76_hostlog) { fputs(s, n76_hostlog); fputc('\n', n76_hostlog); fflush(n76_hostlog); }
@@ -245,7 +292,101 @@ typedef struct n73_video_node {
     int has_pts;
     uint64_t pts_us;
     int is_annexb;
+    int nonref;   /* P96W3: every VCL NAL has nal_ref_idc == 0 */
 } n73_video_node;
+
+/* P96W3: 1 when this access unit is safe to drop (contains slices, and no
+ * slice is used as a reference).  Unknown/odd packets count as reference. */
+static int p96w_au_is_nonref(const uint8_t *d, uint32_t n, int annexb,
+                             unsigned ls)
+{
+    uint32_t i = 0;
+    int vcl = 0;
+    if (!d || !n) return 0;
+    if (annexb) {
+        while (i + 3 < n) {
+            uint32_t sc;
+            if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1) sc = 3;
+            else if (i + 4 < n && d[i] == 0 && d[i+1] == 0 && d[i+2] == 0 && d[i+3] == 1) sc = 4;
+            else { i++; continue; }
+            i += sc;
+            if (i >= n) break;
+            {
+                unsigned t = d[i] & 31u;
+                if (t >= 1 && t <= 5) {
+                    vcl = 1;
+                    if (t == 5 || (d[i] & 0x60u)) return 0;
+                }
+            }
+        }
+        return vcl;
+    }
+    if (ls < 1 || ls > 4) return 0;
+    while (i + ls < n) {
+        uint32_t len = 0, k;
+        for (k = 0; k < ls; k++) len = (len << 8) | d[i + k];
+        i += ls;
+        if (!len || len > n - i) return 0;
+        {
+            unsigned t = d[i] & 31u;
+            if (t >= 1 && t <= 5) {
+                vcl = 1;
+                if (t == 5 || (d[i] & 0x60u)) return 0;
+            }
+        }
+        i += len;
+    }
+    return vcl;
+}
+static unsigned long p96w_dropped;
+/* P96W5: keep audio ahead of the window video.
+ * prefill: before the first AU is sent, read until ~0.8 s of audio is known.
+ * audio-first: a due AU waits while the audio read position is less than
+ * 0.4 s ahead of the playback clock, so the demux reads more audio first. */
+static int p96w_have_vpts, p96w_have_apts, p96w_prefill_done, p96w_drain;
+static uint64_t p96w_first_vpts, p96w_last_apts;
+static unsigned long p96w_audio_first_holds;
+#define P96W_PREFILL_US   800000ULL
+#define P96W_AUDIO_LEAD_US 400000ULL
+#define P96W_HOLD_MAX_Q   60u   /* P96W27: +0.45 s of frames for the AV delay */
+#define P96W_READ_AHEAD_Q 72u   /* P96W27: was 48; stop demux only above this */
+#define P96W_DROP_LATE_US 83000u   /* drop only when ~2 frames late */
+/* P96W26: the Pi plays sound ~0.45 s after it is handed over; the cinema
+ * scheduler knows that, the host-paced window does not, so window frames are
+ * ~0.4-0.5 s early (phone-measured with SyncTest2 at W:25/50/75).
+ * P96W30: delaying the host pacer is NOT a reliable fix - the effective shift
+ * was 1x (SyncTest2 W:50), 2x (SyncTest2 W:75, plus a hang) and ~2.7x
+ * (trailerDE W:25: 0.45 s -> 1.2 s), and Michael found trailerDE W:50 better
+ * without it.  Default 0; AV:<ms> stays as an experiment switch.  A real fix
+ * must delay presentation in the library, not the feed. */
+#define P96W_AV_DELAY_DEFAULT_US 0
+/* P96W37: AV:<ms> is handed to berryvp.library (signed, + = picture later);
+ * the library holds finished frames until the Pi audio clock is there.
+ * mrberry's own feed timing is never moved any more (W32-W36 did, and that
+ * made the old VideoCore stall much more frequent). */
+static long p96w_av_delay_us = P96W_AV_DELAY_DEFAULT_US;
+
+/* P96W32: window A/V sync on the Pi's audio clock.
+ * The library publishes at libbase+120 a small block (see berryvp.library.s,
+ * p96w_sync): the Pi audio-clock media time with the 1-MHz system time it was
+ * sampled at, and the PTS + system time of the frame last drawn into the
+ * window.  We compare both on the same system timer and move our own frame
+ * grid (pace->base_us) until the shown frame matches the sound.  One large
+ * step at the start, then small corrections.  AV:<ms> = picture this much
+ * later than the sound clock; NOSYNC = old behaviour (host time only). */
+static volatile unsigned long *p96s;
+static int p96s_off;            /* NOSYNC: no clock queries, no shift */
+static int p96s_measure = 1;    /* P96W37: mrberry only measures; the library holds frames */
+static unsigned long p96s_last_seq, p96s_samples, p96s_used, p96s_corrections;
+static long p96s_first_err, p96s_last_err, p96s_min_err, p96s_max_err, p96s_shift;
+static long p96s_init_err[3];
+static long p96s_hist[3];
+static unsigned p96s_hist_n;
+static int p96s_init_n, p96s_init_done;
+static uint32_t p96s_settle_until;
+#define P96S_LOG_MAX 48
+static long p96s_log_t[P96S_LOG_MAX], p96s_log_e[P96S_LOG_MAX];
+static unsigned p96s_log_n;
 
 static n73_video_node *n73_vhead, *n73_vtail;
 static unsigned long n73_vqueued;
@@ -264,6 +405,13 @@ static int n73_queue_video(const mr_packet *pkt)
     n->has_pts = pkt->has_pts;
     n->pts_us = pkt->pts_us;
     n->is_annexb = pkt->is_annexb;
+    if (mr_berryvp_stream_flags && !p96w_have_vpts && pkt->has_pts) {
+        p96w_first_vpts = pkt->pts_us;
+        p96w_have_vpts = 1;
+    }
+    n->nonref = mr_berryvp_stream_flags ?
+        p96w_au_is_nonref(pkt->data, pkt->len, pkt->is_annexb,
+                          g_bvp.avc.nal_length_size) : 0;
     if (n73_vtail) n73_vtail->next = n; else n73_vhead = n;
     n73_vtail = n;
     n73_vqueued++;
@@ -369,6 +517,197 @@ static void ac309i_pacer_init(ac309i_pacer *p, const mr_video_info *vi, int enab
     p->enabled = 1;
 }
 
+/* P96W58: Ctrl-F = stop for the MintVID-pi "Fullscreen" button.  Same as a
+ * stop (Ctrl-C), but the .t position is written without the 30-s recap, so
+ * the cinema restart continues right where the window film was. */
+static int p58_switch;
+static int p58_stop_sig(ULONG sig)
+{
+    if (sig & SIGBREAKF_CTRL_F) p58_switch = 1;
+    return (sig & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_F)) != 0;
+}
+
+/* ---- P96W45: pause (Space / MintVID-pi "||" = Ctrl-D) ------------------
+ * Like VPr8's SPACE-PAUSE: nothing new is read or sent while paused; what is
+ * already at the Pi plays out.  In the window the library is kept alive with
+ * BVP_Control(IDLE) (callbacks, clock replies, window keys).  On continue
+ * every wall-clock anchor moves forward by the pause, so no frames are
+ * "caught up".  Esc / 0 / close / Ctrl-C end the film also while paused. */
+#define P45_CTRL_IDLE 5
+extern LONG bvp_call_control(struct Library *base, ULONG cmd);
+extern LONG bvp_call_control2(struct Library *base, ULONG cmd, ULONG arg);
+#define P47_CTRL_TIMESHIFT 6
+#define P68_CTRL_CLOCKSTART 7
+static unsigned long p45_win_space_seen;
+static uint32_t p45_last_toggle_us;
+static int p45_have_toggle;
+static unsigned long p45_pauses;
+static uint32_t p45_paused_total_us;
+static char p45_status_text[128];
+static int p63_noaudio;           /* P96W63: NOAUDIO = play without sound */
+/* P96W67: PAULA = sound through the Amiga (Darren Banfi's mrb_paula module),
+ * picture on the Pi with its own free-running clock (CLK81), as NOAUDIO. */
+static int p67_paula, p67_low, p67_mono;
+static mrb_paula *p67_pa;
+/* P96W69/W73: Paula base offset.  W69: built-in -500 ms; W73: Michael set
+ * -350 ms as the built-in value, and MintVID-pi's menu can change it
+ * (ENVARC:MintVID-pi.paula, text "-350"; same reader as
+ * player/amiga/mr_paula_pref.h).  The per-film fine value is added. */
+static long p73_base_ms = -350L;
+#define P69_PAULA_DEFAULT_AV_US (p73_base_ms * 1000L)
+static void p73_base_load(void)
+{
+    char text[16];
+    BPTR f = Open((CONST_STRPTR)"ENVARC:MintVID-pi.paula", MODE_OLDFILE);
+    LONG got;
+    long v;
+    if (!f) return;
+    got = Read(f, text, (LONG)sizeof text - 1);
+    Close(f);
+    if (got <= 0) return;
+    text[got] = 0;
+    v = strtol(text, NULL, 10);
+    if (v >= -1000L && v <= 0L) p73_base_ms = v;
+}
+static int p69_av_set;
+static int p70_used;               /* Paula was really playing (for .t) */
+static int p67_anchored;
+#define P67_FREE (p63_noaudio || p67_paula)   /* no HDMI audio, Pi clock alone */
+static void p67_cleanup(void)
+{
+    if (p67_pa) { mrb_paula_close(p67_pa); p67_pa = NULL; }
+}
+static void p70_apply_keys(void);
+static unsigned long p66_lead_ms = 1000; /* P96W66: NOAUDIO feed lead (LEAD=ms) */
+static int p45_no_idle;          /* P96W46: PIDLE0 = no library calls while paused */
+
+static int p45_pause_requested(void)
+{
+    int req = 0;
+    uint32_t now;
+
+    if (p45_key_space) { p45_key_space = 0; req = 1; }
+    if (g_bvp.lib) {
+        unsigned long v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
+        if (v && ((volatile unsigned long *)v)[0] == 0x50393653UL) {   /* 'P96S' */
+            unsigned long c = ((volatile unsigned long *)v)[19];       /* +76 */
+            if (c != p45_win_space_seen) { p45_win_space_seen = c; req = 1; }
+        }
+    }
+    if (bvp_exec_setsignal(0, SIGBREAKF_CTRL_D) & SIGBREAKF_CTRL_D) req = 1;
+    if (!req) return 0;
+    if (P67_FREE) return 0;   /* P96W67: no pause yet with the free Pi clock */
+    /* one key press may arrive as RAWKEY and VANILLAKEY: merge (250 ms) */
+    now = (uint32_t)ac309i_read_sys_us();
+    if (p45_have_toggle && (uint32_t)(now - p45_last_toggle_us) < 250000u) return 0;
+    p45_last_toggle_us = now;
+    p45_have_toggle = 1;
+    return 1;
+}
+
+/* Returns 1 when the user stopped the film during the pause. */
+static int p45_pause_loop(ac309i_pacer *pace, uint32_t *eac3_wall)
+{
+    uint32_t t0 = (uint32_t)ac309i_read_sys_us(), dt;
+    int stop = 0;
+    char line[64];
+
+    n76_hlog("P45_PAUSE_ON");
+    p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", "Paused");
+    for (;;) {
+        Delay(2);
+        if (g_bvp.lib && !p45_no_idle) bvp_call_control(g_bvp.lib, P45_CTRL_IDLE);
+        if (p05_input_poll_stop() ||
+            p58_stop_sig(bvp_exec_setsignal(0, 0))) { stop = 1; break; }
+        if (p45_pause_requested()) break;
+    }
+    dt = (uint32_t)ac309i_read_sys_us() - t0;
+    pace->base_us += dt;
+    /* P96W47: the library's own window pacer must move with ours */
+    if (g_bvp.lib) bvp_call_control2(g_bvp.lib, P47_CTRL_TIMESHIFT, dt);
+    if (eac3_wall) *eac3_wall += dt;
+    p45_pauses++;
+    p45_paused_total_us += dt;
+    snprintf(line, sizeof line, "P45_PAUSE_OFF ms=%lu stop=%d",
+             (unsigned long)(dt / 1000u), stop);
+    n76_hlog(line);
+    if (!stop)
+        p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", p45_status_text);
+    return stop;
+}
+
+/* ---- P96W46: soft pause in the window ----------------------------------
+ * W45 stopped the picture at once, but the sound already sent to the Pi
+ * (0.4-0.8 s ahead) kept playing.  After "continue" the sound clock was then
+ * ahead of the picture (seen: 0.1-0.5 s), and the Pi bulk hang came much more
+ * often (87-MB film 4 of 5 runs) - like W32-W36, where the picture also ran
+ * behind the sound.  Now, as at the film start:
+ *   1. pause key: no more audio is sent (it is kept in the P04 queue); the
+ *      picture keeps running until it reaches the last sound already sent
+ *      (max 3 s) - picture and sound stop at the same film position;
+ *   2. pause loop (as W45);
+ *   3. continue: first one picture, then the kept audio (like P04 at start).
+ * Cinema: unchanged (immediate pause). */
+static int p45_phase;            /* 0 play, 1 draining to the pause point */
+static int p45_hold_audio;       /* audio packets go to the P04 queue */
+static int p45_flush_pending;
+static unsigned long p45_sent_mark;
+static uint64_t p45_audio_end;
+static uint32_t p45_drain_start;
+
+/* 0 = go on, 1 = user stop, 2 = audio send error */
+static int p45_service(mr_berryvp *bvp, ac309i_pacer *pace, uint32_t *eac3_wall,
+                       unsigned long sent, unsigned long *audio_sent)
+{
+    int req = p45_pause_requested();
+    uint32_t now = (uint32_t)ac309i_read_sys_us();
+
+    if (req) {
+        if (p45_phase == 1) {
+            /* second key press while draining: continue at once */
+            p45_phase = 0;
+            p45_flush_pending = 1;
+            p45_sent_mark = sent ? sent - 1 : 0;
+            n76_hlog("P46_DRAIN_CANCEL");
+            p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", p45_status_text);
+        } else if (mr_berryvp_stream_flags && pace->started &&
+                   p96w_have_apts && p96w_have_vpts && !p45_flush_pending) {
+            p45_phase = 1;
+            p45_hold_audio = 1;
+            p45_audio_end = p96w_last_apts;
+            p45_drain_start = now;
+            n76_hlog("P46_DRAIN_START");
+            p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", "Paused");
+        } else {
+            if (p45_pause_loop(pace, eac3_wall)) return 1;
+        }
+    }
+    if (p45_phase == 1) {
+        uint64_t now_media = p96w_first_vpts + (uint64_t)(uint32_t)(now - pace->base_us);
+        uint32_t waited = now - p45_drain_start;
+        if (now_media >= p45_audio_end || waited >= 3000000u) {
+            char line[80];
+            snprintf(line, sizeof line, "P46_DRAIN_DONE ms=%lu", (unsigned long)(waited / 1000u));
+            n76_hlog(line);
+            p45_phase = 0;
+            if (p45_pause_loop(pace, eac3_wall)) return 1;
+            p45_flush_pending = 1;
+            p45_sent_mark = sent;
+        }
+    }
+    if (p45_flush_pending && sent > p45_sent_mark) {
+        mr_status st;
+        char line[80];
+        snprintf(line, sizeof line, "P46_AUDIO_RESUME queued=%lu", p04_aqueued);
+        n76_hlog(line);
+        p45_flush_pending = 0;
+        p45_hold_audio = 0;
+        st = p04_flush_audio_queue(bvp, audio_sent);
+        if (st != MR_OK) return 2;
+    }
+    return 0;
+}
+
 static int ac309i_video_due(const ac309i_pacer *p, uint32_t *elapsed_out)
 {
     uint32_t elapsed, feed_deadline;
@@ -396,6 +735,9 @@ static void ac309i_commit_video_deadline(ac309i_pacer *p, FILE *log)
         p->target_us = ac309i_next_interval(p);
         p->sent_aus = 1;
         if (log) {
+            if (mr_berryvp_stream_flags)
+                fprintf(log, "P96W37_AV_US=%ld SYNC=%s\n", p96w_av_delay_us,
+                        p96s_off ? "off" : "library-hold");
             fprintf(log,
                     "AC309I_PACE_ANCHOR base=$%08lx next=%lu lead=%lu step=%lu rem=%lu/%lu\n",
                     (unsigned long)p->base_us, (unsigned long)p->target_us,
@@ -417,7 +759,8 @@ static void ac309i_commit_video_deadline(ac309i_pacer *p, FILE *log)
     }
     p->target_us += ac309i_next_interval(p);
     p->sent_aus++;
-    if (log && ((p->sent_aus & 255u) == 0u || (elapsed >= 45000000u && (p->sent_aus & 31u) == 0u))) {
+    if (log && (mr_berryvp_stream_flags ? (p->sent_aus & 1023u) == 0u :
+                ((p->sent_aus & 255u) == 0u || (elapsed >= 45000000u && (p->sent_aus & 31u) == 0u)))) {
         fprintf(log,
                 "AC309I_PACE sent=%lu elapsed=%lu next=%lu lead=%lu queue=%lu feedlate=%lu maxfeedlate=%lu latecnt=%lu\n",
                 p->sent_aus, (unsigned long)elapsed, (unsigned long)p->target_us,
@@ -425,6 +768,98 @@ static void ac309i_commit_video_deadline(ac309i_pacer *p, FILE *log)
                 (unsigned long)p->max_late_us, p->late_count);
         fflush(log);
     }
+}
+
+static long p96s_median3(long a, long b, long c)
+{
+    if (a > b) { long t = a; a = b; b = t; }
+    if (b > c) { long t = b; b = c; c = t; }
+    if (a > b) { long t = a; a = b; b = t; }
+    return b;
+}
+
+static void p96w_sync_update(ac309i_pacer *pace)
+{
+    volatile unsigned long *s;
+    uint64_t clk, disp;
+    int32_t dt;
+    int64_t e64;
+    long e, corr;
+    uint32_t now, elapsed;
+    if (!mr_berryvp_stream_flags) return;
+    if (!p96s) {
+        unsigned long v;
+        if (!g_bvp.lib) return;
+        v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
+        if (!v || ((volatile unsigned long *)v)[0] != 0x50393653UL) return;   /* 'P96S' */
+        p96s = (volatile unsigned long *)v;
+        if (p96s_off) p96s[16] = 1;               /* P96W36: library must not ask */
+        p96s[17] = (unsigned long)p96w_av_delay_us; /* P96W37: AV offset for the hold */
+    }
+    if (p96s_off || !pace->enabled || !pace->started) return;
+    s = p96s;
+    if (s[1] == p96s_last_seq) return;          /* no new clock sample */
+    p96s_last_seq = s[1];
+    if (!s[5]) return;                          /* nothing shown yet */
+    clk  = ((uint64_t)s[2] << 32) | (uint64_t)s[3];
+    disp = ((uint64_t)s[6] << 32) | (uint64_t)s[7];
+    dt = (int32_t)(uint32_t)(s[8] - s[4]);      /* display time - clock time */
+    if (dt > 1000000 || dt < -1000000) return;  /* samples too far apart */
+    /* >0: the shown frame is ahead of the sound -> show later. */
+    e64 = (int64_t)disp - ((int64_t)clk + dt) + (int64_t)p96w_av_delay_us;
+    if (e64 > 5000000 || e64 < -5000000) return;
+    e = (long)e64;
+    p96s_samples++;
+    now = (uint32_t)ac309i_read_sys_us();
+    elapsed = now - pace->base_us;
+    if (p96s_log_n < P96S_LOG_MAX && (p96s_samples <= 30 || (p96s_samples % 25) == 0)) {
+        p96s_log_t[p96s_log_n] = (long)(elapsed / 1000u);
+        p96s_log_e[p96s_log_n] = e / 1000;
+        p96s_log_n++;
+    }
+    if (p96s_samples == 1) { p96s_first_err = e; p96s_min_err = e; p96s_max_err = e; }
+    p96s_last_err = e;
+    if (e < p96s_min_err) p96s_min_err = e;
+    if (e > p96s_max_err) p96s_max_err = e;
+    if (p96s_measure) return;                   /* P96W36: only measure */
+    if ((int32_t)(now - p96s_settle_until) < 0) return;   /* pipeline still shows old frames */
+    p96s_used++;
+    if (!p96s_init_done) {
+        p96s_init_err[p96s_init_n++] = e;
+        if (p96s_init_n < 3) return;
+        p96s_init_done = 1;
+        corr = p96s_median3(p96s_init_err[0], p96s_init_err[1], p96s_init_err[2]);
+        if (corr < 20000 && corr > -20000) return;
+        if (corr > 1000000) corr = 1000000;       /* more than 1 s is not plausible */
+        if (corr < -1000000) corr = -1000000;
+    } else {
+        /* P96W33: median of the last three values ignores single outliers,
+         * and at most 8 ms per value (~40 ms/s) keeps corrections invisible. */
+        long f;
+        p96s_hist[p96s_hist_n % 3u] = e;
+        p96s_hist_n++;
+        if (p96s_hist_n < 3) return;
+        f = p96s_median3(p96s_hist[0], p96s_hist[1], p96s_hist[2]);
+        if (f < 15000 && f > -15000) return;      /* close enough */
+        corr = f / 4;
+        {
+            /* P96W34: after 25 queries the library asks only once per second,
+             * so allow a bit more per value (still <= 20 ms per second). */
+            long lim = (s[9] >= 25u) ? 20000 : 8000;
+            if (corr > lim) corr = lim;
+            if (corr < -lim) corr = -lim;
+        }
+    }
+    /* never move the grid start into the future */
+    if (corr > 0 && (uint32_t)corr + 100000u > elapsed) {
+        if (elapsed <= 100000u) return;
+        corr = (long)(elapsed - 100000u);
+    }
+    pace->base_us += (uint32_t)corr;
+    p96s_shift += corr;
+    p96s_corrections++;
+    if (corr > 50000 || corr < -50000)
+        p96s_settle_until = now + 1000000u;     /* let the queued frames pass */
 }
 
 static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
@@ -436,8 +871,51 @@ static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
         mr_packet p;
         mr_status st;
         uint32_t elapsed;
+        p96w_sync_update(pace);
+        if (mr_berryvp_stream_flags && !p96w_drain && n73_vqueued < P96W_HOLD_MAX_Q) {
+            if (!p96w_prefill_done) {
+                if (!(p96w_have_vpts && p96w_have_apts &&
+                      p96w_last_apts >= p96w_first_vpts + P96W_PREFILL_US)) break;
+                p96w_prefill_done = 1;
+                if (n76_hostlog) {
+                    fprintf(n76_hostlog, "P96W5_PREFILL_DONE queue=%lu\n", n73_vqueued);
+                    fflush(n76_hostlog);
+                }
+            } else if (pace->started && p96w_have_apts && p96w_have_vpts) {
+                /* P96W27: audio must stay ahead of REAL time as in W25, not of
+                 * the delayed picture (W26 shrank the audio cushion by the AV
+                 * delay -> dropouts and silence at W:75). */
+                uint64_t now_media = p96w_first_vpts +
+                    (uint64_t)(uint32_t)(ac309i_read_sys_us() - pace->base_us);
+                if (p96w_last_apts < now_media + P96W_AUDIO_LEAD_US) {
+                    p96w_audio_first_holds++;
+                    break;
+                }
+            }
+        }
         if (!ac309i_video_due(pace, &elapsed)) break;
         n = n73_vhead;
+        /* P96W3: in the P96 window the shared VCHIQ transport cannot always
+         * keep real time with 1080p.  When this AU is already more than two
+         * frame periods late and nothing references it, drop it: no decode,
+         * no ISP->host transfer, no blit.  The deadline grid still advances,
+         * so video catches up and audio stays in sync. */
+        if (mr_berryvp_stream_flags && n->nonref && pace->started) {
+            uint32_t fd = (pace->target_us > pace->lead_us) ?
+                (pace->target_us - pace->lead_us) : 0u;
+            /* P96W6: like VPberry, show late frames and let them catch up;
+             * drop only when really far behind. */
+            if (elapsed > fd + P96W_DROP_LATE_US) {
+                ac309i_commit_video_deadline(pace, NULL);
+                p96w_dropped++;
+                n73_vhead = n->next;
+                if (!n73_vhead) n73_vtail = NULL;
+                free(n->data);
+                free(n);
+                n73_vqueued--;
+                continue;
+            }
+        }
         memset(&p, 0, sizeof p);
         p.is_video = 1;
         p.has_pts = n->has_pts;
@@ -453,6 +931,22 @@ static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
         if (st == MR_EAGAIN) { if (skipped) (*skipped)++; }
         else if (st != MR_OK) return st;
         else if (sent) (*sent)++;
+        if (p67_pa && !p67_anchored && st == MR_OK) {
+            /* P96W67: the Pi clock (CLK81) started inside this first
+             * SendVideo at media time 0; Paula follows the same Pi timer. */
+            uint32_t t = (uint32_t)ac309i_read_sys_us();
+            /* P96W68: the library says when the Pi clock really started
+             * (BVP_CTRL_CLOCKSTART); W67 used the end of the first send. */
+            uint32_t cs = g_bvp.lib ? (uint32_t)bvp_call_control(g_bvp.lib, P68_CTRL_CLOCKSTART) : 0;
+            if (cs && (uint32_t)(t - cs) > 5000000u) cs = 0;   /* old library: error code */
+            p67_anchored = 1;
+            mrb_paula_anchor(p67_pa, cs ? cs : t, 0);
+            if (n76_hostlog) { fprintf(n76_hostlog, "P67_ANCHOR sys=%lu clockstart=%lu gap_ms=%ld first_pts_ms=%lu\n",
+                               (unsigned long)t, (unsigned long)cs,
+                               cs ? (long)((int32_t)(t - cs) / 1000) : 0L,
+                               p.has_pts ? (unsigned long)(p.pts_us / 1000ULL) : 0UL); fflush(n76_hostlog); }
+        }
+        if (p67_pa) mrb_paula_service(p67_pa);
         n73_vhead = n->next;
         if (!n73_vhead) n73_vtail = NULL;
         free(n->data);
@@ -462,9 +956,351 @@ static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
     return MR_OK;
 }
 
+/* ---- P96W50: T: start time ------------------------------------------------
+ * mrberry <film> [W=50] T=H:MM  (T=H:MM:SS too; ':' works instead of '=',
+ * so VPr8's .t lines T:HH:MM:SS / W:50 can be passed as they are).
+ * The demux jumps to the last H.264 IDR at or before T (MKV and MP4) before
+ * the Pi is touched.  From there every PTS is moved down by the IDR's PTS,
+ * so berryvp.library and the Pi see a stream that starts at 0, exactly like
+ * a normal film start.  Audio/video packets before the IDR's PTS are
+ * dropped. */
+static int p50_t_set;
+static uint64_t p50_t_us, p50_seek_us, p50_base_us;
+static int p50_have_base;
+static unsigned long p50_drop_audio, p50_drop_video;
+
+static int p50_parse_time(const char *s, uint64_t *us)
+{
+    unsigned long part[3];
+    int n = 0;
+    uint64_t sec;
+    for (;;) {
+        unsigned long v = 0;
+        int digits = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10UL + (unsigned long)(*s - '0');
+            if (++digits > 6) return 0;
+            s++;
+        }
+        if (!digits || n >= 3) return 0;
+        part[n++] = v;
+        if (*s == ':') { s++; continue; }
+        if (*s) return 0;
+        break;
+    }
+    /* P96W52: hours and minutes, seconds optional; a single number is
+     * refused (T=1 could mean seconds, minutes or hours). */
+    if (n == 1) return 0;
+    if (part[1] > 59) return 0;
+    sec = (uint64_t)part[0] * 3600U + (uint64_t)part[1] * 60U;
+    if (n == 3) {
+        if (part[2] > 59) return 0;
+        sec += part[2];
+    }
+    *us = sec * 1000000ULL;
+    return 1;
+}
+
+static void p50_fmt(char *dst, size_t size, uint64_t us)
+{
+    unsigned long s = (unsigned long)(us / 1000000ULL);
+    snprintf(dst, size, "%02lu:%02lu:%02lu", s / 3600UL, (s / 60UL) % 60UL, s % 60UL);
+}
+
+static uint64_t p54_last_vpts_raw;
+static int p54_have_raw;
+
+/* P96W62: live position for MintVID-pi's timeline.  Film time of the last
+ * video packet read (no Pi clock query - see W26-W36), written as whole
+ * seconds to T:MintVID-pi.pos every P62_STEP_US of film time.  RAM only;
+ * the .t next to the film is still written once, at stop. */
+#define P62_POS_FILE "T:MintVID-pi.pos"
+#define P62_POS_TMP  "T:MintVID-pi.pos.tmp"
+#define P62_STEP_US  10000000ULL
+static uint64_t p62_next_us;
+static int p62_have;
+static void p62_pos_clear(void)
+{
+    DeleteFile((CONST_STRPTR)P62_POS_FILE);
+    DeleteFile((CONST_STRPTR)P62_POS_TMP);
+    p62_have = 0;
+}
+static void p62_pos_write(uint64_t film_us)
+{
+    char line[24];
+    BPTR f;
+    LONG len, w;
+    if (p70_used)                    /* P96W72: + live Paula fine offset */
+        snprintf(line, sizeof line, "%lu\nP:%ld\n",
+                 (unsigned long)(film_us / 1000000ULL), p70_fine_ms);
+    else
+        snprintf(line, sizeof line, "%lu\n", (unsigned long)(film_us / 1000000ULL));
+    len = (LONG)strlen(line);
+    f = Open((CONST_STRPTR)P62_POS_TMP, MODE_NEWFILE);
+    if (!f) return;
+    w = Write(f, line, len);
+    Close(f);
+    if (w == len) {
+        DeleteFile((CONST_STRPTR)P62_POS_FILE);
+        if (!Rename((CONST_STRPTR)P62_POS_TMP, (CONST_STRPTR)P62_POS_FILE))
+            DeleteFile((CONST_STRPTR)P62_POS_TMP);
+    } else {
+        DeleteFile((CONST_STRPTR)P62_POS_TMP);
+    }
+}
+/* P96W65 test: NOAUDIO heartbeat from the main loop (N76_HOST.TXT, 1/s). */
+static void p65_hb(unsigned long sent, unsigned long queued)
+{
+    static ULONG t0, last;
+    ULONG now;
+    if (!P67_FREE || !n76_hostlog) return;
+    now = ac309i_read_sys_us();
+    if (!t0) { t0 = now; last = now; return; }
+    if (now - last < 1000000UL) return;
+    last = now;
+    fprintf(n76_hostlog, "P65_HB wall_ms=%lu sent=%lu read_pts_ms=%lu queued=%lu\n",
+            (unsigned long)((now - t0) / 1000UL), sent,
+            (unsigned long)(p54_last_vpts_raw / 1000ULL), queued);
+    fflush(n76_hostlog);
+}
+static void p70_apply_keys(void)
+{
+    long d = p70_key_delta;
+    if (!d) return;
+    p70_key_delta = 0;
+    if (!p67_pa) return;
+    p70_fine_ms += d;
+    if (p70_fine_ms > 3000) p70_fine_ms = 3000;
+    if (p70_fine_ms < -3000) p70_fine_ms = -3000;
+    p70_fine_changed = 1;
+    mrb_paula_set_offset(p67_pa, (int32_t)(P69_PAULA_DEFAULT_AV_US + p70_fine_ms * 1000L));
+    if (n76_hostlog) { fprintf(n76_hostlog, "P70_FINE_MS=%ld\n", p70_fine_ms); fflush(n76_hostlog); }
+    p62_pos_write(p54_last_vpts_raw);   /* P96W72: MintVID-pi shows it at once */
+}
+static void p62_pos_update(uint64_t film_us)
+{
+    if (p62_have && film_us < p62_next_us) return;
+    p62_pos_write(film_us);
+    p62_next_us = film_us - film_us % P62_STEP_US + P62_STEP_US;
+    p62_have = 1;
+}
+static mr_status p50_next_packet(mr_demux *d, mr_packet *pkt)
+{
+    for (;;) {
+        mr_status st = mr_demux_next_packet(d, pkt);
+        if (st == MR_OK && pkt->len && pkt->is_video && pkt->has_pts &&
+            (!p54_have_raw || pkt->pts_us > p54_last_vpts_raw)) {
+            p54_last_vpts_raw = pkt->pts_us;      /* P96W54: film time */
+            p54_have_raw = 1;
+            p62_pos_update(p54_last_vpts_raw);
+        }
+        if (st != MR_OK || !p50_t_set || !pkt->len) return st;
+        if (!p50_have_base) {
+            if (!pkt->is_video) { p50_drop_audio++; continue; }
+            p50_base_us = pkt->has_pts ? pkt->pts_us : p50_seek_us;
+            p50_have_base = 1;
+            if (n76_hostlog) {
+                fprintf(n76_hostlog, "P50_BASE_MS=%lu\n", (unsigned long)(p50_base_us / 1000U));
+                fflush(n76_hostlog);
+            }
+        }
+        if (pkt->has_pts) {
+            if (pkt->pts_us < p50_base_us) {
+                if (pkt->is_video) p50_drop_video++; else p50_drop_audio++;
+                continue;
+            }
+            pkt->pts_us -= p50_base_us;
+        }
+        return st;
+    }
+}
+
+/* ---- P96W54: .t resume file (as VPr8) -------------------------------------
+ * Stop in the middle (Esc, close gadget, Ctrl-C, MintVID-pi []) writes
+ * <film>.t next to the film (extension replaced, Supergirl.mkv ->
+ * Supergirl.t):
+ *     T:HH:MM:SS      position 30 s before the stop point
+ *     W:50 | W:C      window size or cinema
+ *     A:HDMI | A:NONE sound output (P96W55; A:PAULA reserved for later)
+ * P96W55: the file stays after the natural end of the film (Michael: a hint
+ * that the film / episode was already watched).  "mrberry <film> R" (or
+ * RESUME) reads it; T=/W= given on the command line win over the file. */
+#define P54_RECAP_US (30ULL * 1000000ULL)
+
+static void p54_name(char *dst, size_t size, const char *film)
+{
+    size_t n = strlen(film), i, dot = (size_t)-1;
+    if (n + 3 > size) n = size - 3;
+    memcpy(dst, film, n);
+    dst[n] = 0;
+    for (i = 0; i < n; i++) {
+        if (dst[i] == ':' || dst[i] == '/') dot = (size_t)-1;
+        else if (dst[i] == '.') dot = i;
+    }
+    if (dot != (size_t)-1) dst[dot] = 0;
+    strcat(dst, ".t");
+}
+
+/* 1 = file found; *t_us / *window (-1 = no W line, 0 = cinema) filled */
+static char p55_audio_read[16];        /* A: value of the last .t read */
+
+static long p70_t_fine_ms;
+static int p70_t_have_fine;
+static int p54_read(const char *film, uint64_t *t_us, int *have_t, long *window)
+{
+    char name[512], line[64];
+    p55_audio_read[0] = 0;
+    p70_t_have_fine = 0;
+    FILE *f;
+    p54_name(name, sizeof name, film);
+    f = fopen(name, "r");
+    if (!f) return 0;
+    *have_t = 0; *window = -1;
+    while (fgets(line, sizeof line, f)) {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        if ((line[0] == 'T' || line[0] == 't') && (line[1] == ':' || line[1] == '=')) {
+            if (!strcmp(line + 2, "0") || !strcmp(line + 2, "00:00:00")) { *t_us = 0; *have_t = 1; }
+            else if (p50_parse_time(line + 2, t_us)) *have_t = 1;
+        } else if ((line[0] == 'W' || line[0] == 'w') && (line[1] == ':' || line[1] == '=')) {
+            if (line[2] == 'C' || line[2] == 'c') *window = 0;
+            else {
+                long w = strtol(line + 2, NULL, 10);
+                if (w == 10 || w == 25 || w == 50 || w == 75) *window = w;
+            }
+        } else if ((line[0] == 'P' || line[0] == 'p') && (line[1] == ':' || line[1] == '=')) {
+            p70_t_fine_ms = strtol(line + 2, NULL, 10);   /* P96W70 */
+            p70_t_have_fine = 1;
+        } else if ((line[0] == 'A' || line[0] == 'a') && (line[1] == ':' || line[1] == '=')) {
+            strncpy(p55_audio_read, line + 2, sizeof p55_audio_read - 1);
+            p55_audio_read[sizeof p55_audio_read - 1] = 0;
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+static void p54_write(const char *film, uint64_t film_us, const char *audio,
+                      uint64_t recap_us)
+{
+    char name[512], t[16];
+    FILE *f;
+    uint64_t at = film_us > recap_us ? film_us - recap_us : 0;
+    p54_name(name, sizeof name, film);
+    p50_fmt(t, sizeof t, at);
+    f = fopen(name, "w");
+    if (!f) {
+        printf("Warning: cannot write resume file %s.\n", name);
+        return;
+    }
+    fprintf(f, "T:%s\n", t);
+    if (mr_berryvp_stream_flags) fprintf(f, "W:%lu\n", (unsigned long)mr_berryvp_stream_flags);
+    else fprintf(f, "W:C\n");
+    fprintf(f, "A:%s\n", audio);
+    if (!strcmp(audio, "PAULA")) fprintf(f, "P:%ld\n", p70_fine_ms);   /* P96W70 */
+    fclose(f);
+    printf("Resume position saved: %s (T=%s).\n", name, t);
+    if (n76_hostlog) {
+        fprintf(n76_hostlog, "P54_T_WRITTEN stop_ms=%lu t=%s\n",
+                (unsigned long)(film_us / 1000U), t);
+        fflush(n76_hostlog);
+    }
+}
+
+
+/* ---- P96W56: INFO mode ------------------------------------------------------
+ * mrberry <film> INFO  - no Pi, no window, no status file, no logs.
+ * Prints KEY=VALUE lines for MintVID-pi (timeline length, status line,
+ * resume position) and returns 0 when mrberry can play the film, 5 when it
+ * cannot (REASON=...), 10 when the file cannot be opened. */
+extern uint64_t mr_demux_duration_us(const mr_demux *d);
+
+static int p56_info(const char *film)
+{
+    mr_demux *d;
+    const mr_video_info *vi;
+    const mr_audio_info *ai;
+    char text[96];
+    const char *reason = NULL, *sound = "NONE";
+    uint64_t dur;
+
+    printf("MRBERRY_INFO=1\nFILE=%s\n", film);
+    d = mr_demux_open_file(film);
+    if (!d) {
+        printf("PLAYABLE=0\nREASON=cannot open file (%s)\n", mr_demux_last_open_error());
+        return 10;
+    }
+    vi = mr_demux_video(d);
+    ai = mr_demux_audio(d);
+    printf("CONTAINER=%s\n", mr_demux_container_name(d));
+    mr_demux_describe_video_codec(d, text, sizeof text);
+    printf("VIDEO=%s\n", text);
+    if (vi && vi->valid) {
+        printf("SIZE=%dx%d\n", vi->width, vi->height);
+        if (vi->rate && vi->scale) {
+            uint64_t milli = (uint64_t)vi->rate * 1000U / vi->scale;
+            printf("FPS=%lu.%03lu\n", (unsigned long)(milli / 1000U),
+                   (unsigned long)(milli % 1000U));
+        }
+    }
+    if (!vi || !vi->valid || vi->fourcc != MR_FOURCC('a','v','c','1'))
+        reason = "H.264/AVC video is required";
+    dur = mr_demux_duration_us(d);
+    if (dur) {
+        char len[16];
+        p50_fmt(len, sizeof len, dur);
+        printf("LENGTH=%s\nLENGTH_MS=%lu\n", len, (unsigned long)(dur / 1000U));
+    } else {
+        printf("LENGTH=unknown\n");
+    }
+    mr_demux_describe_audio_codec(d, text, sizeof text);
+    printf("AUDIO=%s\n", (ai && ai->valid) ? text : "none");
+    if (ai && ai->valid) {
+        printf("AUDIO_RATE=%lu\nAUDIO_CH=%u\n",
+               (unsigned long)ai->sample_rate, (unsigned)ai->channels);
+        if (ai->format_tag == MR_AUDIO_FORMAT_AAC) {
+            unsigned ch = ai->config_len >= 2 ? ((ai->config[1] >> 3) & 15u) : ai->channels;
+            if (ai->config_len && (ai->config[0] >> 3) != 2)
+                reason = reason ? reason : "only AAC-LC sound is supported";
+            else if (ch != 2 && ch != 5 && ch != 6)
+                reason = reason ? reason : "AAC sound must be stereo or 5.1";
+            else sound = "HDMI";
+        } else if (ai->format_tag == MR_AUDIO_FORMAT_AC3) {
+            sound = "HDMI";
+        } else if (ai->format_tag == MR_AUDIO_FORMAT_EAC3) {
+            if (ai->channels != 2)
+                reason = reason ? reason : "E-AC3 multichannel is not supported in real time";
+            else sound = "HDMI";
+        }
+    }
+    printf("SOUND=%s\n", sound);
+    printf("SEEK=%d\n", mr_demux_can_seek(d) ? 1 : 0);
+    {
+        uint64_t rt = 0;
+        int have_t = 0;
+        long rw = -1;
+        if (p54_read(film, &rt, &have_t, &rw)) {
+            char t[16];
+            p50_fmt(t, sizeof t, have_t ? rt : 0);
+            printf("RESUME_T=%s\n", t);
+            if (rw == 0) printf("RESUME_W=C\n");
+            else if (rw > 0) printf("RESUME_W=%ld\n", rw);
+            if (p55_audio_read[0]) printf("RESUME_A=%s\n", p55_audio_read);
+            if (p70_t_have_fine) printf("RESUME_P=%ld\n", p70_t_fine_ms);   /* P96W72 */
+        }
+    }
+    mr_demux_close(d);
+    printf("PLAYABLE=%d\n", reason ? 0 : 1);
+    if (reason) printf("REASON=%s\n", reason);
+    return reason ? 5 : 0;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 3 && (!strcmp(argv[2], "INFO") || !strcmp(argv[2], "info") ||
+                      !strcmp(argv[2], "Info")))
+        return p56_info(argv[1]);
 #if MR_DEBUG_LOGS
     n76_hostlog = fopen("N76_HOST.TXT", "ab");
 #endif
@@ -489,13 +1325,113 @@ int main(int argc, char **argv)
     int n73_prime_ready = 0;
     int p04_first_video_sent = 0;
     int aborted = 0;
+    int p54_demux_eof = 0, p54_can_seek = 0, p54_have_stop = 0;
+    uint64_t p54_stop_us = 0;
     mr_status st;
 
-    if (argc != 2) {
-        printf("mrberry - H.264 hardware A/V player\n"
-               "Usage: mrberry <movie.mkv|movie.mp4|movie.ts>\n");
-        return 5;
+    {
+        /* P96W50: options in any order after the film:
+         *   W=10|25|50|75 (or the bare number, first one) = P96 window size
+         *   T=H:MM or T=H:MM:SS                           = start time
+         *   AV=<ms> (or a second bare number), NOSYNC, PIDLE0 = test switches
+         * P96W52: '=' and ':' are both accepted after W, T and AV. */
+        int i, have_window = 0, bad = (argc < 2), resume = 0, cli_t = 0;
+        for (i = 2; i < argc && !bad; i++) {
+            const char *a = argv[i];
+            if (!a[0]) { bad = 1; break; }
+            if ((a[0] == 'T' || a[0] == 't') && (a[1] == ':' || a[1] == '=')) {
+                if (!p50_parse_time(a + 2, &p50_t_us)) {
+                    printf("Error: start time must be T=hours:minutes, e.g. T=0:01 (1 minute) or T=1:30 (1 h 30 min); T=1:30:15 with seconds.\n");
+                    return 5;
+                }
+                p50_t_set = p50_t_us != 0;
+                cli_t = 1;
+            } else if (!strcmp(a, "R") || !strcmp(a, "r") ||
+                       !strcmp(a, "RESUME") || !strcmp(a, "resume") || !strcmp(a, "Resume")) {
+                resume = 1;                       /* P96W54: continue from <film>.t */
+            } else if (((a[0] == 'W' || a[0] == 'w') && (a[1] == ':' || a[1] == '=')) ||
+                       (!have_window && a[0] >= '0' && a[0] <= '9')) {
+                /* Optional window size: play in a P96 window.  Without it
+                 * mrberry stays in the cinema/HVS mode. */
+                const char *w = (a[1] == ':' || a[1] == '=') ? a + 2 : a;
+                unsigned long pct = strtoul(w, NULL, 10);
+                if (pct == 10 || pct == 25 || pct == 50 || pct == 75) {
+                    mr_berryvp_stream_flags = pct;
+                    have_window = 1;
+                } else {
+                    printf("Error: window size must be W=10, W=25, W=50 or W=75.\n");
+                    return 5;
+                }
+            } else if ((a[0] == 'L' || a[0] == 'l') && (a[1] == 'E' || a[1] == 'e') &&
+                       (a[2] == 'A' || a[2] == 'a') && (a[3] == 'D' || a[3] == 'd') &&
+                       (a[4] == '=' || a[4] == ':')) {
+                p66_lead_ms = strtoul(a + 5, NULL, 10);   /* P96W66 test */
+                if (p66_lead_ms < 100 || p66_lead_ms > 3000) {
+                    printf("Error: LEAD= must be 100..3000 (milliseconds).\n");
+                    return 5;
+                }
+            } else if (!strcmp(a, "PAULA") || !strcmp(a, "paula") || !strcmp(a, "Paula")) {
+                p67_paula = 1;                    /* P96W67: sound through Paula */
+            } else if (!strcmp(a, "PLOW") || !strcmp(a, "plow")) {
+                p67_low = 1;                      /* P96W67: Paula lower rate */
+            } else if (!strcmp(a, "PMONO") || !strcmp(a, "pmono")) {
+                p67_mono = 1;                     /* P96W67: Paula mono */
+            } else if (!strcmp(a, "NOAUDIO") || !strcmp(a, "noaudio") ||
+                       !strcmp(a, "NoAudio")) {
+                p63_noaudio = 1;                  /* P96W63 test: cinema, no sound */
+            } else if ((a[0] == 'N' || a[0] == 'n') && (a[1] == 'O' || a[1] == 'o')) {
+                p96s_off = 1;                     /* NOSYNC: no clock, draw at once */
+            } else if ((a[0] == 'P' || a[0] == 'p') && (a[1] == 'I' || a[1] == 'i')) {
+                p45_no_idle = 1;                  /* P96W46 test: PIDLE0 */
+            } else if (((a[0] == 'A' || a[0] == 'a') && (a[1] == 'V' || a[1] == 'v') &&
+                        (a[2] == ':' || a[2] == '=')) ||
+                       a[0] == '-' || (a[0] >= '0' && a[0] <= '9')) {
+                /* P96W26: AV:<ms> = how much later window frames are shown */
+                int av = (a[0] == 'A' || a[0] == 'a');
+                long ms = strtol(av ? a + 3 : a, NULL, 10);
+                if (ms > 2000 || ms < -2000) {
+                    printf("Error: AV= must be -2000..2000 (milliseconds).\n");
+                    return 5;
+                }
+                p96w_av_delay_us = ms * 1000L;
+                p69_av_set = 1;
+            } else {
+                bad = 1;
+            }
+        }
+        if (bad) {
+            printf("mrberry - H.264 hardware A/V player\n"
+                   "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [W=10|25|50|75] [T=h:mm] [R] [AV=ms|NOSYNC]\n"
+                   "  T=0:01 = start at 1 minute, T=1:30 = 1 h 30 min (T=1:30:15 with seconds)\n"
+                   "  R = continue where the film was stopped (<film>.t)\n"
+                   "  mrberry <movie> INFO = show length, video and sound, no playback\n");
+            return 5;
+        }
+        if (resume) {
+            uint64_t rt = 0;
+            int have_t = 0;
+            long rw = -1;
+            if (p54_read(argv[1], &rt, &have_t, &rw)) {
+                if (!cli_t && have_t) { p50_t_us = rt; p50_t_set = rt != 0; }
+                if (!have_window && rw >= 0) mr_berryvp_stream_flags = (ULONG)rw;
+                printf("Resume from saved position (%s).\n",
+                       mr_berryvp_stream_flags ? "window" : "cinema");
+                n76_hlog("P54_RESUME_FILE_READ");
+                if (p55_audio_read[0] && (p55_audio_read[0] == 'P' || p55_audio_read[0] == 'p') &&
+                    !p63_noaudio && !mr_berryvp_stream_flags)
+                    p67_paula = 1;                /* P96W70: continue with Paula */
+                if (n76_hostlog) {
+                    fprintf(n76_hostlog, "P55_T_AUDIO=%s\n",
+                            p55_audio_read[0] ? p55_audio_read : "(none)");
+                    fflush(n76_hostlog);
+                }
+            } else {
+                printf("No saved position for this film - starting from the beginning.\n");
+                n76_hlog("P54_RESUME_NO_FILE");
+            }
+        }
     }
+    p62_pos_clear();
     p06_status_write(P06_STATE_OPENING, "H.264 / VideoCore",
                      "Opening PiStorm VideoCore playback...");
     DBG_PRINTF("[D01] before mr_demux_open_file\n");
@@ -524,6 +1460,57 @@ int main(int argc, char **argv)
            (unsigned long)vi->config_len);
     ac309i_is_mov = !strcmp(mr_demux_container_name(d), "MOV");
     ai = mr_demux_audio(d);
+    if (p63_noaudio) {
+        if (mr_berryvp_stream_flags) {
+            printf("Error: NOAUDIO is a cinema test - leave out W=.\n");
+            mr_demux_close(d);
+            return 5;
+        }
+        printf("NOAUDIO: playing without sound (clock test CLK81).\n");
+        n76_hlog("P63_NOAUDIO");
+        ai = NULL;
+    }
+    if (p67_paula && !p63_noaudio) {
+        char why[80];
+        if (mr_berryvp_stream_flags) {
+            printf("Error: PAULA is cinema only - leave out W=.\n");
+            mr_demux_close(d);
+            return 5;
+        }
+        why[0] = 0;
+        atexit(p67_cleanup);
+        p73_base_load();
+        /* P96W70: fine value: AV= (Shell) > .t P: > 0 */
+        if (p69_av_set) p70_fine_ms = (long)(p96w_av_delay_us / 1000L);
+        else {
+            uint64_t rt = 0; int ht = 0; long rw = -1;
+            p70_t_have_fine = 0;
+            if (p54_read(argv[1], &rt, &ht, &rw) && p70_t_have_fine)
+                p70_fine_ms = p70_t_fine_ms;
+        }
+        if (p70_fine_ms > 3000) p70_fine_ms = 3000;
+        if (p70_fine_ms < -3000) p70_fine_ms = -3000;
+        p67_pa = (ai && ai->valid) ?
+            mrb_paula_open(ai, p67_low, p67_mono,
+                           (int32_t)(P69_PAULA_DEFAULT_AV_US + p70_fine_ms * 1000L),
+                           why, sizeof why) : NULL;
+        if (p67_pa) {
+            p70_used = 1;
+            printf("PAULA: sound offset %ld ms (base %ld + fine %ld; +/- keys change it).\n",
+                   (long)(P69_PAULA_DEFAULT_AV_US / 1000L) + p70_fine_ms,
+                   (long)(P69_PAULA_DEFAULT_AV_US / 1000L), p70_fine_ms);
+        }
+        if (p67_pa) {
+            printf("PAULA: %s (sound through the Amiga).\n", mrb_paula_describe(p67_pa));
+            if (n76_hostlog) { fprintf(n76_hostlog, "P67_PAULA_OPEN %s offset_ms=%ld\n",
+                               mrb_paula_describe(p67_pa),
+                               (long)(P69_PAULA_DEFAULT_AV_US / 1000L) + p70_fine_ms); fflush(n76_hostlog); }
+        } else {
+            printf("PAULA: no sound (%s) - picture only.\n",
+                   (ai && ai->valid) ? why : "no audio track");
+            n76_hlog("P67_PAULA_FAILED");
+        }
+    }
     if (ai && ai->valid) {
         char acodec[80];
         mr_demux_describe_audio_codec(d, acodec, sizeof acodec);
@@ -551,6 +1538,53 @@ int main(int argc, char **argv)
         return 20;
     }
 
+    if (p50_t_set) {
+        char want[16], got[16];
+        p50_fmt(want, sizeof want, p50_t_us);
+        if (!mr_demux_can_seek(d)) {
+            printf("Error: T= start time works only with MKV and MP4 files.\n");
+            p06_status_write(P06_STATE_UNSUPPORTED, "H.264 / VideoCore",
+                             "T= start time needs an MKV or MP4 file");
+            mr_demux_close(d);
+            return 10;
+        }
+        {
+            /* P96W53: T= must lie inside the film */
+            extern uint64_t mr_demux_duration_us(const mr_demux *d);
+            uint64_t dur = mr_demux_duration_us(d);
+            if (n76_hostlog) {
+                fprintf(n76_hostlog, "P53_DURATION_MS=%lu\n", (unsigned long)(dur / 1000U));
+                fflush(n76_hostlog);
+            }
+            if (dur && p50_t_us >= dur) {
+                char len[16], text[96];
+                p50_fmt(len, sizeof len, dur);
+                printf("Error: T=%s is behind the end of the film (length %s).\n", want, len);
+                snprintf(text, sizeof text, "Start time is behind the end (film length %s)", len);
+                p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore", text);
+                mr_demux_close(d);
+                return 10;
+            }
+        }
+        p06_status_write(P06_STATE_OPENING, "H.264 / VideoCore",
+                         "Searching start position...");
+        st = mr_demux_seek(d, p50_t_us, &p50_seek_us);
+        if (st != MR_OK) {
+            printf("Error: cannot find a start picture for T=%s.\n", want);
+            p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
+                             "Start time not found in the file");
+            mr_demux_close(d);
+            return 10;
+        }
+        p50_fmt(got, sizeof got, p50_seek_us);
+        printf("Start at %s (T=%s, nearest key frame before).\n", got, want);
+        if (n76_hostlog) {
+            fprintf(n76_hostlog, "P50_SEEK T_MS=%lu SEEK_MS=%lu\n",
+                    (unsigned long)(p50_t_us / 1000U), (unsigned long)(p50_seek_us / 1000U));
+            fflush(n76_hostlog);
+        }
+    }
+
     DBG_PRINTF("[D05] before mr_berryvp_open\n");
     st = mr_berryvp_open(bvp, vi);
     DBG_PRINTF("[D06] after mr_berryvp_open st=%ld\n", (long)st);
@@ -568,7 +1602,7 @@ int main(int argc, char **argv)
         n76_hlog("AC309I_MP4_128K_FRAGMENT_CAP");
     }
 
-    if (ai && ai->valid && (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_AC3 || ai->format_tag == MR_AUDIO_FORMAT_EAC3)) {
+    if (!p67_paula && ai && ai->valid && (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_AC3 || ai->format_tag == MR_AUDIO_FORMAT_EAC3)) {
         st = mr_berryvp_config_audio(bvp, ai);
         if (st == MR_OK) {
             audio_enabled = 1;
@@ -589,11 +1623,29 @@ int main(int argc, char **argv)
             return 20;
         }
     } else {
-        printf("Warning: no supported AAC/AC3/E-AC3 audio track; video will continue without audio.\n");
+        if (!P67_FREE)
+            printf("Warning: no supported AAC/AC3/E-AC3 audio track; video will continue without audio.\n");
         n73_prime_ready = 1;
     }
 
-    ac309i_pacer_init(&ac309i_pace, vi, ac309i_is_mov && audio_enabled);
+    /* P96W2: in the P96 window the library shows each frame as soon as it
+     * comes back from the ISP, and its own host pacer holds SendVideo to real
+     * time.  Without a host-side video queue the demux can never run ahead,
+     * so every 16-frame AAC batch reached audio_render ~0.37 s late and was
+     * dropped (P96W1 hardware log).  Reuse the proven AC309I queue: video AUs
+     * wait here until due, the demux keeps reading, and audio gets ahead until
+     * the library's audio slots push back. */
+    ac309i_pacer_init(&ac309i_pace, vi,
+                      ((ac309i_is_mov || mr_berryvp_stream_flags) && audio_enabled) ||
+                      P67_FREE);         /* P96W65: no HDMI sound -> host pacer (real time) */
+    if (ac309i_pace.enabled && P67_FREE) {
+        ac309i_pace.lead_us = p66_lead_ms * 1000UL;   /* P96W66 */
+        if (n76_hostlog) { fprintf(n76_hostlog, "P66_LEAD_MS=%lu\n", p66_lead_ms); fflush(n76_hostlog); }
+    }
+    if (ac309i_pace.enabled && mr_berryvp_stream_flags) {
+        ac309i_pace.lead_us = 50000UL;
+        n76_hlog("P96W5_WINDOW_QUEUE_NONREF_DROP_AUDIO_FIRST");
+    }
     if (ac309i_pace.enabled) {
         DBG_PRINTF("[AC309I] VPv149 host-time feed pacer: fps=%lu/%lu step=%lu + %lu/%lu us, lead=%lu us\n",
                (unsigned long)vi->rate, (unsigned long)vi->scale,
@@ -611,11 +1663,15 @@ int main(int argc, char **argv)
         snprintf(p06_text, sizeof p06_text, "%dx%d, %s",
                  vi->width, vi->height, mr_demux_container_name(d));
         p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", p06_text);
+        strncpy(p45_status_text, p06_text, sizeof p45_status_text - 1);
         n76_hlog("P06_STATUS_PLAYING");
     }
 
     n76_hlog("N76_BEFORE_DEMUX_LOOP");
     for (;;) {
+        p65_hb(sent, n73_vqueued);
+        if (p67_pa) mrb_paula_service(p67_pa);
+        p70_apply_keys();
         if (p05_input_poll_stop()) {
             n76_hlog("P05_ESC_STOP");
             aborted = 1;
@@ -625,29 +1681,73 @@ int main(int argc, char **argv)
         if (seen < 3 && audio_seen < 3) n76_hlog("N76_BEFORE_SETSIGNAL");
         { ULONG n76_sig = bvp_exec_setsignal(0, 0);
           if (seen < 3 && audio_seen < 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_SETSIGNAL sig=%08lx\n", (unsigned long)n76_sig); fflush(n76_hostlog); }
-          if (n76_sig & SIGBREAKF_CTRL_C) {
+          if (p58_stop_sig(n76_sig)) {
             aborted = 1;
             st = MR_EAGAIN;
             break;
           }
         }
+        {
+            int p46 = p45_service(bvp, &ac309i_pace, &eac3_first_wall_us, sent, &audio_sent);
+            if (p46 == 2) {
+                printf("Error: audio after pause failed.\n");
+                p04_free_audio_queue();
+                p05_input_close();
+                n73_free_video_queue();
+                mr_berryvp_close(bvp);
+                mr_demux_close(d);
+                return 20;
+            }
+            if (p46) { aborted = 1; st = MR_EAGAIN; break; }
+        }
+        /* P96W3: bounded read-ahead.  With the video queue full, service it
+         * until there is room again instead of reading the whole file. */
+        if ((mr_berryvp_stream_flags || P67_FREE) && ac309i_pace.enabled && n73_prime_ready) {
+            int stop_now = 0;
+            while (n73_vqueued >= P96W_READ_AHEAD_Q) {
+                st = ac309i_service_mov_video(bvp, &ac309i_pace, &sent, &skipped);
+                if (st != MR_OK) break;
+                if (n73_vqueued < P96W_READ_AHEAD_Q) break;
+                if (p05_input_poll_stop() ||
+                    p58_stop_sig(bvp_exec_setsignal(0, 0))) { stop_now = 1; break; }
+                if (p45_service(bvp, &ac309i_pace, &eac3_first_wall_us, sent, &audio_sent)) { stop_now = 1; break; }
+                p65_hb(sent, n73_vqueued);
+                if (p67_pa) mrb_paula_service(p67_pa);
+                p70_apply_keys();
+                Delay(1);
+            }
+            if (st != MR_OK) {
+                printf("Error: window video service failed.\n");
+                n73_free_video_queue();
+                mr_berryvp_close(bvp);
+                mr_demux_close(d);
+                return 20;
+            }
+            if (stop_now) { aborted = 1; st = MR_EAGAIN; break; }
+        }
         if (seen < 3 && audio_seen < 3) n76_hlog("N76_BEFORE_DEMUX_NEXT");
         if (seen < 3) DBG_PRINTF("[D10] before demux_next_packet seen=%lu\n", seen);
-        st = mr_demux_next_packet(d, &pkt);
+        st = p50_next_packet(d, &pkt);
         if (seen < 3 && audio_seen < 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_DEMUX_NEXT st=%ld video=%d len=%lu pts=%d\n", (long)st, pkt.is_video, (unsigned long)pkt.len, pkt.has_pts); fflush(n76_hostlog); }
         if (seen < 3) DBG_PRINTF("[D11] after demux_next_packet st=%ld is_video=%d len=%lu\n", (long)st, pkt.is_video, (unsigned long)pkt.len);
         if (st != MR_OK) break;
         if (!pkt.len) continue;
         if (!pkt.is_video) {
             audio_seen++;
+            if (p67_pa) {                 /* P96W67: sound through Paula */
+                if (!mrb_paula_feed(p67_pa, &pkt))
+                    n76_hlog("P67_FEED_NOMEM");
+                continue;
+            }
             if (!audio_enabled) continue;
+            if (pkt.has_pts) { p96w_last_apts = pkt.pts_us; p96w_have_apts = 1; }
             if (audio_seen <= 4)
                 DBG_PRINTF("[A10] audio #%lu len=%lu pts=%s\n", audio_seen,
                        (unsigned long)pkt.len, pkt.has_pts ? "yes" : "no");
 
             /* PiStorm04: retain compressed startup audio until one real
              * H.264 AU has completed SendVideo. */
-            if (!p04_first_video_sent) {
+            if (!p04_first_video_sent || p45_hold_audio) {
                 if (!p04_queue_audio(&pkt)) {
                     printf("Error: cannot buffer startup audio packet %lu (%lu bytes).\n",
                            audio_seen, (unsigned long)pkt.len);
@@ -658,7 +1758,7 @@ int main(int argc, char **argv)
                     mr_demux_close(d);
                     return 20;
                 }
-                if (n76_hostlog) {
+                if (n76_hostlog && !p04_first_video_sent) {
                     fprintf(n76_hostlog,
                             "P04_STARTUP_AUDIO_QUEUED count=%lu bytes=%lu\n",
                             p04_aqueued, p04_abytes);
@@ -811,7 +1911,30 @@ int main(int argc, char **argv)
         }
         if (seen <= 3) DBG_PRINTF("[D12] before send_packet #%lu\n", seen);
         if (seen <= 3) n76_hlog("N76_BEFORE_SEND_VIDEO");
-        st = mr_berryvp_send_packet(bvp, &pkt);
+        {
+            /* P96W64 test: NOAUDIO heartbeat, one line per second in N76_HOST.TXT */
+            static ULONG p64_t0, p64_last_hb, p64_max_us;
+            ULONG p64_a = p63_noaudio ? ac309i_read_sys_us() : 0, p64_b;
+            st = mr_berryvp_send_packet(bvp, &pkt);
+            if (p63_noaudio && n76_hostlog) {
+                p64_b = ac309i_read_sys_us();
+                if (!p64_t0) { p64_t0 = p64_a; p64_last_hb = p64_a; }
+                if (p64_b - p64_a > p64_max_us) p64_max_us = p64_b - p64_a;
+                if (p64_b - p64_a > 1000000UL)
+                    fprintf(n76_hostlog, "P64_SLOW_SEND ms=%lu pts_ms=%lu\n",
+                            (unsigned long)((p64_b - p64_a) / 1000UL),
+                            pkt.has_pts ? (unsigned long)(pkt.pts_us / 1000ULL) : 0UL);
+                if (p64_b - p64_last_hb >= 1000000UL) {
+                    fprintf(n76_hostlog, "P64_HB wall_ms=%lu sent=%lu pts_ms=%lu max_send_ms=%lu\n",
+                            (unsigned long)((p64_b - p64_t0) / 1000UL), (unsigned long)sent,
+                            pkt.has_pts ? (unsigned long)(pkt.pts_us / 1000ULL) : 0UL,
+                            (unsigned long)(p64_max_us / 1000UL));
+                    p64_max_us = 0;
+                    p64_last_hb = p64_b;
+                }
+                fflush(n76_hostlog);
+            }
+        }
         if (seen <= 3 && n76_hostlog) { fprintf(n76_hostlog, "N76_AFTER_SEND_VIDEO st=%ld\n", (long)st); fflush(n76_hostlog); }
         if (seen <= 3) DBG_PRINTF("[D13] after send_packet #%lu st=%ld\n", seen, (long)st);
         if (st == MR_EAGAIN) {
@@ -867,6 +1990,7 @@ int main(int argc, char **argv)
             DBG_PRINTF("video packets sent: %lu\n", sent);
     }
 
+    p54_demux_eof = (st == MR_EAGAIN);
     if (aborted) {
         DBG_PRINTF("Ctrl-C: stopping video and returning to Workbench.\n");
     } else if (st != MR_EAGAIN) {
@@ -876,6 +2000,7 @@ int main(int argc, char **argv)
                (long)st, seen);
     }
 
+    p96w_drain = 1;
     if (ac309i_pace.enabled && n73_vhead && !aborted) {
         /* Natural EOF normally leaves only a tiny tail.  Let the absolute
          * timeline reach it without inventing new PTS or changing the grid.
@@ -891,9 +2016,62 @@ int main(int argc, char **argv)
                 aborted = 1;
                 break;
             }
-            if ((bvp_exec_setsignal(0, 0) & SIGBREAKF_CTRL_C) != 0) { aborted = 1; break; }
-            if ((uint32_t)(ac309i_read_sys_us() - drain_start) >= 2000000u) break;
+            if (p58_stop_sig(bvp_exec_setsignal(0, 0))) { aborted = 1; break; }
+            if ((uint32_t)(ac309i_read_sys_us() - drain_start) >=
+                (P67_FREE ? 5000000u : 2000000u)) break;
+            if (p67_pa) mrb_paula_service(p67_pa);
         }
+    }
+    if (p67_pa && !aborted) {
+        /* P96W67: let Paula play what it still holds (max 6 s). */
+        uint32_t t0 = (uint32_t)ac309i_read_sys_us();
+        while (!mrb_paula_idle(p67_pa)) {
+            if (p05_input_poll_stop() || p58_stop_sig(bvp_exec_setsignal(0, 0))) break;
+            if ((uint32_t)(ac309i_read_sys_us() - t0) >= 6000000u) break;
+            Delay(1);
+        }
+    }
+    if (p67_pa && n76_hostlog) {
+        unsigned long sil, drop, fix, dec_ms, pk, starv, minbuf;
+        mrb_paula_stats(p67_pa, &sil, &drop, &fix);
+        mrb_paula_timing(p67_pa, &dec_ms, &pk, &starv, &minbuf);
+        fprintf(n76_hostlog, "P67_PAULA_END silence_ms=%lu dropped_ms=%lu corrections=%lu "
+                "decode_ms=%lu packets=%lu starvations=%lu min_buffered_ms=%lu\n",
+                sil, drop, fix, dec_ms, pk, starv, minbuf);
+        fflush(n76_hostlog);
+    }
+    p67_cleanup();
+    if (p50_t_set && n76_hostlog) {
+        fprintf(n76_hostlog, "P50 start: t_ms=%lu seek_ms=%lu base_ms=%lu drop_audio=%lu drop_video=%lu\n",
+                (unsigned long)(p50_t_us / 1000U), (unsigned long)(p50_seek_us / 1000U),
+                (unsigned long)(p50_base_us / 1000U), p50_drop_audio, p50_drop_video);
+        fflush(n76_hostlog);
+    }
+    if (mr_berryvp_stream_flags && n76_hostlog) {
+        fprintf(n76_hostlog, "P96W window: dropped=%lu queue_peak=%lu audio_first_holds=%lu\n",
+                p96w_dropped, ac309i_pace.queue_peak, p96w_audio_first_holds);
+        fprintf(n76_hostlog, "P45 pauses=%lu paused_ms=%lu\n",
+                p45_pauses, (unsigned long)(p45_paused_total_us / 1000u));
+        if (p96s_off) {
+            fprintf(n76_hostlog, "P96W32_SYNC off (NOSYNC, no clock queries)\n");
+        } else if (!p96s) {
+            fprintf(n76_hostlog, "P96W32_SYNC no clock block from berryvp.library (old library?)\n");
+        } else {
+            unsigned i;
+            fprintf(n76_hostlog,
+                    "P96W32_SYNC samples=%lu used=%lu corrections=%lu shift_ms=%ld "
+                    "first_err_ms=%ld last_err_ms=%ld min_ms=%ld max_ms=%ld\n",
+                    p96s_samples, p96s_used, p96s_corrections, p96s_shift / 1000,
+                    p96s_first_err / 1000, p96s_last_err / 1000,
+                    p96s_min_err / 1000, p96s_max_err / 1000);
+            fprintf(n76_hostlog,
+                    "P96W32_LIB requests=%lu replies=%lu failures=%lu status=%lu timeouts=%lu "
+                    "rtt_max_us=%lu port_mode=%lu shown=%lu\n",
+                    p96s[9], p96s[10], p96s[11], p96s[12], p96s[13], p96s[14], p96s[15], p96s[5]);
+            for (i = 0; i < p96s_log_n; i++)
+                fprintf(n76_hostlog, "P96W32_ERR t_ms=%ld err_ms=%ld\n", p96s_log_t[i], p96s_log_e[i]);
+        }
+        fflush(n76_hostlog);
     }
     if (ac309i_pace.enabled) {
         uint32_t elapsed = ac309i_pace.started ?
@@ -949,7 +2127,7 @@ int main(int argc, char **argv)
                     aborted = 1;
                     break;
                 }
-                if ((bvp_exec_setsignal(0, 0) & SIGBREAKF_CTRL_C) != 0) {
+                if (p58_stop_sig(bvp_exec_setsignal(0, 0))) {
                     aborted = 1;
                     break;
                 }
@@ -965,10 +2143,30 @@ int main(int argc, char **argv)
     DBG_PRINTF("mrberry A/V complete: video=%lu sent=%lu preconfig-skipped=%lu bytes=%lu; "
            "audio=%lu sent=%lu adts-bytes=%lu\n",
            seen, sent, skipped, bvp->bytes, audio_seen, audio_sent, bvp->audio_bytes);
+    {
+        /* P96W54: stop position in film time, read before the library
+         * closes (window: frame on screen, else last frame read) */
+        p54_can_seek = mr_demux_can_seek(d);
+        if (p54_have_raw) { p54_stop_us = p54_last_vpts_raw; p54_have_stop = 1; }
+        if (mr_berryvp_stream_flags && p96s && p96s[5]) {
+            uint64_t shown = ((uint64_t)p96s[6] << 32) | p96s[7];
+            p54_stop_us = shown + (p50_t_set ? p50_base_us : 0);
+            p54_have_stop = 1;
+        }
+    }
     DBG_PRINTF("Closing BerryVP stream (EOS + Workbench return) ...\n");
     st = mr_berryvp_close(bvp);
     p05_input_close();
     mr_demux_close(d);
+    if (aborted && p54_can_seek && p54_have_stop)
+        p54_write(argv[1], p54_stop_us, audio_enabled ? "HDMI" : (p70_used ? "PAULA" : "NONE"),
+                  p58_switch ? 0 : P54_RECAP_US);
+    else if (!aborted && p54_demux_eof && p70_used && p70_fine_changed)
+        p54_write(argv[1], 0, "PAULA", 0);  /* P96W70: keep the new fine value */
+    else if (!aborted && p54_demux_eof)
+        n76_hlog("P55_T_KEPT_AT_END");     /* P96W55: .t stays (watched hint) */
+    p62_pos_clear();
+    if (p63_noaudio && n76_hostlog) { fprintf(n76_hostlog, "P64_END aborted=%d sent=%lu\n", aborted, (unsigned long)sent); fflush(n76_hostlog); }
     if (st != MR_OK) {
         p06_status_write(P06_STATE_ERROR, "H.264 / VideoCore",
                          "VideoCore cleanup failed");

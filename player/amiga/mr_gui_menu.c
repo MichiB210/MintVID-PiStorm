@@ -1,6 +1,7 @@
 #include "mr_gui_menu.h"
 #include "mr_p96_format.h"
 #include "mr_tls_pref.h"
+#include "mr_paula_pref.h"
 
 #include <intuition/intuition.h>
 #include <libraries/gadtools.h>
@@ -28,6 +29,12 @@ struct Library *GadToolsBase;
 #define MR_MENU_USER_P96_YUYV ((APTR)5)
 #define MR_MENU_USER_TLS_12 ((APTR)6)
 #define MR_MENU_USER_TLS_13 ((APTR)7)
+/* P96W73: Paula base offset items, user data 100 + index (0 .. -1000 ms). */
+#define MR_MENU_USER_PAULA0 100
+#define MR_PAULA_STEPS 21
+int mr_gui_menu_with_paula;          /* set by MintVID-pi before open */
+static char paula_labels[MR_PAULA_STEPS][16];
+static struct NewMenu paula_menu[40];
 /* Indices in menu_template: title, Guide, About, P96 parent, two subs,
  * HTTPS parent, two subs. */
 #define MR_P96_YVYU_ITEM 4
@@ -84,6 +91,48 @@ int mr_gui_menu_open(mr_gui_menu *menu, struct Window *window)
     menu->visual_info = GetVisualInfoA(window->WScreen, NULL);
     if (!menu->visual_info)
         goto fail;
+    if (mr_gui_menu_with_paula) {
+        /* P96W73 (MintVID-pi): menu_template up to the bar before Quit,
+         * then "Paula sound base" with 0 .. -1000 ms in 50-ms steps, then
+         * the bar and Quit. */
+        int n = 0, i, bar;
+        long cur = mr_paula_pref_load();
+        ULONG all = (1UL << MR_PAULA_STEPS) - 1UL;
+        for (bar = 0; menu_template[bar].nm_Type != NM_END &&
+                      menu_template[bar].nm_Label != NM_BARLABEL; bar++)
+            ;
+        for (i = 0; i < bar; i++) {
+            /* P96W74: MintVID-pi plays no network streams - no HTTPS. */
+            if (i >= MR_TLS_12_ITEM - 1 && i <= MR_TLS_13_ITEM) continue;
+            /* P96W75: nor the P96 overlay byte order (graphics-card
+             * playback of the classic MintVID, not used by the Pi). */
+            if (i >= MR_P96_YVYU_ITEM - 1 && i <= MR_P96_YUYV_ITEM) continue;
+            paula_menu[n] = menu_template[i];
+            if (menu_template[i].nm_UserData == MR_MENU_USER_ABOUT)
+                paula_menu[n].nm_Label = (STRPTR)"About MintVID-pi...";
+            n++;
+        }
+        memset(&paula_menu[n], 0, sizeof paula_menu[n]);
+        paula_menu[n].nm_Type = NM_ITEM;
+        paula_menu[n].nm_Label = (STRPTR)"Paula sound base";
+        n++;
+        for (i = 0; i < MR_PAULA_STEPS; i++) {
+            long ms = -50L * i;
+            snprintf(paula_labels[i], sizeof paula_labels[i], "%ld ms", ms);
+            memset(&paula_menu[n], 0, sizeof paula_menu[n]);
+            paula_menu[n].nm_Type = NM_SUB;
+            paula_menu[n].nm_Label = (STRPTR)paula_labels[i];
+            paula_menu[n].nm_Flags = CHECKIT | MENUTOGGLE | (ms == cur ? CHECKED : 0);
+            paula_menu[n].nm_MutualExclude = all & ~(1UL << i);
+            paula_menu[n].nm_UserData = (APTR)(ULONG)(MR_MENU_USER_PAULA0 + i);
+            n++;
+        }
+        for (i = bar; menu_template[i].nm_Type != NM_END; i++)
+            paula_menu[n++] = menu_template[i];
+        memset(&paula_menu[n], 0, sizeof paula_menu[n]);
+        paula_menu[n].nm_Type = NM_END;
+        menu->strip = CreateMenusA(paula_menu, NULL);
+    } else
     menu->strip = CreateMenusA(menu_template, NULL);
     if (!menu->strip ||
         !LayoutMenusA(menu->strip, menu->visual_info, NULL))
@@ -149,6 +198,15 @@ int mr_gui_menu_action(mr_gui_menu *menu, UWORD code)
         /* The browsers apply it to their own fetches straight away; mrplay
          * reads it when the next stream starts. */
         return MR_GUI_MENU_TLS;
+    }
+    if ((ULONG)user_data >= MR_MENU_USER_PAULA0 &&
+        (ULONG)user_data < MR_MENU_USER_PAULA0 + MR_PAULA_STEPS) {
+        long ms = -50L * (long)((ULONG)user_data - MR_MENU_USER_PAULA0);
+        if (mr_paula_pref_save(ms))
+            item->Flags |= CHECKED;
+        else
+            printf("MintVID-pi: could not save the Paula sound base\n");
+        return MR_GUI_MENU_PAULA;
     }
     if (user_data == MR_MENU_USER_ABOUT)
         return MR_GUI_MENU_ABOUT;
@@ -257,6 +315,29 @@ void mr_gui_show_about(struct Window *window, const char *edition)
 {
     struct EasyStruct request;
     const char *name = edition && *edition ? edition : "AmigaOS edition";
+
+    if (mr_gui_menu_with_paula) {
+        /* P96W74: MintVID-pi (PiStorm) About, credits as Michael wants. */
+        request.es_StructSize = sizeof(request);
+        request.es_Flags = 0;
+        request.es_Title = (UBYTE *)"About MintVID-pi";
+        request.es_TextFormat = (UBYTE *)
+            "MintVID-pi - H.264 video for PiStorm (Raspberry Pi 3A+)\n"
+            "Version v96.76 (22.10.2026)\n\n"
+            "PiStorm player (mrberry, berryvp.library):\n"
+            "H.264 on the Pi's VideoCore, AAC/AC3/E-AC3 sound\n"
+            "modules on the Pi's second core, HDMI output\n"
+            "by Michael 'MichiB210' (Germany)\n"
+            "https://github.com/MichiB210/MintVID-PiStorm\n\n"
+            "Paula sound player by Darren 'boingball' Banfi (UK)\n\n"
+            "Based on MintVID " MINTVID_VERSION " by Darren 'boingball' Banfi\n"
+            "https://github.com/boingball/MintVID\n\n"
+            "Emu68 by Michal Schulz, PiStorm by Claude Schwarz.\n"
+            "Built with MintAMP audio decoders, liba52 and Claude.";
+        request.es_GadgetFormat = (UBYTE *)"Cheers!";
+        EasyRequestArgs(window, &request, NULL, NULL);
+        return;
+    }
 
     request.es_StructSize = sizeof(request);
     request.es_Flags = 0;

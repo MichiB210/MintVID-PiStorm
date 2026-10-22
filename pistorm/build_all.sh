@@ -1,6 +1,7 @@
 #!/bin/sh
-# Builds all PiStorm/BerryCore runtime files of MintVID P35 into pistorm/out/P35
-# and compares them with the released P35 binaries (pistorm/P35_SHA256SUMS).
+# Builds all PiStorm/BerryCore runtime files of MintVID-PiStorm v96.76 into
+# pistorm/out/v96.76 and compares them with the released binaries
+# (pistorm/v96.76_SHA256SUMS).
 #
 # Tools (in PATH):
 #   m68k-amigaos-gcc (bebbo, 16.2)      MintVID, mrberry
@@ -10,21 +11,17 @@
 #   python3, tar, patch, make
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT="$HERE/out"; DIST="$OUT/P35"
+OUT="$HERE/out"; DIST="$OUT/v96.76"
 rm -rf "$OUT"; mkdir -p "$DIST"
 
-echo "== MintVID (GUI)"
+echo "== MintVID-pi (GUI)"
 make -C "$HERE/../player" -f Makefile.amiga \
      AMIGA_GCC="$(command -v m68k-amigaos-gcc)" MintVID >/dev/null
-mv "$HERE/../player/MintVID" "$DIST/MintVID"
+mv "$HERE/../player/MintVID" "$DIST/MintVID-pi"
 
 echo "== mrberry"
 sh "$HERE/mrberry/build.sh" "$OUT/mrberry" >/dev/null 2>&1
 cp "$OUT/mrberry/mrberry" "$DIST/"
-
-echo "== VPberry"
-sh "$HERE/vpberry/build.sh" "$OUT/vpberry" >/dev/null
-cp "$OUT/vpberry/VPberry" "$DIST/"
 
 echo "== berryvp.library"
 sh "$HERE/berryvp_library/build.sh" "$OUT/library" >/dev/null
@@ -53,4 +50,4 @@ while read -r sum name; do
   now=$(sha256sum "$name" | cut -d' ' -f1)
   if [ "$now" = "$sum" ]; then echo "  IDENTICAL   $name"
   else echo "  REBUILT     $name ($(wc -c < "$name") bytes, compiler differs from the release)"; fi
-done < "$HERE/P35_SHA256SUMS"
+done < "$HERE/v96.76_SHA256SUMS"

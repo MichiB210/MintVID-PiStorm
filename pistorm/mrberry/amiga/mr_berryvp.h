@@ -29,6 +29,8 @@ typedef struct {
     unsigned long audio_bytes;
 } mr_berryvp;
 
+extern unsigned long mr_berryvp_stream_flags;
+
 mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi);
 mr_status mr_berryvp_config_audio(mr_berryvp *b, const mr_audio_info *ai);
 mr_status mr_berryvp_send_packet(mr_berryvp *b, const mr_packet *pkt);

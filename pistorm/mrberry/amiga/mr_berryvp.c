@@ -58,11 +58,15 @@ extern void bvp_exec_closelibrary(struct Library *lib);
 
 /* AC309F: diagnostic only.  Trace the actual BerryVP ABI boundary around the
  * reproducible MOV/MP4 stall.  No scheduling or packet contents are changed. */
+/* OpenStream flags: 0 = cinema (HVS), 10/25/50/75 = P96 window size. */
+ULONG mr_berryvp_stream_flags = 0;
+
 static FILE *ac309f_trace;
 
 static FILE *ac309f_trace_file(void)
 {
 #if MR_DEBUG_LOGS
+    if (mr_berryvp_stream_flags) return NULL;   /* no file trace in window mode */
     if (!ac309f_trace) ac309f_trace = fopen("AC309F_BRIDGE.TXT", "w");
     return ac309f_trace;
 #else
@@ -228,20 +232,21 @@ static int parse_aac_config(mr_berryvp *b, const mr_audio_info *ai)
         obj = (unsigned)(ai->config[0] >> 3);
         sfi = (unsigned)(((ai->config[0] & 7u) << 1) | (ai->config[1] >> 7));
         ch = (unsigned)((ai->config[1] >> 3) & 0x0fu);
-        if (obj != 2u || sfi >= 13u || ch != 2u) return 0;
+        /* P96W31: stereo, 5.0 or 5.1; berry_faad03 mixes 5.x to stereo. */
+        if (obj != 2u || sfi >= 13u || (ch != 2u && ch != 5u && ch != 6u)) return 0;
         if (ai->sample_rate && aac_rates[sfi] != ai->sample_rate) return 0;
         b->aac_object_type = (uint8_t)obj;
         b->aac_sf_index = (uint8_t)sfi;
         b->aac_channels = (uint8_t)ch;
         return 1;
     }
-    if (ai->channels != 2) return 0;
+    if (ai->channels != 2 && ai->channels != 5 && ai->channels != 6) return 0;
     {
         int idx = aac_rate_index(ai->sample_rate);
         if (idx < 0) return 0;
         b->aac_object_type = 2;
         b->aac_sf_index = (uint8_t)idx;
-        b->aac_channels = 2;
+        b->aac_channels = (uint8_t)ai->channels;
     }
     return 1;
 }
@@ -259,7 +264,8 @@ static mr_status make_adts(mr_berryvp *b, const uint8_t *src, uint32_t n,
     uint8_t *p;
     if (!b || !src || !n || !out || !out_n) return MR_EFORMAT;
     if (packet_is_adts(src, n)) { *out = src; *out_n = n; return MR_OK; }
-    if (!b->audio_ready || b->aac_object_type != 2 || b->aac_channels != 2)
+    if (!b->audio_ready || b->aac_object_type != 2 ||
+        (b->aac_channels != 2 && b->aac_channels != 5 && b->aac_channels != 6))
         return MR_EUNSUPPORTED;
     if (n > 0x1fffu - 7u) return MR_EFORMAT;
     total = n + 7u;
@@ -314,7 +320,7 @@ mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi)
         return MR_EUNSUPPORTED;
     }
     DBG_PRINTF("[B05] before OpenStream\n");
-    r = bvp_call_openstream(b->lib, 0);
+    r = bvp_call_openstream(b->lib, mr_berryvp_stream_flags);
     DBG_PRINTF("[B06] after OpenStream r=%ld\n", (long)r);
     if (r != BVP_OK) {
         printf("Error: BerryVP OpenStream failed: %ld (%s).\n", (long)r, bvp_error_name(r));
@@ -370,13 +376,13 @@ mr_status mr_berryvp_config_audio(mr_berryvp *b, const mr_audio_info *ai)
 
     if (ai->format_tag == MR_AUDIO_FORMAT_AAC) {
         if (!parse_aac_config(b, ai)) {
-            printf("Error: AAC playback supports AAC-LC stereo at a standard ADTS sample rate only.\n");
+            printf("Error: AAC playback supports AAC-LC stereo or 5.1 at a standard ADTS sample rate only.\n");
             return MR_EUNSUPPORTED;
         }
         codec = BVP_CODEC_AAC;
         channels = 2UL;
-        DBG_PRINTF("[A01] ConfigAudio AAC-LC %lu Hz stereo\n",
-               (unsigned long)ai->sample_rate);
+        DBG_PRINTF("[A01] ConfigAudio AAC-LC %lu Hz input-ch=%u -> stereo HDMI\n",
+               (unsigned long)ai->sample_rate, (unsigned)b->aac_channels);
     } else if (ai->format_tag == MR_AUDIO_FORMAT_AC3) {
         if (ai->sample_rate < 8000 || ai->sample_rate > 192000 ||
             ai->channels < 1 || ai->channels > 6) {
