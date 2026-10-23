@@ -9,9 +9,10 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
 - **Paula sound** in full screen (mrberry `PAULA`, Paula player by Darren 'boingball' Banfi): AAC, MP3, MP2, AC3 and PCM decoded on the Amiga, synchronised to the Pi's video clock.
 
 > [!IMPORTANT]
-> **Requires the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** Playback only
-> works with it: the unmodified Emu68 kernel has no BerryCore service on CPU1,
-> so nothing will play.
+> **HDMI sound needs the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** The
+> unmodified Emu68 kernel has no BerryCore service on CPU1, so the AAC/AC3/E-AC3
+> decoders for HDMI cannot run. Video with Paula sound (`PAULA`) also works with
+> the original Emu68 1.0.7 kernel (tested on hardware, 23.10.2026).
 >
 > **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
 > Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
@@ -68,7 +69,7 @@ Everything ends up in `pistorm/out/v96.76/`, and each file is compared against `
 ## Installation (Amiga side)
 
 1. Copy `MintVID-pi`, `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into one drawer.
-2. **Required:** use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the SD card, instead of `Emu68-pistorm`. It is only available for Emu68 1.0.7 on PiStorm Classic / Raspberry Pi 3A+.
+2. **For HDMI sound:** use `Emu68-pistorm-BerryCore` as the Emu68 kernel on the SD card, instead of `Emu68-pistorm`. It is only available for Emu68 1.0.7 on PiStorm Classic / Raspberry Pi 3A+. Paula sound works with the original kernel.
 3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64` (add the line if it is missing).
 
 The modules must have the exact sizes that berryvp.library P32 expects. The build scripts check this.
@@ -104,7 +105,7 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 - exakt gleich (bytegleich) zum Release v96.76: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und der Emu68-BerryCore-Kern
 - berry_ac3 und berry_eac3 (in v96.76 die P35-Dateien) funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
-**Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` geht nichts. Zur Zeit gibt es ihn nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+**Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` gibt es keinen Ton über HDMI. Bild mit Ton über Paula läuft auch mit dem Original-Kern. Den gepatchten Kern gibt es zur Zeit nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
 **Installation:**
 1. Die sechs Dateien `MintVID-pi`, `mrberry`, `berryvp.library` und die drei `.module`-Dateien in eine Schublade kopieren. VPberry wird nicht mehr gebraucht.

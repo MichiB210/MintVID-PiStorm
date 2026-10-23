@@ -1,7 +1,8 @@
 # Emu68 1.0.7 BerryCore kernel
 
 > [!IMPORTANT]
-> MintVID-PiStorm only works with this patched kernel. It is made for the
+> MintVID-PiStorm needs this patched kernel for HDMI sound (Paula sound works
+> with the original kernel). It is made for the
 > Emu68 1.0.7 PiStorm kernel only, as used on PiStorm Classic with a
 > Raspberry Pi 3A+. The patch writes into fixed file offsets, so it cannot be
 > applied to any other Emu68 version or build. `build_berrycore.py` refuses

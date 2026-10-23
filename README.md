@@ -22,9 +22,10 @@ includes it in full (MIT licence). MintVID's own README is in
 [`docs/MintVID-README.md`](docs/MintVID-README.md).
 
 > [!IMPORTANT]
-> **Requires the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** Playback only
-> works with it: the unmodified Emu68 kernel has no BerryCore service on CPU1,
-> so nothing will play.
+> **HDMI sound needs the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** The
+> unmodified Emu68 kernel has no BerryCore service on CPU1, so the AAC/AC3/E-AC3
+> decoders for HDMI cannot run. Video with Paula sound (`PAULA`) also works with
+> the original Emu68 1.0.7 kernel (tested on hardware, 23.10.2026).
 >
 > **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
 > Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
@@ -76,9 +77,9 @@ modes work as in upstream MintVID.
 
 1. Copy `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the same drawer.
    - Add `MintVID-pi` too if you want the GUI.
-2. **Required:** replace the Emu68 kernel on the PiStorm's SD card (`Emu68-pistorm`) with the patched `Emu68-pistorm-BerryCore`.
+2. **For HDMI sound:** replace the Emu68 kernel on the PiStorm's SD card (`Emu68-pistorm`) with the patched `Emu68-pistorm-BerryCore`.
    - This is Emu68 1.0.7 for PiStorm Classic / Raspberry Pi 3A+, with the BerryCore service on CPU1.
-   - Without it, nothing plays.
+   - Without it there is no HDMI sound. Video with Paula sound works with the original kernel.
    - It only exists for this Emu68 version and this hardware.
 3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64`. If the line is missing, add it.
 
@@ -147,7 +148,7 @@ synchron auf einem Amiga mit PiStorm ab:
 - Im Vollbild kann der Ton auch über Paula laufen (Paula-Player von Darren 'boingball' Banfi).
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
 
-**Wichtig:** Es läuft nur mit dem gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`, und zur Zeit nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+**Wichtig:** Für den Ton über HDMI braucht es den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`. Bild mit Ton über Paula läuft auch mit dem Original-Kern Emu68 1.0.7. Zur Zeit läuft alles nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
 
 Außerdem muss in der `config.txt` auf der SD-Karte `gpu_mem=64` stehen. Fehlt die Zeile, bitte ergänzen.
 
