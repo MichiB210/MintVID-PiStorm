@@ -38,6 +38,22 @@
 #define MR_LOCAL_FILE_READ_CHUNK   (64u * 1024u)
 #define MR_LOCAL_FILE_READAHEAD    (128u * 1024u)
 
+/* mrberry --read=KB: size of one read from the file, and the read-ahead
+ * window is two of them. The default stays at the 64 KiB / 128 KiB that was
+ * tuned on local USB/SD storage, where a bigger read blocks the player for
+ * too long. Over a network share every read waits a round trip, so fewer,
+ * bigger reads are faster there. Set before the file is opened. */
+static size_t g_read_chunk = MR_LOCAL_FILE_READ_CHUNK;
+static size_t g_readahead  = MR_LOCAL_FILE_READAHEAD;
+
+void mrb_source_set_read_kb(unsigned kb)
+{
+    if (kb < 64u) kb = 64u;
+    if (kb > 1024u) kb = 1024u;
+    g_read_chunk = (size_t)kb * 1024u;
+    g_readahead = 2u * g_read_chunk;
+}
+
 struct mr_source {
     void   *ctx;
     size_t  len;
@@ -299,7 +315,7 @@ static int file_read_chunked(file_source *f, size_t off, unsigned char *dst, siz
     if (!file_seek_exact(f, off)) return 0;
     while (done < len) {
         size_t chunk = len - done;
-        if (chunk > MR_LOCAL_FILE_READ_CHUNK) chunk = MR_LOCAL_FILE_READ_CHUNK;
+        if (chunk > g_read_chunk) chunk = g_read_chunk;
 #if defined(AMIGA_M68K) || defined(__amigaos__) || defined(__AMIGA__)
         if (f->large_file_mode) {
             if (!n96q_dos_read_exact(f, dst + done, chunk)) return 0;
@@ -324,7 +340,7 @@ static int file_fill_readahead(file_source *f, size_t off)
     unsigned long fill_ms;
     if (!f || !f->readahead || off > f->file_len) return 0;
     want = f->file_len - off;
-    if (want > MR_LOCAL_FILE_READAHEAD) want = MR_LOCAL_FILE_READAHEAD;
+    if (want > g_readahead) want = g_readahead;
     if (!file_seek_exact(f, off)) return 0;
     f->ra_fills++;
     fill_started = clock();
@@ -332,7 +348,7 @@ static int file_fill_readahead(file_source *f, size_t off)
         size_t chunk = want - done;
         clock_t read_started;
         unsigned long read_ms;
-        if (chunk > MR_LOCAL_FILE_READ_CHUNK) chunk = MR_LOCAL_FILE_READ_CHUNK;
+        if (chunk > g_read_chunk) chunk = g_read_chunk;
         read_started = clock();
 #if defined(AMIGA_M68K) || defined(__amigaos__) || defined(__AMIGA__)
         if (f->large_file_mode) {
@@ -385,7 +401,7 @@ static int file_read_at(void *opaque, size_t off, void *dst, size_t len)
     if (!f->file) return 0;
 
     /* Large caller ranges bypass the cache but still use <=64-KiB reads. */
-    if (!f->readahead || len > MR_LOCAL_FILE_READAHEAD)
+    if (!f->readahead || len > g_readahead)
         return file_read_chunked(f, off, out, len);
 
     /* Serve a complete hit without touching DOS/USB. */
@@ -440,8 +456,8 @@ static void file_write_io_log(file_source *f, int snapshot)
     log = fopen("N68B_IO.TXT", "w");
     if (!log) return;
     fprintf(log, "N97QD SNAPSHOT=%lu\n", snapshot ? 1UL : 0UL);
-    fprintf(log, "N68B READ_AHEAD_BYTES=%lu\n", (unsigned long)MR_LOCAL_FILE_READAHEAD);
-    fprintf(log, "N68B READ_CHUNK_MAX_BYTES=%lu\n", (unsigned long)MR_LOCAL_FILE_READ_CHUNK);
+    fprintf(log, "N68B READ_AHEAD_BYTES=%lu\n", (unsigned long)g_readahead);
+    fprintf(log, "N68B READ_CHUNK_MAX_BYTES=%lu\n", (unsigned long)g_read_chunk);
     fprintf(log, "N68B FILE_SIZE=%lu\n", (unsigned long)f->file_len);
     fprintf(log, "N96Q LARGE_FILE_MODE=%lu\n", f->large_file_mode ? 1UL : 0UL);
     fprintf(log, "N96Q DOS_REOPENS=%lu\n", f->lf_reopens);
@@ -675,13 +691,21 @@ static mr_source *open_local_file(const char *path, size_t requested_buffer)
             }
         }
         if (!ctx->buffer)
-            (void)setvbuf(file, NULL, _IOFBF, MR_LOCAL_FILE_BUFFER_SIZE);
+            (void)setvbuf(file, NULL, _IOFBF,
+                          g_read_chunk > MR_LOCAL_FILE_BUFFER_SIZE ?
+                          g_read_chunk : MR_LOCAL_FILE_BUFFER_SIZE);
     }
 
     /* N68: a real read-ahead layer above stdio.  The stdio window remains
      * 64 KiB; the explicit cache is 128 KiB and is filled in two <=64-KiB
      * fread() calls. Allocation failure simply preserves the old path. */
-    ctx->readahead = (unsigned char *)mr_alloc_fast(MR_LOCAL_FILE_READAHEAD);
+    ctx->readahead = (unsigned char *)mr_alloc_fast(g_readahead);
+    if (!ctx->readahead && g_readahead > MR_LOCAL_FILE_READAHEAD) {
+        /* No room for the bigger window: fall back to the default sizes. */
+        g_read_chunk = MR_LOCAL_FILE_READ_CHUNK;
+        g_readahead = MR_LOCAL_FILE_READAHEAD;
+        ctx->readahead = (unsigned char *)mr_alloc_fast(g_readahead);
+    }
     ctx->readahead_start = 0;
     ctx->readahead_len = 0;
 

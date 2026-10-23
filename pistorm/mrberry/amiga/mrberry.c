@@ -26,6 +26,7 @@
 #endif
 
 extern ULONG bvp_exec_setsignal(ULONG newSignals, ULONG signalSet);
+extern void mrb_source_set_read_kb(unsigned kb);   /* core/mr_source.c, W77 */
 extern ULONG ac309i_read_sys_us(void);
 
 /* D4: keep the ~4 KiB BerryVP bridge context out of the Amiga CLI stack.
@@ -241,6 +242,68 @@ typedef struct {
 } p06_player_status_snapshot;
 static ULONG p06_status_seq;
 
+/* P96W77: the live control port MintVID's own GUI looks for while a player
+ * runs (docs/EXTERNAL_PLAYER.md in Darren's MintVID, layout of
+ * mr_player_control_port in player/amiga/mr_player_status.h): MsgPort first,
+ * then the command bits (Ctrl-E), the volume and the live status. */
+#define P77_PORT_NAME "MintVID.player"
+#define P77_CMD_PAUSE      (1UL << 0)
+#define P77_CMD_FAST       (1UL << 1)
+#define P77_CMD_FULLSCREEN (1UL << 2)
+typedef struct {
+    struct MsgPort port;
+    volatile ULONG commands;
+    volatile ULONG volume;
+    p06_player_status status;
+} p77_control_port;
+static p77_control_port *p77_port;
+
+static void p77_port_close(void)
+{
+    if (p77_port) {
+        Forbid();
+        RemPort(&p77_port->port);
+        Permit();
+        FreeMem(p77_port, sizeof *p77_port);
+        p77_port = NULL;
+    }
+}
+
+static void p77_port_open(void)
+{
+    p77_control_port *b;
+    Forbid();
+    if (FindPort((CONST_STRPTR)P77_PORT_NAME)) { Permit(); return; }
+    Permit();
+    b = (p77_control_port *)AllocMem(sizeof *b, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!b) return;
+    b->port.mp_Node.ln_Type = NT_MSGPORT;
+    b->port.mp_Node.ln_Name = (char *)P77_PORT_NAME;
+    b->port.mp_Flags = PA_IGNORE;
+    b->port.mp_SigTask = FindTask(NULL);
+    b->port.mp_MsgList.lh_Head = (struct Node *)&b->port.mp_MsgList.lh_Tail;
+    b->port.mp_MsgList.lh_Tail = NULL;
+    b->port.mp_MsgList.lh_TailPred = (struct Node *)&b->port.mp_MsgList.lh_Head;
+    b->volume = 64;
+    b->status.state = 0;
+    b->status.magic = 0x4D525653UL;
+    AddPort(&b->port);
+    p77_port = b;
+    atexit(p77_port_close);
+}
+
+/* Ctrl-E: take and clear the command bits. */
+static ULONG p77_take_commands(void)
+{
+    ULONG c = 0;
+    if (!p77_port) return 0;
+    Forbid();
+    c = p77_port->commands;
+    p77_port->commands = 0;
+    Permit();
+    return c;
+}
+
 static void p06_status_copy(char *dst, size_t size, const char *src)
 {
     size_t i = 0;
@@ -265,6 +328,18 @@ static void p06_status_write(LONG state, const char *codec, const char *text)
     p06_status_copy(snapshot.status.text, sizeof snapshot.status.text,
                     text ? text : "");
     snapshot.trailer_magic = P06_STATUS_MAGIC;
+
+    if (p77_port) {                       /* P96W77: live status */
+        Forbid();
+        p77_port->status.state = state;
+        p06_status_copy(p77_port->status.codec, sizeof p77_port->status.codec,
+                        codec ? codec : "");
+        p06_status_copy(p77_port->status.text, sizeof p77_port->status.text,
+                        text ? text : "");
+        p77_port->status.seq = snapshot.status.seq;   /* same counter as T: */
+        p77_port->status.magic = P06_STATUS_MAGIC;
+        Permit();
+    }
 
     file = Open((CONST_STRPTR)P06_STATUS_TMP, MODE_NEWFILE);
     if (!file) return;
@@ -595,6 +670,10 @@ static int p45_pause_requested(void)
         }
     }
     if (bvp_exec_setsignal(0, SIGBREAKF_CTRL_D) & SIGBREAKF_CTRL_D) req = 1;
+    /* P96W77: Ctrl-E from MintVID's GUI: MR_PLAYER_COMMAND_PAUSE toggles
+     * pause.  FAST and FULLSCREEN are not supported yet (ignored). */
+    if (bvp_exec_setsignal(0, SIGBREAKF_CTRL_E) & SIGBREAKF_CTRL_E)
+        if (p77_take_commands() & P77_CMD_PAUSE) req = 1;
     if (!req) return 0;
     if (P67_FREE) return 0;   /* P96W67: no pause yet with the free Pi clock */
     /* one key press may arrive as RAWKEY and VANILLAKEY: merge (250 ms) */
@@ -1383,9 +1462,47 @@ int main(int argc, char **argv)
                 p96s_off = 1;                     /* NOSYNC: no clock, draw at once */
             } else if ((a[0] == 'P' || a[0] == 'p') && (a[1] == 'I' || a[1] == 'i')) {
                 p45_no_idle = 1;                  /* P96W46 test: PIDLE0 */
+            } else if ((a[0] == 'R' || a[0] == 'r') && (a[1] == 'E' || a[1] == 'e') &&
+                       (a[2] == 'A' || a[2] == 'a') && (a[3] == 'D' || a[3] == 'd') &&
+                       (a[4] == '=' || a[4] == ':')) {
+                /* P96W77: READ=KB, size of one file read (Darren's --read) */
+                unsigned long kb = strtoul(a + 5, NULL, 10);
+                if (kb < 64 || kb > 1024) {
+                    printf("Error: READ= must be 64..1024 (KB).\n");
+                    return 5;
+                }
+                mrb_source_set_read_kb((unsigned)kb);
+            } else if (a[0] == '-' && a[1] == '-') {
+                /* P96W77: the option names MintVID (Darren's GUI) passes,
+                 * docs/EXTERNAL_PLAYER.md.  Unknown --options are an error
+                 * (before W77 they were silently read as AV=0). */
+                if (!strcmp(a, "--paula")) p67_paula = 1;
+                else if (!strcmp(a, "--audio-rate=low")) p67_low = 1;
+                else if (!strncmp(a, "--audio-rate=", 13)) { /* normal: default */ }
+                else if (!strcmp(a, "--audio-mono")) p67_mono = 1;
+                else if (!strcmp(a, "--no-audio")) p63_noaudio = 1;
+                else if (!strncmp(a, "--start=", 8)) {
+                    if (!p50_parse_time(a + 8, &p50_t_us)) {
+                        printf("Error: --start must be H:MM or H:MM:SS.\n");
+                        return 5;
+                    }
+                    p50_t_set = p50_t_us != 0;
+                    cli_t = 1;
+                } else if (!strncmp(a, "--read=", 7)) {
+                    unsigned long kb = strtoul(a + 7, NULL, 10);
+                    if (kb < 64 || kb > 1024) {
+                        printf("Error: --read must be 64..1024 (KB).\n");
+                        return 5;
+                    }
+                    mrb_source_set_read_kb((unsigned)kb);
+                } else {
+                    printf("Error: unknown option %s\n", a);
+                    bad = 1;
+                }
             } else if (((a[0] == 'A' || a[0] == 'a') && (a[1] == 'V' || a[1] == 'v') &&
                         (a[2] == ':' || a[2] == '=')) ||
-                       a[0] == '-' || (a[0] >= '0' && a[0] <= '9')) {
+                       (a[0] == '-' && a[1] >= '0' && a[1] <= '9') ||
+                       (a[0] >= '0' && a[0] <= '9')) {
                 /* P96W26: AV:<ms> = how much later window frames are shown */
                 int av = (a[0] == 'A' || a[0] == 'a');
                 long ms = strtol(av ? a + 3 : a, NULL, 10);
@@ -1401,9 +1518,13 @@ int main(int argc, char **argv)
         }
         if (bad) {
             printf("mrberry - H.264 hardware A/V player\n"
-                   "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [W=10|25|50|75] [T=h:mm] [R] [AV=ms|NOSYNC]\n"
+                   "Usage: mrberry <movie.mkv|movie.mp4|movie.ts> [W=10|25|50|75] [T=h:mm] [R] [PAULA [PLOW] [PMONO]] [NOAUDIO] [READ=KB] [AV=ms|NOSYNC]\n"
                    "  T=0:01 = start at 1 minute, T=1:30 = 1 h 30 min (T=1:30:15 with seconds)\n"
                    "  R = continue where the film was stopped (<film>.t)\n"
+                   "  PAULA = sound through the Amiga (PLOW lower rate, PMONO mono)\n"
+                   "  READ=64..1024 = KB per file read (default 64, bigger for network shares)\n"
+                   "  Also understood (MintVID): --paula --audio-rate=low --audio-mono\n"
+                   "    --no-audio --start=H:MM:SS --read=KB\n"
                    "  mrberry <movie> INFO = show length, video and sound, no playback\n");
             return 5;
         }
@@ -1431,6 +1552,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    p77_port_open();                      /* P96W77: MintVID.player */
     p62_pos_clear();
     p06_status_write(P06_STATE_OPENING, "H.264 / VideoCore",
                      "Opening PiStorm VideoCore playback...");
