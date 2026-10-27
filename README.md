@@ -74,7 +74,10 @@ Or with the GUI **MintVID-pi**: pick a film and choose the display mode
 **PiStorm / VC Hard Fullscreen (Paula)**. MintVID-pi has Play/Pause,
 Stop, a time line and ">>" to jump to the time set on the slider.
 The Paula sound offset base is set in the menu ("Paula sound base");
-during playback + and - fine-tune it per film.
+during playback + and - fine-tune it per film. Pause (Space or "||")
+also works with Paula sound: the film stops at the picture on screen,
+MintVID-pi shows that spot as a still picture in a window, and Play
+(or Space) continues in full screen with Paula sound.
 
 Since v96.76 VPberry is no longer needed. All other MintVID playback
 modes work as in upstream MintVID.
@@ -117,7 +120,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.76
+This builds all runtime files and compares them with the released v96.79
 binaries. Tools needed:
 
 - m68k-amigaos-gcc
