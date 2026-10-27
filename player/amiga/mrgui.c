@@ -670,6 +670,15 @@ static int g_play_shows_pause;      /* 1 = button reads "||" */
 static int g_full_enabled = -1;
 static int g_player_paused;         /* mrberry status text "Paused" */
 static int g_player_was_running;
+/* P96W78: Paula pause = mrberry stopped at the spot (status ENDED "Paused",
+ * .t without recap).  Play then continues there like ">>". */
+static int g_paula_paused;
+/* P96W79: during the Paula pause MintVID-pi shows a still picture: mrberry
+ * W=50 T=<spot> STILL (window, no sound).  g_still_active = that process is
+ * ours; g_still_resume = Space pressed in the still window (status ENDED
+ * "Resume") -> start the Paula fullscreen again. */
+static int g_still_active;
+static int g_still_resume;
 static int g_launch_display = -1;   /* display of the last launch */
 static Object *g_mode;              /* P96W59: Display chooser */
 
@@ -729,8 +738,12 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
         if (out) Close(out);
         return 0;
     }
+    /* P96W78a: give mrberry the same stack as for playback.  Without
+     * NP_StackSize a Workbench-started MintVID-pi runs the command with the
+     * small default stack (often 4 KB); the MKV/MP4 demuxer overflowed it
+     * and overwrote memory (rare 8000 0004 / freeze when choosing a film). */
     SystemTags((CONST_STRPTR)cmd, SYS_Input, (ULONG)in, SYS_Output, (ULONG)out,
-               TAG_END);
+               NP_StackSize, MRPLAY_STACK_SIZE, TAG_END);
     Close(in);
     Close(out);
 
@@ -738,7 +751,8 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
     if (!out) return 0;
     n = Read(out, buf, (LONG)sizeof buf - 1);
     Close(out);
-    DeleteFile((CONST_STRPTR)"T:MintVID-pi.info");
+    /* P96W78a: the file stays in T: (overwritten each time), so the last
+     * INFO answer incl. STACK= can be checked with "Type T:MintVID-pi.info". */
     if (n <= 0) return 0;
     buf[n] = 0;
 
@@ -1208,6 +1222,20 @@ static void poll_player_status(Object *info, struct Window *window)
     player_status_seq = ps.seq;
     g_player_paused = ps.state == MR_PLAYER_STATE_PLAYING &&
                       !strcmp(ps.text, "Paused");
+    if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Paused")) {
+        g_paula_paused = 1;                       /* P96W78 */
+        set_info(info, window, "Paused - press > to continue.");
+        return;
+    }
+    if (g_still_active) {                         /* P96W79: the still */
+        if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Resume"))
+            g_still_resume = 1;
+        if (ps.state == MR_PLAYER_STATE_PLAYING && !strcmp(ps.text, "Paused"))
+            set_info(info, window, "Paused - press > to continue.");
+        else if (ps.state == MR_PLAYER_STATE_OPENING)
+            set_info(info, window, "Paused - showing the picture...");
+        return;
+    }
 
     if (ps.state == MR_PLAYER_STATE_OPENING)
         snprintf(line, sizeof(line), "%s",
@@ -1329,6 +1357,7 @@ static void start_player_path(const char *full_file, Object *mode,
                       no_audio, mono_audio, video_mode, &options);
     g_launch_display = (int)options.display;
     g_player_paused = 0;
+    g_paula_paused = 0;
 
     if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN ||
         options.display == MR_DISPLAY_PISTORM_PAULA) {
@@ -1484,9 +1513,9 @@ static void start_player(Object *file, Object *mode, Object *c2p,
 static void mrg_buttons_update(struct Window *window)
 {
     int running = find_player() != NULL;
+    /* P96W78: Paula has a pause now (stop at the spot + Play) */
     int show_pause = running && !g_player_paused &&
-                     g_launch_display != MR_DISPLAY_PISTORM_RGB &&
-                     g_launch_display != MR_DISPLAY_PISTORM_PAULA;
+                     g_launch_display != MR_DISPLAY_PISTORM_RGB;
     int full = running && g_launch_display == MR_DISPLAY_PISTORM_HARD_WINDOW;
     if (!running) g_player_paused = 0;
     if (g_play_button && window && show_pause != g_play_shows_pause) {
@@ -1505,6 +1534,62 @@ static void mrg_buttons_update(struct Window *window)
         SetGadgetAttrs((struct Gadget *)g_full_button, window, NULL,
                        GA_Disabled, full ? FALSE : TRUE, TAG_DONE);
     }
+}
+
+/* P96W79: still picture for the Paula pause.  The slider already stands on
+ * the pause spot (.t read again).  The display chooser and g_launch_display
+ * stay on "Fullscreen (Paula)", so ">" and ">>" continue with Paula. */
+static void mrg_start_still(Object *info, struct Window *window)
+{
+    char args[1600];
+    BPTR seglist;
+    struct Process *process;
+
+    if (!g_film_path[0] || find_player()) return;
+    if (!mr_build_mrberry_arguments(args, sizeof(args), g_film_path) ||
+        !mrg_args_append(args, sizeof(args), "W=50") ||
+        !mrg_args_append_time(args, sizeof(args), g_film_path) ||
+        !mrg_args_append(args, sizeof(args), "STILL"))
+        return;
+    seglist = LoadSeg((CONST_STRPTR)"PROGDIR:mrberry");
+    if (!seglist)
+        seglist = LoadSeg((CONST_STRPTR)"mrberry");
+    if (!seglist) return;
+    clear_player_status_snapshot();
+    player_status_seq = 0;
+    g_still_resume = 0;
+    process = CreateNewProcTags(
+        NP_Seglist, seglist, NP_FreeSeglist, TRUE,
+        NP_Arguments, (ULONG)args, NP_StackSize, MRPLAY_STACK_SIZE,
+        NP_Cli, TRUE, NP_CommandName, (ULONG)"mrberry",
+        NP_Name, (ULONG)"MintVID-pi player", TAG_END);
+    if (!process) {
+        UnLoadSeg(seglist);
+        return;
+    }
+    g_still_active = 1;
+    g_player_was_running = 1;
+    set_info(info, window, "Paused - showing the picture...");
+}
+
+/* P96W79: end the still (Ctrl-F; it never writes the .t).  1 = gone. */
+static int mrg_stop_still(void)
+{
+    struct Task *task;
+    int guard;
+
+    Forbid();
+    task = FindTask((STRPTR)"MintVID-pi player");
+    if (task) Signal(task, SIGBREAKF_CTRL_F);
+    Permit();
+    for (guard = 0; guard < 500 && find_player(); guard++)
+        Delay(1);
+    if (find_player()) return 0;
+    g_still_active = 0;
+    g_still_resume = 0;
+    g_player_was_running = 0;
+    g_player_paused = 0;
+    return 1;
 }
 
 /* Fullscreen: stop the PiStorm window film with Ctrl-F (mrberry writes the
@@ -1644,6 +1729,8 @@ static void mrg_jump(Object *file, Object *mode, Object *c2p,
     }
     g_player_was_running = 0;
     g_player_paused = 0;
+    g_still_active = 0;                 /* P96W79: ">>" also from the still */
+    g_still_resume = 0;
     g_pos_hold = 0;
     g_pos_last = (ULONG)-1;
     /* re-read the film (.t now holds the stop position), then put the
@@ -2643,8 +2730,34 @@ int main(void)
              * which did not move the slider on hardware.) */
             {
                 int running = find_player() != NULL;
-                if (g_player_was_running && !running && g_film_path[0])
-                    mrg_film_info_apply(g_film_path, info, window, 0);
+                if (g_player_was_running && !running && g_film_path[0]) {
+                    /* P96W79: read the last status once more - the player may
+                     * have written "Paused"/"Resume" and ended in this tick */
+                    poll_player_status(info, window);
+                    if (g_still_active) {
+                        /* P96W79: the still ended (Space = continue, or
+                         * Esc / window closed = stay paused, no picture) */
+                        int resume = g_still_resume;
+                        g_still_active = 0;
+                        g_still_resume = 0;
+                        g_player_paused = 0;
+                        if (resume)        /* .t unchanged: slider as it is */
+                            start_player(file, mode, c2p, h264, lace, scale,
+                                         audio_rate, fast_buffer, no_audio,
+                                         mono_audio, video_mode, info, window);
+                        else if (g_paula_paused)
+                            set_info(info, window, "Paused - press > to continue.");
+                    } else {
+                        mrg_film_info_apply(g_film_path, info, window, 0);
+                        /* P96W78: slider now on the pause spot (.t) */
+                        if (g_paula_paused) {
+                            set_info(info, window, "Paused - press > to continue.");
+                            if (g_film_seek)          /* P96W79: still picture */
+                                mrg_start_still(info, window);
+                        }
+                    }
+                    running = find_player() != NULL;
+                }
                 g_player_was_running = running;
                 if (running) mrg_pos_poll(window);
                 else { g_pos_hold = 0; g_pos_last = (ULONG)-1; }
@@ -2727,12 +2840,25 @@ int main(void)
 
                 case G_PLAY:
                     /* P96W58: one button - start, or pause/continue */
-                    if (find_player() &&
-                        (g_launch_display == MR_DISPLAY_PISTORM_RGB ||
-                         g_launch_display == MR_DISPLAY_PISTORM_PAULA)) {
-                        set_info(info, window, g_launch_display == MR_DISPLAY_PISTORM_PAULA ?
-                                 "Pause is not available with Paula sound yet." :
-                                 "Amiga RGB output has no pause.");
+                    if (find_player() && g_still_active) {
+                        /* P96W79: end the still, continue with Paula */
+                        if (mrg_stop_still()) {
+                            /* .t is unchanged; the slider keeps the pause
+                             * spot or the time the user chose meanwhile */
+                            start_player(file, mode, c2p, h264, lace, scale,
+                                         audio_rate, fast_buffer, no_audio,
+                                         mono_audio, video_mode, info, window);
+                        } else {
+                            set_info(info, window, "The still picture did not end - press [] first.");
+                        }
+                    } else if (find_player() &&
+                        g_launch_display == MR_DISPLAY_PISTORM_RGB) {
+                        set_info(info, window, "Amiga RGB output has no pause.");
+                    } else if (find_player() &&
+                               g_launch_display == MR_DISPLAY_PISTORM_PAULA) {
+                        /* P96W78: mrberry stops at the spot (Ctrl-D) */
+                        signal_player(SIGBREAKF_CTRL_D);
+                        set_info(info, window, "Pausing...");
                     } else if (find_player()) {
                         signal_player(SIGBREAKF_CTRL_D);
                         g_player_paused = !g_player_paused;
@@ -2752,6 +2878,9 @@ int main(void)
 
                 case G_STOP:
                     stop_player_and_wait();
+                    g_still_active = 0;       /* P96W79: [] ends the pause too */
+                    g_still_resume = 0;
+                    g_paula_paused = 0;
                     /* P96W58: mrberry has written <film>.t - read it now */
                     if (!find_player() && g_player_was_running && g_film_path[0]) {
                         g_player_was_running = 0;

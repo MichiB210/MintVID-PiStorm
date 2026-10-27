@@ -648,6 +648,30 @@ static void p73_base_load(void)
 static int p69_av_set;
 static int p70_used;               /* Paula was really playing (for .t) */
 static int p67_anchored;
+/* P96W78: pause in the Paula fullscreen = stop at the exact spot.  The free
+ * Pi clock (CLK81) cannot be paused safely, so a pause key (Space, Ctrl-D,
+ * MintVID.player PAUSE) ends mrberry like Ctrl-F: .t without the 30-s recap,
+ * status ENDED "Paused".  MintVID-pi then shows ">" and Play starts again
+ * at that spot.  The spot is the Pi clock = picture on screen:
+ * film time = (now - clock start) + T= base. */
+static int p50_t_set;               /* defined with the T= code below */
+static uint64_t p50_base_us;
+static uint64_t p54_last_vpts_raw;
+static int p54_have_raw;
+static int p78_pause_stop;
+static uint32_t p78_clock_sys;      /* Pi clock start (same timer as Paula) */
+static uint64_t p78_stop_us;
+static int p78_have_stop;
+/* P96W79: STILL = still picture for the Paula pause.  MintVID-pi starts
+ * "mrberry <film> W=50 T=<spot> STILL" after a Paula pause: window, no sound,
+ * no clock queries (NOSYNC).  As soon as the first picture is in the window
+ * mrberry stops reading and waits like the window pause (W49).  It never
+ * writes the .t or the timeline position.  Space (in the window) = continue:
+ * status ENDED "Resume" -> MintVID-pi starts the Paula fullscreen again.
+ * Esc / close / Ctrl-C / Ctrl-F = just end. */
+static int p79_still, p79_resume;
+static uint32_t p79_t0;
+static int p79_have_t0;
 #define P67_FREE (p63_noaudio || p67_paula)   /* no HDMI audio, Pi clock alone */
 static void p67_cleanup(void)
 {
@@ -676,7 +700,26 @@ static int p45_pause_requested(void)
     if (bvp_exec_setsignal(0, SIGBREAKF_CTRL_E) & SIGBREAKF_CTRL_E)
         if (p77_take_commands() & P77_CMD_PAUSE) req = 1;
     if (!req) return 0;
-    if (P67_FREE) return 0;   /* P96W67: no pause yet with the free Pi clock */
+    if (P67_FREE) {
+        /* P96W67: the free Pi clock cannot pause.  P96W78: with Paula the
+         * pause key stops at the exact spot (see p78_*). NOAUDIO: ignored. */
+        if (p67_paula && p67_anchored && !p78_pause_stop) {
+            uint32_t now = (uint32_t)ac309i_read_sys_us();
+            uint64_t at = (uint64_t)(uint32_t)(now - p78_clock_sys) +
+                          (p50_t_set ? p50_base_us : 0);
+            if (p54_have_raw && at > p54_last_vpts_raw) at = p54_last_vpts_raw;
+            p78_stop_us = at;
+            p78_have_stop = 1;
+            p78_pause_stop = 1;
+            if (n76_hostlog) {
+                fprintf(n76_hostlog, "P78_PAUSE_STOP film_ms=%lu read_ms=%lu\n",
+                        (unsigned long)(at / 1000ULL),
+                        (unsigned long)(p54_last_vpts_raw / 1000ULL));
+                fflush(n76_hostlog);
+            }
+        }
+        return 0;
+    }
     /* one key press may arrive as RAWKEY and VANILLAKEY: merge (250 ms) */
     now = (uint32_t)ac309i_read_sys_us();
     if (p45_have_toggle && (uint32_t)(now - p45_last_toggle_us) < 250000u) return 0;
@@ -716,6 +759,40 @@ static int p45_pause_loop(ac309i_pacer *pace, uint32_t *eac3_wall)
     return stop;
 }
 
+/* P96W79: has the library drawn a picture in the window yet?  (P96S +20 =
+ * shown counter, counted after every window blit.) */
+static int p79_shown(void)
+{
+    unsigned long v;
+    volatile unsigned long *s;
+    if (!g_bvp.lib) return 0;
+    v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
+    if (!v || ((volatile unsigned long *)v)[0] != 0x50393653UL) return 0;   /* 'P96S' */
+    s = (volatile unsigned long *)v;
+    s[16] = 1;                                   /* no clock queries */
+    return s[5] != 0;
+}
+
+/* P96W79: hold the still.  Returns 1 = continue (Space), 0 = end. */
+static int p79_still_loop(void)
+{
+    int resume = 0;
+    p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", "Paused");
+    if (n76_hostlog) {
+        fprintf(n76_hostlog, "P79_STILL_HOLD shown=%d\n", p79_shown());
+        fflush(n76_hostlog);
+    }
+    for (;;) {
+        Delay(2);
+        if (g_bvp.lib) bvp_call_control(g_bvp.lib, P45_CTRL_IDLE);
+        if (p05_input_poll_stop() ||
+            p58_stop_sig(bvp_exec_setsignal(0, 0))) break;
+        if (p45_pause_requested()) { resume = 1; break; }
+    }
+    n76_hlog(resume ? "P79_STILL_RESUME" : "P79_STILL_END");
+    return resume;
+}
+
 /* ---- P96W46: soft pause in the window ----------------------------------
  * W45 stopped the picture at once, but the sound already sent to the Pi
  * (0.4-0.8 s ahead) kept playing.  After "continue" the sound clock was then
@@ -742,6 +819,7 @@ static int p45_service(mr_berryvp *bvp, ac309i_pacer *pace, uint32_t *eac3_wall,
     int req = p45_pause_requested();
     uint32_t now = (uint32_t)ac309i_read_sys_us();
 
+    if (p78_pause_stop) return 1;   /* P96W78: Paula pause = stop here */
     if (req) {
         if (p45_phase == 1) {
             /* second key press while draining: continue at once */
@@ -1020,6 +1098,7 @@ static mr_status ac309i_service_mov_video(mr_berryvp *bvp, ac309i_pacer *pace,
             uint32_t cs = g_bvp.lib ? (uint32_t)bvp_call_control(g_bvp.lib, P68_CTRL_CLOCKSTART) : 0;
             if (cs && (uint32_t)(t - cs) > 5000000u) cs = 0;   /* old library: error code */
             p67_anchored = 1;
+            p78_clock_sys = cs ? cs : t;           /* P96W78: pause spot */
             mrb_paula_anchor(p67_pa, cs ? cs : t, 0);
             if (n76_hostlog) { fprintf(n76_hostlog, "P67_ANCHOR sys=%lu clockstart=%lu gap_ms=%ld first_pts_ms=%lu\n",
                                (unsigned long)t, (unsigned long)cs,
@@ -1159,6 +1238,7 @@ static void p70_apply_keys(void)
 }
 static void p62_pos_update(uint64_t film_us)
 {
+    if (p79_still) return;          /* P96W79: the still leaves the timeline alone */
     if (p62_have && film_us < p62_next_us) return;
     p62_pos_write(film_us);
     p62_next_us = film_us - film_us % P62_STEP_US + P62_STEP_US;
@@ -1305,6 +1385,12 @@ static int p56_info(const char *film)
     uint64_t dur;
 
     printf("MRBERRY_INFO=1\nFILE=%s\n", film);
+    {
+        /* P96W78a: stack this INFO run got (check for MintVID-pi's call). */
+        struct Task *me = FindTask(NULL);
+        printf("STACK=%lu\n", (unsigned long)((ULONG)me->tc_SPUpper -
+                                              (ULONG)me->tc_SPLower));
+    }
     d = mr_demux_open_file(film);
     if (!d) {
         printf("PLAYABLE=0\nREASON=cannot open file (%s)\n", mr_demux_last_open_error());
@@ -1452,6 +1538,9 @@ int main(int argc, char **argv)
                 }
             } else if (!strcmp(a, "PAULA") || !strcmp(a, "paula") || !strcmp(a, "Paula")) {
                 p67_paula = 1;                    /* P96W67: sound through Paula */
+            } else if (!strcmp(a, "STILL") || !strcmp(a, "still") || !strcmp(a, "Still")) {
+                p79_still = 1;                    /* P96W79: still picture (Paula pause) */
+                p96s_off = 1;                     /* no clock queries, draw at once */
             } else if (!strcmp(a, "ISP") || !strcmp(a, "isp")) {
                 mr_berryvp_force_isp = 1;        /* ISP82 test: picture via ISP */
             } else if (!strcmp(a, "PLOW") || !strcmp(a, "plow")) {
@@ -1594,6 +1683,15 @@ int main(int argc, char **argv)
         printf("NOAUDIO: playing without sound (clock test CLK81).\n");
         n76_hlog("P63_NOAUDIO");
         ai = NULL;
+    }
+    if (p79_still) {
+        if (!mr_berryvp_stream_flags || p67_paula || p63_noaudio) {
+            printf("Error: STILL needs a window (W=50) and no PAULA/NOAUDIO.\n");
+            mr_demux_close(d);
+            return 5;
+        }
+        n76_hlog("P79_STILL");
+        ai = NULL;                        /* picture only, no sound at all */
     }
     if (p67_paula && !p63_noaudio) {
         char why[80];
@@ -2074,6 +2172,19 @@ int main(int argc, char **argv)
         }
         sent++;
 
+        if (p79_still) {
+            /* P96W79: first picture in the window -> hold it.  Safety: after
+             * 3 s or 100 pictures without a shown frame hold anyway. */
+            uint32_t now = (uint32_t)ac309i_read_sys_us();
+            if (!p79_have_t0) { p79_t0 = now; p79_have_t0 = 1; }
+            if (p79_shown() || (uint32_t)(now - p79_t0) >= 3000000u || sent >= 100) {
+                p79_resume = p79_still_loop();
+                aborted = 1;
+                st = MR_EAGAIN;
+                break;
+            }
+        }
+
         if (!p04_first_video_sent) {
             p04_first_video_sent = 1;
             n76_hlog("P04_FIRST_VIDEO_SENT_BEFORE_PCM");
@@ -2278,14 +2389,28 @@ int main(int argc, char **argv)
             p54_stop_us = shown + (p50_t_set ? p50_base_us : 0);
             p54_have_stop = 1;
         }
+        if (p78_pause_stop && p78_have_stop) {   /* P96W78: Pi clock spot */
+            p54_stop_us = p78_stop_us;
+            p54_have_stop = 1;
+        } else if (aborted && p67_paula && p67_anchored) {
+            /* P96W79: Esc/Ctrl-C with Paula: also the picture on screen
+             * (Pi clock), not the last frame read (~4 s ahead). */
+            uint64_t at = (uint64_t)(uint32_t)((uint32_t)ac309i_read_sys_us() - p78_clock_sys) +
+                          (p50_t_set ? p50_base_us : 0);
+            if (p54_have_raw && at > p54_last_vpts_raw) at = p54_last_vpts_raw;
+            p54_stop_us = at;
+            p54_have_stop = 1;
+        }
     }
     DBG_PRINTF("Closing BerryVP stream (EOS + Workbench return) ...\n");
     st = mr_berryvp_close(bvp);
     p05_input_close();
     mr_demux_close(d);
-    if (aborted && p54_can_seek && p54_have_stop)
+    if (p79_still)
+        n76_hlog("P79_T_NOT_WRITTEN");     /* P96W79: the still keeps the .t */
+    else if (aborted && p54_can_seek && p54_have_stop)
         p54_write(argv[1], p54_stop_us, audio_enabled ? "HDMI" : (p70_used ? "PAULA" : "NONE"),
-                  p58_switch ? 0 : P54_RECAP_US);
+                  (p58_switch || p78_pause_stop) ? 0 : P54_RECAP_US);
     else if (!aborted && p54_demux_eof && p70_used && p70_fine_changed)
         p54_write(argv[1], 0, "PAULA", 0);  /* P96W70: keep the new fine value */
     else if (!aborted && p54_demux_eof)
@@ -2298,9 +2423,14 @@ int main(int argc, char **argv)
         return 20;
     }
 
+    /* P96W78: "Paused" with ENDED = Paula pause; MintVID-pi offers Play.
+     * P96W79: "Resume" with ENDED = Space in the still: Play again. */
     p06_status_write(P06_STATE_ENDED, "H.264 / VideoCore",
-                     aborted ? "Stopped" : "Finished");
-    n76_hlog(aborted ? "P06_STATUS_ENDED_STOPPED" : "P06_STATUS_ENDED_FINISHED");
+                     p78_pause_stop ? "Paused" :
+                     (p79_resume ? "Resume" : (aborted ? "Stopped" : "Finished")));
+    n76_hlog(p78_pause_stop ? "P06_STATUS_ENDED_PAUSED" :
+             p79_resume ? "P06_STATUS_ENDED_RESUME" :
+             aborted ? "P06_STATUS_ENDED_STOPPED" : "P06_STATUS_ENDED_FINISHED");
     n76_hlog("N76_END_OK");
     if (n76_hostlog) fclose(n76_hostlog);
     DBG_PRINTF("N76 PASS: host demux trace completed on N75 scheduler base.\n");
