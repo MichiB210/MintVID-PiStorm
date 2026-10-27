@@ -14,8 +14,9 @@ name: Build
 # cannot be caught by `build` compiling cleanly.
 #
 # `nightly` builds all three Amiga CPU profiles and updates one rolling
-# GitHub pre-release. It runs after conformance on pushes to main and once
-# per night. Normal numbered releases remain separate.
+# GitHub pre-release. MintVID-PiStorm: switched off (no nightly schedule,
+# job disabled) - that ZIP has no mrberry, berryvp.library, CPU1 modules or
+# Emu68 kernel, so it misled PiStorm users. Numbered releases only.
 
 on:
   push:
@@ -28,9 +29,6 @@ on:
         required: false
         default: false
         type: boolean
-  schedule:
-    - cron: "17 2 * * *"
-      timezone: "Europe/London"
 
 permissions:
   contents: read
@@ -123,12 +121,8 @@ jobs:
     # Scheduled workflows run from main. Automatic publishing is also limited
     # to main so the public Nightly never points at an arbitrary feature branch.
     needs: conformance
-    if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.ref == 'refs/heads/main' &&
-       inputs.publish_nightly == true)
+    # MintVID-PiStorm: disabled.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
