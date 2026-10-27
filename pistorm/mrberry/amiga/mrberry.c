@@ -27,6 +27,7 @@
 
 extern ULONG bvp_exec_setsignal(ULONG newSignals, ULONG signalSet);
 extern void mrb_source_set_read_kb(unsigned kb);   /* core/mr_source.c, W77 */
+extern int mr_berryvp_force_isp;                    /* mr_berryvp.c, ISP82 */
 extern ULONG ac309i_read_sys_us(void);
 
 /* D4: keep the ~4 KiB BerryVP bridge context out of the Amiga CLI stack.
@@ -1451,6 +1452,8 @@ int main(int argc, char **argv)
                 }
             } else if (!strcmp(a, "PAULA") || !strcmp(a, "paula") || !strcmp(a, "Paula")) {
                 p67_paula = 1;                    /* P96W67: sound through Paula */
+            } else if (!strcmp(a, "ISP") || !strcmp(a, "isp")) {
+                mr_berryvp_force_isp = 1;        /* ISP82 test: picture via ISP */
             } else if (!strcmp(a, "PLOW") || !strcmp(a, "plow")) {
                 p67_low = 1;                      /* P96W67: Paula lower rate */
             } else if (!strcmp(a, "PMONO") || !strcmp(a, "pmono")) {

@@ -64,6 +64,7 @@ BVP_CTRL_RESET        equ 4
 BVP_CTRL_IDLE         equ 5      ; P96W45: keep the window alive (pause)
 BVP_CTRL_TIMESHIFT    equ 6      ; P96W47: D1 = us the caller paused
 BVP_CTRL_CLOCKSTART   equ 7      ; CLK81: D0 = Pi timer when the free clock started (0 = none)
+BVP_CTRL_FORCEISP     equ 8      ; ISP82: D1 = 1 cinema always via ISP (test), 0 = normal
 BVP_PKT_CONFIG        equ 1
 BVP_PKT_FRAME_START   equ 2
 BVP_PKT_FRAME_END     equ 4
@@ -593,6 +594,8 @@ BVP_Control:
         beq.s   BVP_CTL_TimeShift
         cmpi.l  #BVP_CTRL_CLOCKSTART,d0
         beq.s   BVP_CTL_ClockStart
+        cmpi.l  #BVP_CTRL_FORCEISP,d0
+        beq.s   BVP_CTL_ForceIsp
         moveq   #BVPERR_UNSUPPORTED,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
@@ -639,6 +642,13 @@ BVP_CTL_ClockStart:
         clr.l   BVP_LAST_ERROR(a6)
         move.l  n81_active_sys,d0
         rts
+; ISP82: grid-line test.  The direct cinema graph (decoder -> scheduler ->
+; renderer) shows green 1-pixel grid lines when the HVS has to upscale the
+; picture (user report, 960x720 on a 1280x1024 screen).  D1 = 1 sends every
+; cinema film through the ISP graph instead.  Set before OpenStream.
+BVP_CTL_ForceIsp:
+        move.l  d1,n82_force_isp
+        bra.s   BVP_CTL_OK
 BVP_CTL_Bad:
         moveq   #BVPERR_BADSTATE,d0
         move.l  d0,BVP_LAST_ERROR(a6)
@@ -1506,7 +1516,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS (22.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 (27.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -49911,10 +49921,27 @@ v12a_req_done:
 ; every other case uses the N79K ISP graph below.
 ; ====================================================================
 n79p_setup_graph_router:
+        clr.l   n83_upscale
         tst.l   bvp_library_mode
         beq.s   n79p_router_k
+        tst.l   n82_force_isp              ; ISP82 test switch
+        bne.s   n79p_router_k
         cmpi.l  #3,v41_display_style
         bne.s   n79p_router_k
+        ; N83: films smaller than 1280x720 in either direction: the HVS
+        ; would have to upscale by an odd factor and then draws green
+        ; 1-pixel grid lines (tested 26./27.10.2026: lines at 1.88-2.4x,
+        ; clean at 1.0/1.13/1.5/3.0, any graph).  Such films go through
+        ; the ISP, which upscales them to fit 1920x1080; the HVS then
+        ; only shows 1:1 or downscales, which is always clean.
+        cmpi.l  #1280,v6_src_visible_w
+        bcs.s   n83_router_up
+        cmpi.l  #720,v6_src_visible_h
+        bcc.s   n83_router_size_ok
+n83_router_up:
+        move.l  #1,n83_upscale
+        bra.s   n79p_router_k
+n83_router_size_ok:
         ; N79Q aligned64 fix: use the SPS-derived aligned width (valid here,
         ; unlike the late/zero v12a_dec_crop_w) and a 64-pixel rule.
         move.l  v6_src_aligned_w,d0
@@ -51003,6 +51030,11 @@ v12a_in_num_ok:
         clr.l   port_fmt_bitrate
         clr.l   port_fmt_flags
         clr.l   port_fmt_extra
+        tst.l   n83_upscale
+        beq.s   n83_out_native
+        bsr     n83_calc_out             ; N83: ISP upscales to fit 1920x1080
+        bra.s   n83_out_sized
+n83_out_native:
         move.l  v12a_dec_crop_w,d0
         add.l   #127,d0
         and.l   #$FFFFFF80,d0
@@ -51015,6 +51047,7 @@ v12a_in_num_ok:
         clr.l   port_crop_y
         move.l  port_video_width,port_crop_width ; N79K: full 128-aligned width visible
         move.l  v12a_dec_crop_h,port_crop_height
+n83_out_sized:
         move.l  v12a_dec_fps_num,port_fps_num
         move.l  v12a_dec_fps_den,port_fps_den
         moveq   #1,d0
@@ -51248,6 +51281,79 @@ v12a_setup_fail:
 v12a_setup_done:
         clr.l   v12a_local_get_active
         movem.l (sp)+,d1-d7/a0-a3
+        rts
+
+; ====================================================================
+; N83 - ISP output size for small films: fit W x H (decoder crop) into
+; 1920x1080 keeping the aspect.  Width = multiple of 128 (whole width
+; visible, as N79K), height even, buffer height aligned to 16.
+; Sets port_video_width/height and port_crop_*.  68000 code (mulu.w/divu.w;
+; all values <= 2048, quotients <= 1920).
+; ====================================================================
+n83_calc_out:
+        movem.l d0-d4,-(sp)
+        move.l  v12a_dec_crop_w,d2       ; W
+        move.l  v12a_dec_crop_h,d3       ; H
+        tst.l   d2
+        beq.s   n83_calc_full
+        tst.l   d3
+        beq.s   n83_calc_full
+        move.l  d2,d0
+        mulu.w  #1080,d0                 ; W*1080
+        move.l  d3,d1
+        mulu.w  #1920,d1                 ; H*1920
+        cmp.l   d1,d0
+        bcs.s   n83_calc_tall
+        ; wider than 16:9: width 1920, height = H*1920/W
+        divu.w  d2,d1
+        andi.l  #$FFFF,d1
+        move.l  #1920,d4
+        bra.s   n83_calc_round
+n83_calc_tall:
+        ; narrower: height 1080, width = W*1080/H
+        divu.w  d3,d0
+        andi.l  #$FFFF,d0
+        move.l  d0,d4
+        move.l  #1080,d1
+n83_calc_round:
+        add.l   #64,d4                   ; nearest multiple of 128
+        andi.l  #$FFFFFF80,d4
+        cmpi.l  #128,d4
+        bcc.s   n83_calc_wmin
+        move.l  #128,d4
+n83_calc_wmin:
+        cmpi.l  #1920,d4
+        bls.s   n83_calc_wmax
+        move.l  #1920,d4
+n83_calc_wmax:
+        andi.l  #$FFFFFFFE,d1            ; even height
+        cmpi.l  #16,d1
+        bcc.s   n83_calc_hmin
+        moveq   #16,d1
+n83_calc_hmin:
+        bra.s   n83_calc_store
+n83_calc_full:
+        move.l  #1920,d4
+        move.l  #1080,d1
+n83_calc_store:
+        move.l  d4,port_video_width
+        move.l  d4,port_crop_width
+        move.l  d1,port_crop_height
+        move.l  d1,d0
+        add.l   #15,d0
+        andi.l  #$FFFFFFF0,d0
+        move.l  d0,port_video_height
+        clr.l   port_crop_x
+        clr.l   port_crop_y
+        lea     n83_msg_upscale,a1
+        jsr     n12_log
+        move.l  d4,d0
+        lea     n83_pfx_w,a1
+        jsr     n15_log_hex32
+        move.l  port_crop_height,d0
+        lea     n83_pfx_h,a1
+        jsr     n15_log_hex32
+        movem.l (sp)+,d0-d4
         rts
 
 ; ====================================================================
@@ -67180,6 +67286,12 @@ msg_mkvr7_cwait_expired:
 msg_mkvr7_cwait_expired_end:
 n79j_msg_graph_ready:
         dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_READY",0
+n83_msg_upscale:
+        dc.b "N83_ISP_UPSCALE",0
+n83_pfx_w:
+        dc.b "N83 OUT_W=",0
+n83_pfx_h:
+        dc.b "N83 OUT_H=",0
 n79j_msg_graph_fail:
         dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_FAIL",0
         even
@@ -70673,6 +70785,8 @@ n73_clock_armed:             ds.l 1
 n81_tried:                   ds.l 1   ; CLK81 free-clock test
 n81_active:                  ds.l 1
 n81_active_sys:              ds.l 1
+n82_force_isp:               ds.l 1   ; ISP82: cinema always via ISP
+n83_upscale:                 ds.l 1   ; N83: ISP upscales small films
 n81_hb_last:                 ds.l 1
 n81_free_mode:               ds.l 1
 n81_ok:                      ds.l 1

@@ -46,6 +46,12 @@ includes it in full (MIT licence). MintVID's own README is in
 | Audio | AAC, MP3, MP2, AC3, PCM | Amiga (Paula player by Darren 'boingball' Banfi) | Paula, full screen only ("PiStorm / VC Hard Fullscreen (Paula)", mrberry PAULA) |
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
 
+The Pi 3A+ decodes H.264 up to 1080p at 30 fps (Raspberry Pi product brief).
+For smooth playback use up to 1080p25/30 or 720p up to 60 fps with a moderate
+bitrate. Films smaller than 1280x720 are upscaled by the Pi's ISP to fit
+1920x1080 before they reach the screen; the display hardware alone drew green
+grid lines when it had to enlarge a picture by an odd factor.
+
 Multichannel E-AC3 (5.1) is refused, because the CPU1 decoder is not fast
 enough for it in real time yet. Tested on PiStorm Classic with a Raspberry Pi 3A+
 and the patched Emu68 1.0.7 kernel.

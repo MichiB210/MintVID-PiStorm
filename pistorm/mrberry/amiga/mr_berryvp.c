@@ -60,6 +60,8 @@ extern void bvp_exec_closelibrary(struct Library *lib);
  * reproducible MOV/MP4 stall.  No scheduling or packet contents are changed. */
 /* OpenStream flags: 0 = cinema (HVS), 10/25/50/75 = P96 window size. */
 ULONG mr_berryvp_stream_flags = 0;
+int mr_berryvp_force_isp = 0;   /* ISP82: ISP = cinema via ISP graph (test) */
+extern LONG bvp_call_control2(struct Library *base, ULONG cmd, ULONG arg);
 
 static FILE *ac309f_trace;
 
@@ -319,6 +321,8 @@ mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi)
         mr_berryvp_close(b);
         return MR_EUNSUPPORTED;
     }
+    /* ISP82: always tell the library (it stays loaded between films). */
+    (void)bvp_call_control2(b->lib, 8, mr_berryvp_force_isp ? 1UL : 0UL);
     DBG_PRINTF("[B05] before OpenStream\n");
     r = bvp_call_openstream(b->lib, mr_berryvp_stream_flags);
     DBG_PRINTF("[B06] after OpenStream r=%ld\n", (long)r);

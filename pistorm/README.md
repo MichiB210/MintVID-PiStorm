@@ -25,6 +25,14 @@ This directory holds the complete source of all PiStorm parts of the v96.76 rele
 
 > Deutsch: siehe [unten](#deutsch).
 
+**Picture path (berryvp.library N83):** in full screen a film of 1280x720 or
+larger goes from the decoder straight to the display hardware (HVS), or through
+the ISP if its coded width is not a multiple of 64. A film smaller than 1280x720
+always goes through the ISP, which upscales it to fit 1920x1080; otherwise the
+HVS draws green 1-pixel grid lines when it enlarges by an odd factor (tested:
+clean at 1.0/1.13/1.5/3.0, lines at 1.33-2.4). mrberry's test switch `ISP`
+sends every full-screen film through the ISP.
+
 ## How it fits together
 
 ```
