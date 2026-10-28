@@ -48,9 +48,10 @@ includes it in full (MIT licence). MintVID's own README is in
 
 The Pi 3A+ decodes H.264 up to 1080p at 30 fps (Raspberry Pi product brief).
 For smooth playback use up to 1080p25/30 or 720p up to 60 fps with a moderate
-bitrate. Films smaller than 1280x720 are upscaled by the Pi's ISP to fit
-1920x1080 before they reach the screen; the display hardware alone drew green
-grid lines when it had to enlarge a picture by an odd factor.
+bitrate. Films smaller than 1280x720 are upscaled by the Pi's ISP to the full
+1080 lines before they reach the screen (16:9 to exactly 1920x1080, 4:3 with
+borders left and right); the display hardware alone drew green grid lines or
+stripes when it had to enlarge a picture, even by a few lines.
 
 Multichannel E-AC3 (5.1) is refused, because the CPU1 decoder is not fast
 enough for it in real time yet. Tested on PiStorm Classic with a Raspberry Pi 3A+
@@ -68,6 +69,7 @@ Window, start time, resume and Paula sound:
     mrberry movie.mkv T=1:10
     mrberry movie.mkv R
     mrberry movie.mkv PAULA
+    mrberry movie.mkv AUDIO=2      (audio track 2 of an MKV)
 
 Or with the GUI **MintVID-pi**: pick a film and choose the display mode
 **PiStorm / VC Hard Fullscreen**, **PiStorm / VC Hard Fenster** or
@@ -78,6 +80,13 @@ during playback + and - fine-tune it per film. Space pauses the film
 also with Paula sound: MintVID-pi shows the paused spot as a still
 picture in a window, and Play (or Space) continues in full screen with
 Paula sound.
+
+MKV films with several audio tracks: the "Audio" chooser in MintVID-pi
+lists every track (language, format, name). Without a choice the track
+marked as default in the MKV plays. The chosen track is remembered in
+film.t. Tracks that cannot play with the chosen output are refused (e.g.
+MP3 over HDMI, E-AC3 through Paula, DTS/Opus/FLAC anywhere); a film with
+no HDMI-capable track plays without sound in full screen.
 
 Since v96.76 VPberry is no longer needed. All other MintVID playback
 modes work as in upstream MintVID.
@@ -120,7 +129,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.79
+This builds all runtime files and compares them with the released v96.80
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

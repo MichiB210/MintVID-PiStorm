@@ -3,6 +3,7 @@
  * demuxed by MintVID, wrapped as ADTS where required, decoded by BerryFAAD03
  * on ARM CPU1 and sent as PCM16 to MMAL audio_render/HDMI. */
 #include "../core/mr_demux.h"
+#include "../core/mr_mkv_tracks.h"
 #include "mr_berryvp.h"
 #include "mrb_paula.h"
 #include <exec/types.h>
@@ -28,6 +29,7 @@
 extern ULONG bvp_exec_setsignal(ULONG newSignals, ULONG signalSet);
 extern void mrb_source_set_read_kb(unsigned kb);   /* core/mr_source.c, W77 */
 extern int mr_berryvp_force_isp;                    /* mr_berryvp.c, ISP82 */
+extern unsigned long mr_berryvp_isp_out;            /* mr_berryvp.c, N84 */
 extern ULONG ac309i_read_sys_us(void);
 
 /* D4: keep the ~4 KiB BerryVP bridge context out of the Amiga CLI stack.
@@ -1306,11 +1308,18 @@ static char p55_audio_read[16];        /* A: value of the last .t read */
 
 static long p70_t_fine_ms;
 static int p70_t_have_fine;
+
+/* MKA1: audio track choice (MKV).  The track list lives in mr_mkv.c. */
+#define MKA_TRACK_MAX MR_MKV_ATRACK_MAX
+static int mka_cli_track;              /* AUDIO= given on the command line */
+static unsigned mka_t_track;           /* AT: line of the last .t read */
+
 static int p54_read(const char *film, uint64_t *t_us, int *have_t, long *window)
 {
     char name[512], line[64];
     p55_audio_read[0] = 0;
     p70_t_have_fine = 0;
+    mka_t_track = 0;
     FILE *f;
     p54_name(name, sizeof name, film);
     f = fopen(name, "r");
@@ -1331,6 +1340,10 @@ static int p54_read(const char *film, uint64_t *t_us, int *have_t, long *window)
         } else if ((line[0] == 'P' || line[0] == 'p') && (line[1] == ':' || line[1] == '=')) {
             p70_t_fine_ms = strtol(line + 2, NULL, 10);   /* P96W70 */
             p70_t_have_fine = 1;
+        } else if ((line[0] == 'A' || line[0] == 'a') && (line[1] == 'T' || line[1] == 't') &&
+                   (line[2] == ':' || line[2] == '=')) {
+            unsigned long n = strtoul(line + 3, NULL, 10);   /* MKA1 */
+            if (n >= 1 && n <= MKA_TRACK_MAX) mka_t_track = (unsigned)n;
         } else if ((line[0] == 'A' || line[0] == 'a') && (line[1] == ':' || line[1] == '=')) {
             strncpy(p55_audio_read, line + 2, sizeof p55_audio_read - 1);
             p55_audio_read[sizeof p55_audio_read - 1] = 0;
@@ -1358,6 +1371,8 @@ static void p54_write(const char *film, uint64_t film_us, const char *audio,
     else fprintf(f, "W:C\n");
     fprintf(f, "A:%s\n", audio);
     if (!strcmp(audio, "PAULA")) fprintf(f, "P:%ld\n", p70_fine_ms);   /* P96W70 */
+    if (mr_mkv_atrack_count > 1 && mr_mkv_audio_chosen)
+        fprintf(f, "AT:%u\n", mr_mkv_audio_chosen);                     /* MKA1 */
     fclose(f);
     printf("Resume position saved: %s (T=%s).\n", name, t);
     if (n76_hostlog) {
@@ -1375,6 +1390,78 @@ static void p54_write(const char *film, uint64_t film_us, const char *audio,
  * cannot (REASON=...), 10 when the file cannot be opened. */
 extern uint64_t mr_demux_duration_us(const mr_demux *d);
 
+/* MKA1: can this sound go over HDMI (CPU1 modules)?  *why = reason if not. */
+static int mka_hdmi_ok(const mr_audio_info *ai, const char **why)
+{
+    *why = NULL;
+    if (!ai || !ai->valid) { *why = "no sound"; return 0; }
+    if (ai->format_tag == MR_AUDIO_FORMAT_AAC) {
+        unsigned ch = ai->config_len >= 2 ? ((ai->config[1] >> 3) & 15u) : ai->channels;
+        if (ai->config_len && (ai->config[0] >> 3) != 2) { *why = "only AAC-LC sound is supported"; return 0; }
+        if (ch != 2 && ch != 5 && ch != 6) { *why = "AAC sound must be stereo or 5.1"; return 0; }
+        return 1;
+    }
+    if (ai->format_tag == MR_AUDIO_FORMAT_AC3) return 1;
+    if (ai->format_tag == MR_AUDIO_FORMAT_EAC3) {
+        if (ai->channels != 2) { *why = "E-AC3 multichannel is not supported in real time"; return 0; }
+        return 1;
+    }
+    *why = "this sound format plays only through Paula";
+    return 0;
+}
+
+/* MKA1: Paula player (Darren's mrb_paula): AAC, MP3, MP2, AC3, PCM. */
+static int mka_paula_ok(const mr_audio_info *ai)
+{
+    return ai && ai->valid &&
+           (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_MP3 ||
+            ai->format_tag == MR_AUDIO_FORMAT_MP2 || ai->format_tag == MR_AUDIO_FORMAT_AC3 ||
+            ai->format_tag == MR_AUDIO_FORMAT_PCM);
+}
+
+/* MKA1c: for HDMI sound only tracks the CPU1 modules can play are chosen
+ * (an MP3 track is skipped like Opus; with PAULA it stays usable). */
+static int mka_usable_hdmi(const mr_audio_info *ai)
+{
+    const char *why;
+    return mka_hdmi_ok(ai, &why);
+}
+
+static const char *mka_codec_short(const mr_mkv_atrack *t)
+{
+    if (t->supported) {
+        switch (t->ai.format_tag) {
+        case MR_AUDIO_FORMAT_AAC:  return "AAC";
+        case MR_AUDIO_FORMAT_AC3:  return "AC3";
+        case MR_AUDIO_FORMAT_EAC3: return "E-AC3";
+        case MR_AUDIO_FORMAT_MP3:  return "MP3";
+        case MR_AUDIO_FORMAT_MP2:  return "MP2";
+        case MR_AUDIO_FORMAT_PCM:  return "PCM";
+        default: break;
+        }
+    }
+    return t->codec[0] == 'A' && t->codec[1] == '_' ? t->codec + 2 : t->codec;
+}
+
+/* MKA1: one line per audio track for MintVID-pi:
+ *   TRACK<n>=<lang>|<codec>|<channels>|<rate>|<hdmi 0/1>|<paula 0/1>|<default 0/1>|<name>
+ * (name last - it may contain anything but '|' and newlines). */
+static void mka_info_tracks(void)
+{
+    unsigned i;
+    printf("AUDIO_TRACKS=%u\n", mr_mkv_atrack_count);
+    if (mr_mkv_audio_chosen) printf("AUDIO_TRACK=%u\n", mr_mkv_audio_chosen);
+    for (i = 0; i < mr_mkv_atrack_count; i++) {
+        const mr_mkv_atrack *t = &mr_mkv_atracks[i];
+        const char *why;
+        int hdmi = t->supported && mka_hdmi_ok(&t->ai, &why);
+        int paula = t->supported && mka_paula_ok(&t->ai);
+        printf("TRACK%u=%s|%s|%u|%lu|%d|%d|%d|%s\n", i + 1, t->lang, mka_codec_short(t),
+               (unsigned)t->ai.channels, (unsigned long)t->ai.sample_rate,
+               hdmi, paula, t->is_default, t->name);
+    }
+}
+
 static int p56_info(const char *film)
 {
     mr_demux *d;
@@ -1383,6 +1470,9 @@ static int p56_info(const char *film)
     char text[96];
     const char *reason = NULL, *sound = "NONE";
     uint64_t dur;
+    uint64_t r_t = 0;
+    int r_have = 0, r_have_t = 0;
+    long r_w = -1;
 
     printf("MRBERRY_INFO=1\nFILE=%s\n", film);
     {
@@ -1391,6 +1481,9 @@ static int p56_info(const char *film)
         printf("STACK=%lu\n", (unsigned long)((ULONG)me->tc_SPUpper -
                                               (ULONG)me->tc_SPLower));
     }
+    /* MKA1: the .t first, so the saved audio track is the one reported */
+    r_have = p54_read(film, &r_t, &r_have_t, &r_w);
+    if (r_have && mka_t_track && !mka_cli_track) mr_mkv_audio_want = mka_t_track;
     d = mr_demux_open_file(film);
     if (!d) {
         printf("PLAYABLE=0\nREASON=cannot open file (%s)\n", mr_demux_last_open_error());
@@ -1422,38 +1515,25 @@ static int p56_info(const char *film)
     mr_demux_describe_audio_codec(d, text, sizeof text);
     printf("AUDIO=%s\n", (ai && ai->valid) ? text : "none");
     if (ai && ai->valid) {
+        const char *why;
         printf("AUDIO_RATE=%lu\nAUDIO_CH=%u\n",
                (unsigned long)ai->sample_rate, (unsigned)ai->channels);
-        if (ai->format_tag == MR_AUDIO_FORMAT_AAC) {
-            unsigned ch = ai->config_len >= 2 ? ((ai->config[1] >> 3) & 15u) : ai->channels;
-            if (ai->config_len && (ai->config[0] >> 3) != 2)
-                reason = reason ? reason : "only AAC-LC sound is supported";
-            else if (ch != 2 && ch != 5 && ch != 6)
-                reason = reason ? reason : "AAC sound must be stereo or 5.1";
-            else sound = "HDMI";
-        } else if (ai->format_tag == MR_AUDIO_FORMAT_AC3) {
-            sound = "HDMI";
-        } else if (ai->format_tag == MR_AUDIO_FORMAT_EAC3) {
-            if (ai->channels != 2)
-                reason = reason ? reason : "E-AC3 multichannel is not supported in real time";
-            else sound = "HDMI";
-        }
+        if (mka_hdmi_ok(ai, &why)) sound = "HDMI";
+        else if (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_EAC3)
+            reason = reason ? reason : why;     /* as before MKA1: these stop the film */
     }
     printf("SOUND=%s\n", sound);
     printf("SEEK=%d\n", mr_demux_can_seek(d) ? 1 : 0);
-    {
-        uint64_t rt = 0;
-        int have_t = 0;
-        long rw = -1;
-        if (p54_read(film, &rt, &have_t, &rw)) {
-            char t[16];
-            p50_fmt(t, sizeof t, have_t ? rt : 0);
-            printf("RESUME_T=%s\n", t);
-            if (rw == 0) printf("RESUME_W=C\n");
-            else if (rw > 0) printf("RESUME_W=%ld\n", rw);
-            if (p55_audio_read[0]) printf("RESUME_A=%s\n", p55_audio_read);
-            if (p70_t_have_fine) printf("RESUME_P=%ld\n", p70_t_fine_ms);   /* P96W72 */
-        }
+    mka_info_tracks();                          /* MKA1 */
+    if (r_have) {
+        char t[16];
+        p50_fmt(t, sizeof t, r_have_t ? r_t : 0);
+        printf("RESUME_T=%s\n", t);
+        if (r_w == 0) printf("RESUME_W=C\n");
+        else if (r_w > 0) printf("RESUME_W=%ld\n", r_w);
+        if (p55_audio_read[0]) printf("RESUME_A=%s\n", p55_audio_read);
+        if (p70_t_have_fine) printf("RESUME_P=%ld\n", p70_t_fine_ms);   /* P96W72 */
+        if (mka_t_track) printf("RESUME_AT=%u\n", mka_t_track);         /* MKA1 */
     }
     mr_demux_close(d);
     printf("PLAYABLE=%d\n", reason ? 0 : 1);
@@ -1464,9 +1544,23 @@ static int p56_info(const char *film)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc == 3 && (!strcmp(argv[2], "INFO") || !strcmp(argv[2], "info") ||
-                      !strcmp(argv[2], "Info")))
+    if ((argc == 3 || argc == 4) &&
+        (!strcmp(argv[2], "INFO") || !strcmp(argv[2], "info") ||
+         !strcmp(argv[2], "Info"))) {
+        /* MKA1: "mrberry <film> INFO AUDIO=n" = info for that audio track */
+        if (argc == 4) {
+            unsigned long n = 0;
+            if (!strncmp(argv[3], "AUDIO=", 6) || !strncmp(argv[3], "AUDIO:", 6))
+                n = strtoul(argv[3] + 6, NULL, 10);
+            if (n < 1 || n > MKA_TRACK_MAX) {
+                printf("Error: use mrberry <film> INFO [AUDIO=n]\n");
+                return 5;
+            }
+            mr_mkv_audio_want = (unsigned)n;
+            mka_cli_track = 1;
+        }
         return p56_info(argv[1]);
+    }
 #if MR_DEBUG_LOGS
     n76_hostlog = fopen("N76_HOST.TXT", "ab");
 #endif
@@ -1541,6 +1635,21 @@ int main(int argc, char **argv)
             } else if (!strcmp(a, "STILL") || !strcmp(a, "still") || !strcmp(a, "Still")) {
                 p79_still = 1;                    /* P96W79: still picture (Paula pause) */
                 p96s_off = 1;                     /* no clock queries, draw at once */
+            } else if (!strncmp(a, "ISPOUT=", 7) || !strncmp(a, "ispout=", 7)) {
+                /* N84 test: ISPOUT=OFF (no N83 upscale) or ISPOUT=WxH */
+                unsigned long w = 0, h = 0;
+                char *x = NULL;
+                if (!strcmp(a + 7, "OFF") || !strcmp(a + 7, "off")) {
+                    mr_berryvp_isp_out = 0xFFFFFFFFUL;
+                } else {
+                    w = strtoul(a + 7, &x, 10);
+                    if (x && (*x == 'x' || *x == 'X')) h = strtoul(x + 1, NULL, 10);
+                    if (w < 128 || w > 1920 || h < 64 || h > 1088 || (w & 15) || (h & 1)) {
+                        printf("Error: ISPOUT=OFF or ISPOUT=WxH (W 128..1920, multiple of 16; H 64..1088, even).\n");
+                        return 5;
+                    }
+                    mr_berryvp_isp_out = (w << 16) | h;
+                }
             } else if (!strcmp(a, "ISP") || !strcmp(a, "isp")) {
                 mr_berryvp_force_isp = 1;        /* ISP82 test: picture via ISP */
             } else if (!strcmp(a, "PLOW") || !strcmp(a, "plow")) {
@@ -1573,6 +1682,15 @@ int main(int argc, char **argv)
                 else if (!strncmp(a, "--audio-rate=", 13)) { /* normal: default */ }
                 else if (!strcmp(a, "--audio-mono")) p67_mono = 1;
                 else if (!strcmp(a, "--no-audio")) p63_noaudio = 1;
+                else if (!strncmp(a, "--audio-track=", 14)) {   /* MKA1 */
+                    unsigned long n = strtoul(a + 14, NULL, 10);
+                    if (n < 1 || n > 16) {
+                        printf("Error: --audio-track must be 1..16.\n");
+                        return 5;
+                    }
+                    mr_mkv_audio_want = (unsigned)n;
+                    mka_cli_track = 1;
+                }
                 else if (!strncmp(a, "--start=", 8)) {
                     if (!p50_parse_time(a + 8, &p50_t_us)) {
                         printf("Error: --start must be H:MM or H:MM:SS.\n");
@@ -1591,6 +1709,16 @@ int main(int argc, char **argv)
                     printf("Error: unknown option %s\n", a);
                     bad = 1;
                 }
+            } else if (!strncmp(a, "AUDIO=", 6) || !strncmp(a, "AUDIO:", 6) ||
+                       !strncmp(a, "audio=", 6)) {
+                /* MKA1: audio track, 1-based (MKV only) */
+                unsigned long n = strtoul(a + 6, NULL, 10);
+                if (n < 1 || n > 16) {
+                    printf("Error: AUDIO= must be 1..16 (audio track number).\n");
+                    return 5;
+                }
+                mr_mkv_audio_want = (unsigned)n;
+                mka_cli_track = 1;
             } else if (((a[0] == 'A' || a[0] == 'a') && (a[1] == 'V' || a[1] == 'v') &&
                         (a[2] == ':' || a[2] == '=')) ||
                        (a[0] == '-' && a[1] >= '0' && a[1] <= '9') ||
@@ -1615,6 +1743,7 @@ int main(int argc, char **argv)
                    "  R = continue where the film was stopped (<film>.t)\n"
                    "  PAULA = sound through the Amiga (PLOW lower rate, PMONO mono)\n"
                    "  READ=64..1024 = KB per file read (default 64, bigger for network shares)\n"
+                   "  AUDIO=n = audio track n (MKV; see INFO for the list)\n"
                    "  Also understood (MintVID): --paula --audio-rate=low --audio-mono\n"
                    "    --no-audio --start=H:MM:SS --read=KB\n"
                    "  mrberry <movie> INFO = show length, video and sound, no playback\n");
@@ -1627,6 +1756,8 @@ int main(int argc, char **argv)
             if (p54_read(argv[1], &rt, &have_t, &rw)) {
                 if (!cli_t && have_t) { p50_t_us = rt; p50_t_set = rt != 0; }
                 if (!have_window && rw >= 0) mr_berryvp_stream_flags = (ULONG)rw;
+                if (!mka_cli_track && mka_t_track)
+                    mr_mkv_audio_want = mka_t_track;   /* MKA1: same track as before */
                 printf("Resume from saved position (%s).\n",
                        mr_berryvp_stream_flags ? "window" : "cinema");
                 n76_hlog("P54_RESUME_FILE_READ");
@@ -1648,6 +1779,9 @@ int main(int argc, char **argv)
     p62_pos_clear();
     p06_status_write(P06_STATE_OPENING, "H.264 / VideoCore",
                      "Opening PiStorm VideoCore playback...");
+    /* MKA1c: HDMI sound -> only tracks the Pi modules can play */
+    if (!p67_paula && !p63_noaudio && !p79_still)
+        mr_mkv_audio_usable = mka_usable_hdmi;
     DBG_PRINTF("[D01] before mr_demux_open_file\n");
     d = mr_demux_open_file(argv[1]);
     DBG_PRINTF("[D02] after mr_demux_open_file ptr=%p\n", (void *)d);
@@ -1674,6 +1808,21 @@ int main(int argc, char **argv)
            (unsigned long)vi->config_len);
     ac309i_is_mov = !strcmp(mr_demux_container_name(d), "MOV");
     ai = mr_demux_audio(d);
+    if (mr_mkv_atrack_count) {                            /* MKA1 */
+        if (mr_mkv_audio_want_bad)
+            printf("Warning: audio track %u is missing or cannot be played%s - using track %u.\n",
+                   mr_mkv_audio_want, mr_mkv_audio_usable ? " over HDMI" : "",
+                   mr_mkv_audio_chosen);
+        if (mr_mkv_atrack_count > 1 && mr_mkv_audio_chosen)
+            printf("Audio track %u of %u (%s).\n", mr_mkv_audio_chosen, mr_mkv_atrack_count,
+                   mr_mkv_atracks[mr_mkv_audio_chosen - 1].lang);
+        if (n76_hostlog) {
+            fprintf(n76_hostlog, "MKA1_AUDIO_TRACK want=%u chosen=%u of=%u bad=%d\n",
+                    mr_mkv_audio_want, mr_mkv_audio_chosen, mr_mkv_atrack_count,
+                    mr_mkv_audio_want_bad);
+            fflush(n76_hostlog);
+        }
+    }
     if (p63_noaudio) {
         if (mr_berryvp_stream_flags) {
             printf("Error: NOAUDIO is a cinema test - leave out W=.\n");
@@ -1848,6 +1997,15 @@ int main(int argc, char **argv)
     } else {
         if (!P67_FREE)
             printf("Warning: no supported AAC/AC3/E-AC3 audio track; video will continue without audio.\n");
+        /* MKA1b: cinema without HDMI sound (MP3/DTS/Opus track, HE-AAC mono,
+         * or no audio at all) = exactly the tested NOAUDIO case: the library
+         * starts the free Pi clock (CLK81), so mrberry must feed in real time
+         * with the host pacer (W65/W66).  Before, frames were sent unpaced
+         * and the Pi stopped (still picture, Esc dead) - as in W63/W64. */
+        if (!mr_berryvp_stream_flags && !P67_FREE) {
+            p63_noaudio = 1;
+            n76_hlog("MKA1B_CINEMA_WITHOUT_HDMI_SOUND_AS_NOAUDIO");
+        }
         n73_prime_ready = 1;
     }
 

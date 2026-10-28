@@ -65,6 +65,7 @@ BVP_CTRL_IDLE         equ 5      ; P96W45: keep the window alive (pause)
 BVP_CTRL_TIMESHIFT    equ 6      ; P96W47: D1 = us the caller paused
 BVP_CTRL_CLOCKSTART   equ 7      ; CLK81: D0 = Pi timer when the free clock started (0 = none)
 BVP_CTRL_FORCEISP     equ 8      ; ISP82: D1 = 1 cinema always via ISP (test), 0 = normal
+BVP_CTRL_ISPOUT       equ 9      ; N84: D1 = 0 normal, -1 no N83 upscale, (W<<16)|H ISP output size (test)
 BVP_PKT_CONFIG        equ 1
 BVP_PKT_FRAME_START   equ 2
 BVP_PKT_FRAME_END     equ 4
@@ -596,6 +597,8 @@ BVP_Control:
         beq.s   BVP_CTL_ClockStart
         cmpi.l  #BVP_CTRL_FORCEISP,d0
         beq.s   BVP_CTL_ForceIsp
+        cmpi.l  #BVP_CTRL_ISPOUT,d0
+        beq.s   BVP_CTL_IspOut
         moveq   #BVPERR_UNSUPPORTED,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
@@ -648,6 +651,12 @@ BVP_CTL_ClockStart:
 ; cinema film through the ISP graph instead.  Set before OpenStream.
 BVP_CTL_ForceIsp:
         move.l  d1,n82_force_isp
+        bra.s   BVP_CTL_OK
+; N84: green-stripe test (720x404 anime, 28.10.2026).  D1 = 0 normal N83,
+; -1 = no N83 upscale (old N79J path, as P96W31), else (W<<16)|H = ISP
+; output size for the N83 upscale.  Set before OpenStream.
+BVP_CTL_IspOut:
+        move.l  d1,n84_isp_out
         bra.s   BVP_CTL_OK
 BVP_CTL_Bad:
         moveq   #BVPERR_BADSTATE,d0
@@ -1516,7 +1525,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 (27.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 (28.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -49934,13 +49943,36 @@ n79p_setup_graph_router:
         ; clean at 1.0/1.13/1.5/3.0, any graph).  Such films go through
         ; the ISP, which upscales them to fit 1920x1080; the HVS then
         ; only shows 1:1 or downscales, which is always clean.
+        cmpi.l  #-1,n84_isp_out          ; N84 test: no N83 upscale
+        beq.s   n83_router_size_ok
         cmpi.l  #1280,v6_src_visible_w
         bcs.s   n83_router_up
         cmpi.l  #720,v6_src_visible_h
         bcc.s   n83_router_size_ok
 n83_router_up:
+        ; N84: films much wider than 16:9 (more than 2 %, e.g. cinema
+        ; format) are not upscaled for now - old N79J/direct path as P96W31.
+        ; (N83 upscaled 720x404 to 1920x1076; the renderer then stretched
+        ; 1076 -> 1080 lines in the HVS = green stripes, 28.10.2026.)
+        movem.l d1-d2,-(sp)
+        move.l  v6_src_visible_w,d0
+        mulu.w  #1080,d0                 ; W*1080
+        move.l  v6_src_visible_h,d1
+        mulu.w  #1920,d1                 ; H*1920
+        move.l  d1,d2
+        divu.w  #50,d2
+        andi.l  #$FFFF,d2
+        add.l   d2,d1                    ; H*1920 * 1.02
+        cmp.l   d1,d0
+        movem.l (sp)+,d1-d2              ; (movem keeps the flags)
+        bhi.s   n84_router_wide
         move.l  #1,n83_upscale
         bra.s   n79p_router_k
+n84_router_wide:
+        move.l  a1,-(sp)
+        lea     n84_msg_wide,a1
+        jsr     n12_log
+        move.l  (sp)+,a1
 n83_router_size_ok:
         ; N79Q aligned64 fix: use the SPS-derived aligned width (valid here,
         ; unlike the late/zero v12a_dec_crop_w) and a 64-pixel rule.
@@ -51292,6 +51324,15 @@ v12a_setup_done:
 ; ====================================================================
 n83_calc_out:
         movem.l d0-d4,-(sp)
+        move.l  n84_isp_out,d0           ; N84 test: fixed output size
+        beq.s   n84_calc_auto
+        move.l  d0,d4
+        swap    d4
+        andi.l  #$FFFF,d4                ; W
+        move.l  d0,d1
+        andi.l  #$FFFF,d1                ; H
+        bra     n83_calc_store
+n84_calc_auto:
         move.l  v12a_dec_crop_w,d2       ; W
         move.l  v12a_dec_crop_h,d3       ; H
         tst.l   d2
@@ -51304,10 +51345,13 @@ n83_calc_out:
         mulu.w  #1920,d1                 ; H*1920
         cmp.l   d1,d0
         bcs.s   n83_calc_tall
-        ; wider than 16:9: width 1920, height = H*1920/W
-        divu.w  d2,d1
-        andi.l  #$FFFF,d1
+        ; N84: 16:9 or up to 2 % wider (the router sends wider films the old
+        ; way): exactly 1920x1080.  N83 used H*1920/W (720x404 -> 1076 lines)
+        ; and the renderer then stretched it to 1080 lines in the HVS, which
+        ; draws green stripes.  The ISP stretches by <= 2 % instead (clean,
+        ; looks the same as before - the renderer filled the screen anyway).
         move.l  #1920,d4
+        move.l  #1080,d1
         bra.s   n83_calc_round
 n83_calc_tall:
         ; narrower: height 1080, width = W*1080/H
@@ -67288,6 +67332,8 @@ n79j_msg_graph_ready:
         dc.b "N79J_ISP_128ALIGN_CROP_GRAPH_READY",0
 n83_msg_upscale:
         dc.b "N83_ISP_UPSCALE",0
+n84_msg_wide:
+        dc.b "N84_TOO_WIDE_NO_UPSCALE",0
 n83_pfx_w:
         dc.b "N83 OUT_W=",0
 n83_pfx_h:
@@ -70786,6 +70832,7 @@ n81_tried:                   ds.l 1   ; CLK81 free-clock test
 n81_active:                  ds.l 1
 n81_active_sys:              ds.l 1
 n82_force_isp:               ds.l 1   ; ISP82: cinema always via ISP
+n84_isp_out:                 ds.l 1   ; N84 test: 0 / -1 / (W<<16)|H
 n83_upscale:                 ds.l 1   ; N83: ISP upscales small films
 n81_hb_last:                 ds.l 1
 n81_free_mode:               ds.l 1

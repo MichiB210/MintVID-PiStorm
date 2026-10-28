@@ -1,4 +1,4 @@
-# MintVID for PiStorm – BerryVP / BerryCore (v96.79)
+# MintVID for PiStorm – BerryVP / BerryCore (v96.80)
 
 Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry Pi 3A+ / BCM2837):
 
@@ -22,17 +22,22 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
 > **`config.txt` on the SD card must contain `gpu_mem=64`.** The VideoCore
 > needs this memory for hardware decoding. Add the line if it is not there.
 
-This directory holds the complete source of all PiStorm parts of the v96.79 release. The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
+This directory holds the complete source of all PiStorm parts of the v96.80 release. The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
 
 > Deutsch: siehe [unten](#deutsch).
 
-**Picture path (berryvp.library N83):** in full screen a film of 1280x720 or
+**Picture path (berryvp.library N83/N84):** in full screen a film of 1280x720 or
 larger goes from the decoder straight to the display hardware (HVS), or through
 the ISP if its coded width is not a multiple of 64. A film smaller than 1280x720
-always goes through the ISP, which upscales it to fit 1920x1080; otherwise the
-HVS draws green 1-pixel grid lines when it enlarges by an odd factor (tested:
-clean at 1.0/1.13/1.5/3.0, lines at 1.33-2.4). mrberry's test switch `ISP`
-sends every full-screen film through the ISP.
+goes through the ISP, which upscales it to the full 1080 lines: 16:9 and up to
+2 % wider exactly to 1920x1080, narrower films (4:3) to 1080 lines with the
+width rounded to 128. The renderer fills the screen, and every enlargement in
+the HVS draws green lines (N83 test 27.10.: lines at 1.33-2.4x; N84 28.10.:
+720x404 upscaled to 1920x1076 and then stretched 1076 -> 1080 lines gave four
+green stripes). Films more than 2 % wider than 16:9 (cinema format) are not
+upscaled yet (old N79J path). mrberry's test switches: `ISP` = every
+full-screen film through the ISP, `ISPOUT=OFF` = no upscale, `ISPOUT=WxH` =
+fixed ISP output size.
 
 ## How it fits together
 
@@ -49,12 +54,12 @@ MintVID-pi (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 
 | Part | Directory | Language | Rebuild |
 |---|---|---|---|
-| MintVID-pi GUI | `../player/amiga/mrgui*.c`, `mr_gui_menu.c` | C (68k) | byte-identical to v96.79 |
-| mrberry | `mrberry/` | C (68k) | byte-identical to v96.79 |
+| MintVID-pi GUI | `../player/amiga/mrgui*.c`, `mr_gui_menu.c` | C (68k) | byte-identical to v96.80 |
+| mrberry | `mrberry/` | C (68k) | byte-identical to v96.80 |
 | VPberry (VPr8 P48, old window player, not in the release since v96.76) | `vpberry/` | 68k assembler (vasm) | byte-identical to P35 |
-| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.79 |
+| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.80 |
 | berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
-| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | byte-identical to v96.79 (5.1 mixed down to stereo) |
+| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | byte-identical to v96.80 (5.1 mixed down to stereo) |
 | berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | Emu68 BerryCore kernel | `emu68_berrycore/` | AArch64 assembler patch | byte-identical to P32 |
 
@@ -73,7 +78,7 @@ Tools (in `PATH`):
 sh pistorm/build_all.sh
 ```
 
-Everything ends up in `pistorm/out/v96.79/`, and each file is compared against `v96.79_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
+Everything ends up in `pistorm/out/v96.80/`, and each file is compared against `v96.80_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
 
 ## Installation (Amiga side)
 
@@ -108,10 +113,10 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
   - Ausgabe über HDMI-Audio
 - Im Vollbild Ton auch über Paula (Paula-Player von Darren 'boingball' Banfi)
 
-**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.79/`.
+**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.80/`.
 
 **Ergebnis der Neubauten:**
-- exakt gleich (bytegleich) zum Release v96.79: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und der Emu68-BerryCore-Kern
+- exakt gleich (bytegleich) zum Release v96.80: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und der Emu68-BerryCore-Kern
 - berry_ac3 und berry_eac3 (im Release weiterhin die P35-Dateien) funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
 **Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` gibt es keinen Ton über HDMI. Bild mit Ton über Paula läuft auch mit dem Original-Kern. Den gepatchten Kern gibt es zur Zeit nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.

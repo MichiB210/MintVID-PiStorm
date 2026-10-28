@@ -1,4 +1,5 @@
 #include "mr_mkv.h"
+#include "mr_mkv_tracks.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -161,12 +162,73 @@ static int codec_is(const char *id, size_t id_len, const char *wanted)
     return strlen(wanted) == id_len && !memcmp(id, wanted, id_len);
 }
 
+/* ---- MKA1: audio track list and choice ------------------------------------
+ * Every audio track of the file is listed (also ones mrberry cannot play,
+ * e.g. DTS or Opus), in file order.  mr_mkv_audio_want = 1-based index into
+ * this list (0 = automatic).  Automatic = first playable track marked
+ * "default" (FlagDefault, 1 when missing), else the first playable track.
+ * One mrberry process opens one film at a time, so plain globals are fine. */
+mr_mkv_atrack mr_mkv_atracks[MR_MKV_ATRACK_MAX];
+unsigned mr_mkv_atrack_count;
+unsigned mr_mkv_audio_want;     /* set before opening: 0 = automatic */
+unsigned mr_mkv_audio_chosen;   /* after opening: 1-based, 0 = none */
+int mr_mkv_audio_want_bad;      /* the wanted track is missing / not playable */
+
+static void copy_text(char *dst, size_t cap, const uint8_t *src, size_t n)
+{
+    size_t i, o = 0;
+    for (i = 0; i < n && o + 1 < cap && src[i]; i++) {
+        uint8_t c = src[i];
+        if (c == '|' || c == '\n' || c == '\r') c = ' ';
+        if (c >= 0x80) {                 /* UTF-8: keep Latin-1 letters */
+            if ((c == 0xc3 || c == 0xc2) && i + 1 < n) { c = (uint8_t)(src[++i] + (c == 0xc3 ? 0x40 : 0)); }
+            else { while (i + 1 < n && (src[i + 1] & 0xc0) == 0x80) i++; c = '?'; }
+        }
+        dst[o++] = (char)c;
+    }
+    dst[o] = 0;
+}
+
+int (*mr_mkv_audio_usable)(const mr_audio_info *ai);   /* MKA1c */
+
+static int track_usable(const mr_mkv_atrack *t)
+{
+    return t->supported && (!mr_mkv_audio_usable || mr_mkv_audio_usable(&t->ai));
+}
+
+static void mkv_pick_audio(mr_mkv *m)
+{
+    unsigned i, pick = 0;
+    mr_mkv_audio_chosen = 0;
+    mr_mkv_audio_want_bad = 0;
+    if (mr_mkv_audio_want) {
+        if (mr_mkv_audio_want <= mr_mkv_atrack_count &&
+            track_usable(&mr_mkv_atracks[mr_mkv_audio_want - 1]))
+            pick = mr_mkv_audio_want;
+        else
+            mr_mkv_audio_want_bad = 1;
+    }
+    for (i = 0; !pick && i < mr_mkv_atrack_count; i++)
+        if (track_usable(&mr_mkv_atracks[i]) && mr_mkv_atracks[i].is_default) pick = i + 1;
+    for (i = 0; !pick && i < mr_mkv_atrack_count; i++)
+        if (track_usable(&mr_mkv_atracks[i])) pick = i + 1;
+    /* MKA1c: no track usable with this output -> as before, first supported
+     * one (the film then plays without HDMI sound, see MKA1b) */
+    for (i = 0; !pick && i < mr_mkv_atrack_count; i++)
+        if (mr_mkv_atracks[i].supported) pick = i + 1;
+    if (!pick) return;
+    m->audio = mr_mkv_atracks[pick - 1].ai;
+    m->audio_track = mr_mkv_atracks[pick - 1].number;
+    m->audio_default_duration_ns = mr_mkv_atracks[pick - 1].duration_ns;
+    mr_mkv_audio_chosen = pick;
+}
+
 static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
 {
-    size_t pos = 0, codec_len = 0, private_len = 0;
-    uint64_t number = 0, type = 0, duration = 0;
+    size_t pos = 0, codec_len = 0, private_len = 0, lang_len = 0, name_len = 0;
+    uint64_t number = 0, type = 0, duration = 0, flag_default = 1;
     const char *codec = NULL;
-    const uint8_t *priv = NULL;
+    const uint8_t *priv = NULL, *lang = NULL, *tname = NULL;
     mr_video_info vi;
     mr_audio_info ai;
     ebml_elem e;
@@ -182,6 +244,10 @@ static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
             duration = uint_be(q, (size_t)e.size);
         else if (e.id == 0xe0) parse_video(&vi, q, (size_t)e.size);
         else if (e.id == 0xe1) parse_audio(&ai, q, (size_t)e.size);
+        else if (e.id == 0x22b59c && !lang) { lang = q; lang_len = (size_t)e.size; }
+        else if (e.id == 0x22b59d) { lang = q; lang_len = (size_t)e.size; } /* BCP47 wins */
+        else if (e.id == 0x536e) { tname = q; name_len = (size_t)e.size; }
+        else if (e.id == 0x88 && e.size <= 8) flag_default = uint_be(q, (size_t)e.size);
         pos = (size_t)e.end;
     }
     if (!number || !codec) return;
@@ -209,7 +275,19 @@ static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
         vi.valid = vi.width > 0 && vi.height > 0;
         if (vi.valid) { m->video = vi; m->video_track = number;
                         m->default_duration_ns = duration; }
-    } else if (type == 2 && !m->audio_track) {
+    } else if (type == 2 && mr_mkv_atrack_count < MR_MKV_ATRACK_MAX) {
+        /* MKA1: list every audio track; the choice is made afterwards */
+        mr_mkv_atrack *t = &mr_mkv_atracks[mr_mkv_atrack_count++];
+        memset(t, 0, sizeof *t);
+        t->number = number;
+        t->duration_ns = duration;
+        t->is_default = flag_default != 0;
+        copy_text(t->codec, sizeof t->codec, (const uint8_t *)codec, codec_len);
+        if (lang) copy_text(t->lang, sizeof t->lang, lang, lang_len);
+        else strcpy(t->lang, "eng");     /* Matroska default */
+        if (tname) copy_text(t->name, sizeof t->name, tname, name_len);
+        t->ai.channels = ai.channels;
+        t->ai.sample_rate = ai.sample_rate;
         if (codec_is(codec, codec_len, "A_AAC")) {
             ai.format_tag = MR_AUDIO_FORMAT_AAC;
             ai.codec_tag = MR_FOURCC('m','p','4','a');
@@ -238,8 +316,9 @@ static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
         if (ai.format_tag != MR_AUDIO_FORMAT_PCM) ai.bits_per_sample = 16;
         if (!ai.bits_per_sample) ai.bits_per_sample = 16;
         ai.block_align = (uint16_t)(ai.channels * ((ai.bits_per_sample + 7) / 8));
-        ai.valid = 1; m->audio = ai; m->audio_track = number;
-        m->audio_default_duration_ns = duration;
+        ai.valid = 1;
+        t->ai = ai;
+        t->supported = 1;
     }
 }
 
@@ -301,6 +380,7 @@ static mr_status open_common(mr_mkv *m)
     m->segment_start = segment.payload; m->segment_end = segment.end;
     m->timecode_scale = 1000000;
     mkv_duration_ticks = 0; mr_mkv_duration_us = 0;
+    mr_mkv_atrack_count = 0; mr_mkv_audio_chosen = 0;   /* MKA1 */
     for (pos = segment.payload; pos < segment.end;) {
         if (!elem_at(m, pos, segment.end, &e)) return MR_EFORMAT;
         if (e.id == 0x1f43b675) { m->first_cluster = pos; break; }
@@ -314,6 +394,7 @@ static mr_status open_common(mr_mkv *m)
         pos = e.end;
     }
     if (!m->first_cluster || !m->video.valid) return MR_EUNSUPPORTED;
+    mkv_pick_audio(m);                                  /* MKA1 */
     mr_mkv_duration_us = mkv_duration_ticks * m->timecode_scale / 1000U;
     mr_mkv_rewind(m);
     return MR_OK;

@@ -113,7 +113,8 @@ enum {
     G_PLAYLIST,
     G_SKIP_AFTER,
     G_TIME,
-    G_TIME_LABEL
+    G_TIME_LABEL,
+    G_AUDIO_TRACK                       /* MKA1: audio track chooser */
 };
 
 /* Chooser rows are chipset-dependent, so never infer a display mode from a
@@ -681,6 +682,15 @@ static int g_still_active;
 static int g_still_resume;
 static int g_launch_display = -1;   /* display of the last launch */
 static Object *g_mode;              /* P96W59: Display chooser */
+/* MKA1: audio track chooser (MKV).  g_audio_n = tracks of the film,
+ * g_audio_sel = chosen track (1-based, 0 = none).  g_info_want_track > 0
+ * makes the next INFO run report that track ("INFO AUDIO=n"). */
+static Object *g_audio_ch;
+static struct List g_audio_labels;
+static char g_audio_text[16][80];
+static int g_audio_n, g_audio_sel;
+static int g_audio_hdmi[16], g_audio_paula[16], g_audio_def[16];   /* MKA1c */
+static int g_info_want_track;
 
 typedef struct {
     int ok, playable, seek;
@@ -690,6 +700,12 @@ typedef struct {
     char resume_a[8];                 /* P96W71: HDMI / PAULA / NONE */
     long resume_p;                    /* P96W72: Paula fine offset (ms) */
     int have_resume_p;
+    /* MKA1: audio tracks (MKV) from TRACK<n>= lines */
+    int tracks, track;                /* count, 1-based track INFO reported */
+    struct {
+        char lang[12], codec[12], name[48];
+        int ch, hdmi, paula, def;
+    } t[16];
 } mrg_film_info;
 
 static ULONG mrg_hms_to_s(const char *t)
@@ -713,7 +729,7 @@ static void mrg_copy_field(char *dst, size_t cap, const char *src)
  * parse its KEY=VALUE lines from a T: file. */
 static int mrg_film_info_read(const char *path, mrg_film_info *fi)
 {
-    static char cmd[900], prog[300], buf[2048];
+    static char cmd[900], prog[300], buf[4096];   /* MKA1: room for tracks */
     BPTR in, out, lock;
     LONG n;
     char *line;
@@ -729,7 +745,11 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
     lock = Lock((CONST_STRPTR)prog, ACCESS_READ);
     if (lock) UnLock(lock);
     else strcpy(prog, "mrberry");
-    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" INFO", prog, path);
+    if (g_info_want_track > 0)        /* MKA1: info for the chosen track */
+        snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" INFO AUDIO=%d", prog, path,
+                 g_info_want_track);
+    else
+        snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" INFO", prog, path);
 
     in = Open((CONST_STRPTR)"NIL:", MODE_OLDFILE);
     out = Open((CONST_STRPTR)"T:MintVID-pi.info", MODE_NEWFILE);
@@ -780,6 +800,27 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
             else if (!strcmp(line, "REASON")) mrg_copy_field(fi->reason, sizeof fi->reason, eq);
             else if (!strcmp(line, "RESUME_A")) mrg_copy_field(fi->resume_a, sizeof fi->resume_a, eq);
             else if (!strcmp(line, "RESUME_P")) { fi->resume_p = strtol(eq, NULL, 10); fi->have_resume_p = 1; }
+            else if (!strcmp(line, "AUDIO_TRACKS")) fi->tracks = atoi(eq);
+            else if (!strcmp(line, "AUDIO_TRACK")) fi->track = atoi(eq);
+            else if (!strncmp(line, "TRACK", 5)) {
+                /* MKA1: TRACK<n>=lang|codec|ch|rate|hdmi|paula|default|name */
+                int n = atoi(line + 5);
+                char *f[8];
+                int k = 0;
+                if (n >= 1 && n <= 16) {
+                    f[k++] = eq;
+                    while (k < 8 && (eq = strchr(eq, '|')) != NULL) { *eq++ = 0; f[k++] = eq; }
+                    if (k == 8) {
+                        mrg_copy_field(fi->t[n - 1].lang, sizeof fi->t[n - 1].lang, f[0]);
+                        mrg_copy_field(fi->t[n - 1].codec, sizeof fi->t[n - 1].codec, f[1]);
+                        fi->t[n - 1].ch = atoi(f[2]);
+                        fi->t[n - 1].hdmi = *f[4] == '1';
+                        fi->t[n - 1].paula = *f[5] == '1';
+                        fi->t[n - 1].def = *f[6] == '1';
+                        mrg_copy_field(fi->t[n - 1].name, sizeof fi->t[n - 1].name, f[7]);
+                    }
+                }
+            }
         }
         line = next;
     }
@@ -877,6 +918,113 @@ static void mrg_sound_line(Object *info, struct Window *window)
 }
 
 /* Fill timeline (always) and, if text is set, the info line for path. */
+/* MKA1: ISO 639-2 / BCP 47 code -> English name for the chooser. */
+static const char *mrg_lang_name(const char *code)
+{
+    static const char *const map[] = {
+        "eng", "English", "en", "English", "ger", "German", "deu", "German",
+        "de", "German", "fre", "French", "fra", "French", "fr", "French",
+        "spa", "Spanish", "es", "Spanish", "ita", "Italian", "it", "Italian",
+        "dut", "Dutch", "nld", "Dutch", "nl", "Dutch", "por", "Portuguese",
+        "pt", "Portuguese", "rus", "Russian", "ru", "Russian", "pol", "Polish",
+        "pl", "Polish", "swe", "Swedish", "sv", "Swedish", "dan", "Danish",
+        "da", "Danish", "nor", "Norwegian", "no", "Norwegian", "nob", "Norwegian",
+        "fin", "Finnish", "fi", "Finnish", "cze", "Czech", "ces", "Czech",
+        "cs", "Czech", "hun", "Hungarian", "hu", "Hungarian", "tur", "Turkish",
+        "tr", "Turkish", "gre", "Greek", "ell", "Greek", "el", "Greek",
+        "jpn", "Japanese", "ja", "Japanese", "chi", "Chinese", "zho", "Chinese",
+        "zh", "Chinese", "kor", "Korean", "ko", "Korean", "und", "Unknown",
+        NULL
+    };
+    int i;
+    for (i = 0; map[i]; i += 2)
+        if (!strcmp(code, map[i])) return map[i + 1];
+    return code[0] ? code : "Unknown";
+}
+
+/* MKA1: fill the Audio chooser from the film info.  One entry per track,
+ * e.g. "1: German - AAC 2.0 (Director)"; "only Paula" / "only HDMI" /
+ * "not playable" tell where the track can play.  Disabled with < 2 tracks. */
+static void mrg_audio_chooser_update(struct Window *window, const mrg_film_info *fi)
+{
+    int i, n = fi ? fi->tracks : 0;
+    if (!g_audio_ch) return;
+    if (n > 16) n = 16;
+    SetGadgetAttrs((struct Gadget *)g_audio_ch, window, NULL,
+                   CHOOSER_Labels, (ULONG)~0, TAG_DONE);
+    free_chooser_nodes(&g_audio_labels);
+    for (i = 0; i < n; i++) {
+        char chs[8];
+        const char *where = "";
+        int ch = fi->t[i].ch;
+        if (ch == 1) strcpy(chs, "mono");
+        else if (ch == 2) strcpy(chs, "2.0");
+        else if (ch == 6) strcpy(chs, "5.1");
+        else if (ch == 8) strcpy(chs, "7.1");
+        else snprintf(chs, sizeof chs, "%dch", ch);
+        if (!fi->t[i].hdmi && !fi->t[i].paula) where = " - not playable";
+        else if (!fi->t[i].hdmi) where = " - only Paula";
+        else if (!fi->t[i].paula) where = " - only HDMI";
+        if (fi->t[i].name[0])
+            snprintf(g_audio_text[i], sizeof g_audio_text[i], "%d: %s - %s %s (%s)%s",
+                     i + 1, mrg_lang_name(fi->t[i].lang), fi->t[i].codec, chs,
+                     fi->t[i].name, where);
+        else
+            snprintf(g_audio_text[i], sizeof g_audio_text[i], "%d: %s - %s %s%s",
+                     i + 1, mrg_lang_name(fi->t[i].lang), fi->t[i].codec, chs, where);
+        add_chooser_node(&g_audio_labels, g_audio_text[i]);
+        g_audio_hdmi[i] = fi->t[i].hdmi;
+        g_audio_paula[i] = fi->t[i].paula;
+        g_audio_def[i] = fi->t[i].def;
+    }
+    if (!n) {
+        strcpy(g_audio_text[0], fi && fi->audio[0] ? fi->audio : "-");
+        add_chooser_node(&g_audio_labels, g_audio_text[0]);
+    }
+    g_audio_n = n;
+    g_audio_sel = (n && fi->track >= 1 && fi->track <= n) ? fi->track : (n ? 1 : 0);
+    SetGadgetAttrs((struct Gadget *)g_audio_ch, window, NULL,
+                   CHOOSER_Labels, (ULONG)&g_audio_labels,
+                   CHOOSER_Selected, (ULONG)(g_audio_sel ? g_audio_sel - 1 : 0),
+                   GA_Disabled, n < 2 ? TRUE : FALSE, TAG_DONE);
+}
+
+/* MKA1c: can track n (1-based) play with the display chosen now?
+ * HDMI displays need an HDMI track (MP3 = only Paula, like Opus not). */
+static int mrg_audio_track_ok(int n)
+{
+    if (n < 1 || n > g_audio_n) return 0;
+    return mrg_paula_selected() ? g_audio_paula[n - 1] : g_audio_hdmi[n - 1];
+}
+
+/* MKA1c: after a film or display change: if the chosen track cannot play
+ * with this display, take the default track that can, else the first. */
+static int mrg_audio_fix_for_display(struct Window *window)
+{
+    int i, pick = 0;
+    if (g_audio_n < 2 || mrg_audio_track_ok(g_audio_sel)) return 0;
+    for (i = 1; !pick && i <= g_audio_n; i++)
+        if (mrg_audio_track_ok(i) && g_audio_def[i - 1]) pick = i;
+    for (i = 1; !pick && i <= g_audio_n; i++)
+        if (mrg_audio_track_ok(i)) pick = i;
+    if (!pick) return 0;
+    g_audio_sel = pick;
+    SetGadgetAttrs((struct Gadget *)g_audio_ch, window, NULL,
+                   CHOOSER_Selected, (ULONG)(pick - 1), TAG_DONE);
+    return 1;
+}
+
+/* MKA1: "AUDIO=n" for mrberry when the film has more than one track. */
+static int mrg_args_append(char *args, size_t cap, const char *text);
+static int mrg_args_append_audio(char *args, size_t cap, const char *path)
+{
+    char a[24];
+    if (g_audio_n < 2 || !g_audio_sel || strcmp(path, g_film_path)) return 1;
+    if (!mrg_audio_track_ok(g_audio_sel)) return 1;   /* MKA1c: mrberry picks */
+    snprintf(a, sizeof a, "AUDIO=%d", g_audio_sel);
+    return mrg_args_append(args, cap, a);
+}
+
 static int mrg_film_info_apply(const char *path, Object *info,
                                struct Window *window, int text)
 {
@@ -885,17 +1033,21 @@ static int mrg_film_info_apply(const char *path, Object *info,
     const char *name;
 
     if (!mrg_film_info_read(path, &fi)) {
+        g_info_want_track = 0;
         g_film_len_s = 0; g_film_seek = 0; g_film_path[0] = 0;
         mrg_time_slider_set(window, 0, 0, 0);
+        mrg_audio_chooser_update(window, NULL);          /* MKA1 */
         return 0;
     }
+    g_info_want_track = 0;
     strncpy(g_film_path, path, sizeof g_film_path - 1);
     g_film_path[sizeof g_film_path - 1] = 0;
+    mrg_audio_chooser_update(window, &fi);               /* MKA1 */
     g_film_len_s = fi.len_ms / 1000UL;
     g_film_seek = fi.seek && fi.playable;
     mrg_time_slider_set(window, g_film_len_s,
                         fi.have_resume ? fi.resume_s : 0, g_film_seek);
-    if (!text) return 1;
+    if (!text) { mrg_audio_fix_for_display(window); return 1; }   /* MKA1c */
     /* P96W71: a .t that was saved with Paula sound (A:PAULA) selects the
      * Paula cinema entry, one saved with HDMI sound the normal cinema. */
     if (fi.have_resume && g_mode && window) {
@@ -913,6 +1065,11 @@ static int mrg_film_info_apply(const char *path, Object *info,
         if (want >= 0)
             SetGadgetAttrs((struct Gadget *)g_mode, window, NULL,
                            CHOOSER_Selected, (ULONG)want, TAG_DONE);
+    }
+    if (mrg_audio_fix_for_display(window)) {             /* MKA1c */
+        /* other track for this display: info line for that one */
+        g_info_want_track = g_audio_sel;
+        return mrg_film_info_apply(path, info, window, text);
     }
     name = (const char *)FilePart((CONST_STRPTR)path);
     g_fi = fi;
@@ -1367,6 +1524,7 @@ static void start_player_path(const char *full_file, Object *mode,
         player_status_seq = 0;
         if (!mr_build_mrberry_arguments(args, sizeof(args), path) ||
             !mrg_args_append_time(args, sizeof(args), path) ||
+            !mrg_args_append_audio(args, sizeof(args), path) ||   /* MKA1 */
             (options.display == MR_DISPLAY_PISTORM_PAULA &&
              !mrg_args_append(args, sizeof(args), "PAULA"))) {
             set_info(info, window, "Could not build PiStorm player arguments.");
@@ -1408,7 +1566,8 @@ static void start_player_path(const char *full_file, Object *mode,
             return;
         }
         if (!mrg_args_append(args, sizeof(args), "W:50") ||
-            !mrg_args_append_time(args, sizeof(args), path)) {
+            !mrg_args_append_time(args, sizeof(args), path) ||
+            !mrg_args_append_audio(args, sizeof(args), path)) {   /* MKA1 */
             set_info(info, window, "PiStorm player arguments too long.");
             return;
         }
@@ -1626,6 +1785,7 @@ static void mrg_switch_fullscreen(Object *file, Object *mode, Object *c2p,
         return;
     }
     g_player_was_running = 0;
+    g_info_want_track = g_audio_n > 1 ? g_audio_sel : 0;  /* MKA1: keep choice */
     mrg_film_info_apply(g_film_path, info, window, 0);
     SetGadgetAttrs((struct Gadget *)mode, window, NULL,
                    CHOOSER_Selected, (ULONG)row, TAG_DONE);
@@ -1735,6 +1895,7 @@ static void mrg_jump(Object *file, Object *mode, Object *c2p,
     g_pos_last = (ULONG)-1;
     /* re-read the film (.t now holds the stop position), then put the
      * slider back to the time the user chose */
+    g_info_want_track = g_audio_n > 1 ? g_audio_sel : 0;  /* MKA1: keep choice */
     mrg_film_info_apply(g_film_path, info, window, 0);
     SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
                    SLIDER_Level, level, TAG_DONE);
@@ -2125,6 +2286,7 @@ int main(void)
     Object *services;
     Object *file_label;
     Object *display_label;
+    Object *audio_track_label;          /* MKA1 */
     Object *c2p_label;
     Object *h264_label;
     Object *scale_label;
@@ -2192,6 +2354,7 @@ int main(void)
     services = NULL;
     file_label = NULL;
     display_label = NULL;
+    audio_track_label = NULL;
     c2p_label = NULL;
     h264_label = NULL;
     audio_rate_label = NULL;
@@ -2218,6 +2381,9 @@ int main(void)
     modes.lh_Head = (struct Node *)&modes.lh_Tail;
     modes.lh_Tail = NULL;
     modes.lh_TailPred = (struct Node *)&modes.lh_Head;
+    g_audio_labels.lh_Head = (struct Node *)&g_audio_labels.lh_Tail;   /* MKA1 */
+    g_audio_labels.lh_Tail = NULL;
+    g_audio_labels.lh_TailPred = (struct Node *)&g_audio_labels.lh_Head;
     c2p_modes.lh_Head = (struct Node *)&c2p_modes.lh_Tail;
     c2p_modes.lh_Tail = NULL;
     c2p_modes.lh_TailPred = (struct Node *)&c2p_modes.lh_Head;
@@ -2405,6 +2571,19 @@ int main(void)
                                CHOOSER_Selected, default_mode,
                                TAG_DONE);
     g_mode = mode;
+    /* MKA1: audio track chooser, filled per film (mrg_audio_chooser_update) */
+    strcpy(g_audio_text[0], "-");
+    add_chooser_node(&g_audio_labels, g_audio_text[0]);
+    g_audio_ch = (Object *)NewObject(CHOOSER_GetClass(), NULL,
+                                     GA_ID, G_AUDIO_TRACK,
+                                     GA_RelVerify, TRUE,
+                                     GA_Disabled, TRUE,
+                                     CHOOSER_Labels, (ULONG)&g_audio_labels,
+                                     CHOOSER_Selected, 0,
+                                     TAG_DONE);
+    audio_track_label = (Object *)NewObject(LABEL_GetClass(), NULL,
+                                            LABEL_Text, (ULONG)"Audio",
+                                            TAG_DONE);
     c2p = (Object *)NewObject(CHOOSER_GetClass(), NULL,
                               GA_ID, G_C2P,
                               GA_RelVerify, TRUE,
@@ -2517,7 +2696,7 @@ int main(void)
         !video_mode || !g_skip_after || !skip_after_label || !info ||
         !file_label || !display_label || !c2p_label || !h264_label ||
         !scale_label || !audio_rate_label || !fast_buffer_label ||
-        !video_mode_label)
+        !video_mode_label || !g_audio_ch || !audio_track_label)
         goto cleanup;
 
     /* Keep the option area comfortably inside a 640-pixel A1200 Workbench.
@@ -2533,6 +2712,8 @@ int main(void)
                                        LAYOUT_SpaceInner, TRUE,
                                        LAYOUT_AddChild, (ULONG)mode,
                                        CHILD_Label, (ULONG)display_label,
+                                       LAYOUT_AddChild, (ULONG)g_audio_ch,   /* MKA1 */
+                                       CHILD_Label, (ULONG)audio_track_label,
                                        TAG_DONE);
     if (!controls_top)
         goto cleanup;
@@ -2792,8 +2973,65 @@ int main(void)
                         update_file_info(file, info, window);
                     break;
 
+                case G_AUDIO_TRACK: {
+                    /* MKA1: new audio track.  Before the start: read INFO for
+                     * it (sound line, playable).  While a film plays: it is
+                     * used at the next start or ">>" (live switch = A2). */
+                    ULONG sel = 0;
+                    GetAttr(CHOOSER_Selected, g_audio_ch, &sel);
+                    if (g_audio_n < 2 || (int)sel + 1 == g_audio_sel) break;
+                    if (!mrg_audio_track_ok((int)sel + 1)) {
+                        /* MKA1c: not with this display -> back to the old one */
+                        static char msg[96];
+                        int n = (int)sel + 1;
+                        if (g_audio_paula[n - 1] && !mrg_paula_selected())
+                            snprintf(msg, sizeof msg,
+                                     "Audio track %d plays only with Fullscreen (Paula).", n);
+                        else if (g_audio_hdmi[n - 1] && mrg_paula_selected())
+                            snprintf(msg, sizeof msg,
+                                     "Audio track %d plays only over HDMI, not Paula.", n);
+                        else
+                            snprintf(msg, sizeof msg, "Audio track %d cannot be played.", n);
+                        SetGadgetAttrs((struct Gadget *)g_audio_ch, window, NULL,
+                                       CHOOSER_Selected,
+                                       (ULONG)(g_audio_sel ? g_audio_sel - 1 : 0), TAG_DONE);
+                        set_info(info, window, msg);
+                        break;
+                    }
+                    g_audio_sel = (int)sel + 1;
+                    if (find_player()) {
+                        set_info(info, window,
+                                 "Audio track is used after >> or the next start.");
+                    } else if (g_film_path[0]) {
+                        ULONG level = 0;
+                        if (g_time_slider) GetAttr(SLIDER_Level, g_time_slider, &level);
+                        g_info_want_track = g_audio_sel;
+                        SetWindowPointer(window, WA_BusyPointer, TRUE, TAG_DONE);
+                        mrg_film_info_apply(g_film_path, info, window, 1);
+                        SetWindowPointer(window, TAG_DONE);
+                        if (g_time_slider && g_film_seek) {   /* keep the start time */
+                            SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                                           SLIDER_Level, level, TAG_DONE);
+                            mrg_time_label_update(window);
+                        }
+                    }
+                    break;
+                }
+
                 case G_MODE:
                     mrg_time_enable(window);
+                    if (mrg_audio_fix_for_display(window) && /* MKA1c */
+                        !find_player() && g_film_path[0]) {
+                        ULONG level = 0;
+                        if (g_time_slider) GetAttr(SLIDER_Level, g_time_slider, &level);
+                        g_info_want_track = g_audio_sel;
+                        mrg_film_info_apply(g_film_path, info, window, 1);
+                        if (g_time_slider && g_film_seek) {
+                            SetGadgetAttrs((struct Gadget *)g_time_slider, window, NULL,
+                                           SLIDER_Level, level, TAG_DONE);
+                            mrg_time_label_update(window);
+                        }
+                    }
                     mrg_sound_line(info, window);      /* P96W72: HDMI/Paula */
                     update_mode_controls(mode, c2p, lace, scale, window, TRUE);
                     update_skip_after(mode, h264, video_mode, window);
@@ -2970,6 +3208,8 @@ cleanup:
             } else {
                 if (mode) DisposeObject(mode);
                 if (display_label) DisposeObject(display_label);
+                if (g_audio_ch) DisposeObject(g_audio_ch);          /* MKA1 */
+                if (audio_track_label) DisposeObject(audio_track_label);
             }
         }
 
@@ -3034,6 +3274,8 @@ cleanup:
     free_chooser_nodes(&fast_buffer_modes);
     free_chooser_nodes(&video_modes);
     free_chooser_nodes(&skip_after_modes);
+    free_chooser_nodes(&g_audio_labels);                 /* MKA1 */
+    g_audio_ch = NULL;
     g_skip_after = NULL;
     g_time_slider = NULL;
     g_time_label = NULL;

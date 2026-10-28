@@ -61,6 +61,7 @@ extern void bvp_exec_closelibrary(struct Library *lib);
 /* OpenStream flags: 0 = cinema (HVS), 10/25/50/75 = P96 window size. */
 ULONG mr_berryvp_stream_flags = 0;
 int mr_berryvp_force_isp = 0;   /* ISP82: ISP = cinema via ISP graph (test) */
+unsigned long mr_berryvp_isp_out = 0;  /* N84: 0 / 0xFFFFFFFF / (W<<16)|H (test) */
 extern LONG bvp_call_control2(struct Library *base, ULONG cmd, ULONG arg);
 
 static FILE *ac309f_trace;
@@ -323,6 +324,8 @@ mr_status mr_berryvp_open(mr_berryvp *b, const mr_video_info *vi)
     }
     /* ISP82: always tell the library (it stays loaded between films). */
     (void)bvp_call_control2(b->lib, 8, mr_berryvp_force_isp ? 1UL : 0UL);
+    /* N84: ISP output size test (always set; 0 = normal N83) */
+    (void)bvp_call_control2(b->lib, 9, mr_berryvp_isp_out);
     DBG_PRINTF("[B05] before OpenStream\n");
     r = bvp_call_openstream(b->lib, mr_berryvp_stream_flags);
     DBG_PRINTF("[B06] after OpenStream r=%ld\n", (long)r);
