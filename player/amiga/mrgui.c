@@ -114,7 +114,8 @@ enum {
     G_SKIP_AFTER,
     G_TIME,
     G_TIME_LABEL,
-    G_AUDIO_TRACK                       /* MKA1: audio track chooser */
+    G_AUDIO_TRACK,                      /* MKA1: audio track chooser */
+    G_SUB_TRACK                         /* S2: subtitle file chooser */
 };
 
 /* Chooser rows are chipset-dependent, so never infer a display mode from a
@@ -680,6 +681,7 @@ static int g_paula_paused;
  * "Resume") -> start the Paula fullscreen again. */
 static int g_still_active;
 static int g_still_resume;
+static int g_full_req;              /* v96.82: F in the video window */
 static int g_launch_display = -1;   /* display of the last launch */
 static Object *g_mode;              /* P96W59: Display chooser */
 /* MKA1: audio track chooser (MKV).  g_audio_n = tracks of the film,
@@ -691,6 +693,14 @@ static char g_audio_text[16][80];
 static int g_audio_n, g_audio_sel;
 static int g_audio_hdmi[16], g_audio_paula[16], g_audio_def[16];   /* MKA1c */
 static int g_info_want_track;
+/* S2: subtitle chooser.  Entry 0 = Off, n = SRT file n of the film (as
+ * mrberry INFO numbers them).  g_sub_sel follows INFO's SUB_CHOSEN until
+ * the user picks one for this film (g_sub_touched). */
+static Object *g_sub_ch;
+static struct List g_sub_labels;
+static char g_sub_text[17][72];
+static int g_sub_n, g_sub_sel, g_sub_touched;
+static char g_sub_film[256];
 
 typedef struct {
     int ok, playable, seek;
@@ -706,6 +716,10 @@ typedef struct {
         char lang[12], codec[12], name[48];
         int ch, hdmi, paula, def;
     } t[16];
+    /* S2: SRT files from SUBS= / SUB<n>= / SUB_CHOSEN= */
+    int subs, sub_chosen;
+    char sub_label[16][64];
+    int sub_forced[16];
 } mrg_film_info;
 
 static ULONG mrg_hms_to_s(const char *t)
@@ -801,6 +815,16 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
             else if (!strcmp(line, "RESUME_A")) mrg_copy_field(fi->resume_a, sizeof fi->resume_a, eq);
             else if (!strcmp(line, "RESUME_P")) { fi->resume_p = strtol(eq, NULL, 10); fi->have_resume_p = 1; }
             else if (!strcmp(line, "AUDIO_TRACKS")) fi->tracks = atoi(eq);
+            else if (!strcmp(line, "SUBS")) fi->subs = atoi(eq);              /* S2 */
+            else if (!strcmp(line, "SUB_CHOSEN")) fi->sub_chosen = atoi(eq);
+            else if (!strncmp(line, "SUB", 3) && line[3] >= '1' && line[3] <= '9') {
+                int n = atoi(line + 3);
+                char *bar = strrchr(eq, '|');
+                if (n >= 1 && n <= 16) {
+                    if (bar) { *bar++ = 0; fi->sub_forced[n - 1] = *bar == '1'; }
+                    mrg_copy_field(fi->sub_label[n - 1], sizeof fi->sub_label[n - 1], eq);
+                }
+            }
             else if (!strcmp(line, "AUDIO_TRACK")) fi->track = atoi(eq);
             else if (!strncmp(line, "TRACK", 5)) {
                 /* MKA1: TRACK<n>=lang|codec|ch|rate|hdmi|paula|default|name */
@@ -989,6 +1013,56 @@ static void mrg_audio_chooser_update(struct Window *window, const mrg_film_info 
                    GA_Disabled, n < 2 ? TRUE : FALSE, TAG_DONE);
 }
 
+/* S2b: subtitles only in fullscreen (cinema, HDMI or Paula sound); the
+ * window mode has no OSD layer -> chooser grey there. */
+static int mrg_sub_display_ok(void)
+{
+    ULONG row = 0;
+    if (!g_mode) return 0;
+    GetAttr(CHOOSER_Selected, g_mode, &row);
+    return row < mode_count && (mode_values[row] == MR_DISPLAY_PISTORM_HARD_FULLSCREEN ||
+                                mode_values[row] == MR_DISPLAY_PISTORM_PAULA);
+}
+static void mrg_sub_enable(struct Window *window)
+{
+    if (g_sub_ch)
+        SetGadgetAttrs((struct Gadget *)g_sub_ch, window, NULL,
+                       GA_Disabled, (g_sub_n < 1 || !mrg_sub_display_ok()) ? TRUE : FALSE,
+                       TAG_DONE);
+}
+
+/* S2: fill the Subtitles chooser: "Off", then one entry per SRT file.
+ * Keeps the user's choice while the same film stays selected. */
+static void mrg_sub_chooser_update(struct Window *window, const mrg_film_info *fi,
+                                   const char *path)
+{
+    int i, n = fi ? fi->subs : 0;
+    if (!g_sub_ch) return;
+    if (n > 16) n = 16;
+    if (!path || strcmp(path, g_sub_film)) {
+        g_sub_touched = 0;
+        g_sub_film[0] = 0;
+        if (path) { strncpy(g_sub_film, path, sizeof g_sub_film - 1); g_sub_film[sizeof g_sub_film - 1] = 0; }
+    }
+    SetGadgetAttrs((struct Gadget *)g_sub_ch, window, NULL,
+                   CHOOSER_Labels, (ULONG)~0, TAG_DONE);
+    free_chooser_nodes(&g_sub_labels);
+    strcpy(g_sub_text[0], n ? "Off" : "-");
+    add_chooser_node(&g_sub_labels, g_sub_text[0]);
+    for (i = 0; i < n; i++) {
+        snprintf(g_sub_text[i + 1], sizeof g_sub_text[i + 1], "%d: %s", i + 1,
+                 fi->sub_label[i][0] ? fi->sub_label[i] : "?");
+        add_chooser_node(&g_sub_labels, g_sub_text[i + 1]);
+    }
+    if (!g_sub_touched || g_sub_sel > n)
+        g_sub_sel = (fi && fi->sub_chosen >= 0 && fi->sub_chosen <= n) ? fi->sub_chosen : 0;
+    g_sub_n = n;
+    SetGadgetAttrs((struct Gadget *)g_sub_ch, window, NULL,
+                   CHOOSER_Labels, (ULONG)&g_sub_labels,
+                   CHOOSER_Selected, (ULONG)g_sub_sel,
+                   GA_Disabled, (n < 1 || !mrg_sub_display_ok()) ? TRUE : FALSE, TAG_DONE);
+}
+
 /* MKA1c: can track n (1-based) play with the display chosen now?
  * HDMI displays need an HDMI track (MP3 = only Paula, like Opus not). */
 static int mrg_audio_track_ok(int n)
@@ -1025,6 +1099,16 @@ static int mrg_args_append_audio(char *args, size_t cap, const char *path)
     return mrg_args_append(args, cap, a);
 }
 
+/* S2: "SUB=n" / "SUB=OFF" for mrberry when the film has SRT files. */
+static int mrg_args_append_sub(char *args, size_t cap, const char *path)
+{
+    char a[24];
+    if (g_sub_n < 1 || strcmp(path, g_film_path)) return 1;
+    if (g_sub_sel >= 1 && g_sub_sel <= g_sub_n) snprintf(a, sizeof a, "SUB=%d", g_sub_sel);
+    else strcpy(a, "SUB=OFF");
+    return mrg_args_append(args, cap, a);
+}
+
 static int mrg_film_info_apply(const char *path, Object *info,
                                struct Window *window, int text)
 {
@@ -1037,12 +1121,14 @@ static int mrg_film_info_apply(const char *path, Object *info,
         g_film_len_s = 0; g_film_seek = 0; g_film_path[0] = 0;
         mrg_time_slider_set(window, 0, 0, 0);
         mrg_audio_chooser_update(window, NULL);          /* MKA1 */
+        mrg_sub_chooser_update(window, NULL, NULL);      /* S2 */
         return 0;
     }
     g_info_want_track = 0;
     strncpy(g_film_path, path, sizeof g_film_path - 1);
     g_film_path[sizeof g_film_path - 1] = 0;
     mrg_audio_chooser_update(window, &fi);               /* MKA1 */
+    mrg_sub_chooser_update(window, &fi, path);           /* S2 */
     g_film_len_s = fi.len_ms / 1000UL;
     g_film_seek = fi.seek && fi.playable;
     mrg_time_slider_set(window, g_film_len_s,
@@ -1379,6 +1465,11 @@ static void poll_player_status(Object *info, struct Window *window)
     player_status_seq = ps.seq;
     g_player_paused = ps.state == MR_PLAYER_STATE_PLAYING &&
                       !strcmp(ps.text, "Paused");
+    if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Fullscreen")) {
+        g_full_req = 1;                           /* v96.82: key F */
+        set_info(info, window, "Switching to fullscreen...");
+        return;
+    }
     if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Paused")) {
         g_paula_paused = 1;                       /* P96W78 */
         set_info(info, window, "Paused - press > to continue.");
@@ -1525,6 +1616,7 @@ static void start_player_path(const char *full_file, Object *mode,
         if (!mr_build_mrberry_arguments(args, sizeof(args), path) ||
             !mrg_args_append_time(args, sizeof(args), path) ||
             !mrg_args_append_audio(args, sizeof(args), path) ||   /* MKA1 */
+            !mrg_args_append_sub(args, sizeof(args), path) ||     /* S2 */
             (options.display == MR_DISPLAY_PISTORM_PAULA &&
              !mrg_args_append(args, sizeof(args), "PAULA"))) {
             set_info(info, window, "Could not build PiStorm player arguments.");
@@ -1754,6 +1846,28 @@ static int mrg_stop_still(void)
 /* Fullscreen: stop the PiStorm window film with Ctrl-F (mrberry writes the
  * .t position without recap), read it, switch the Display chooser to
  * cinema and start again at that position. */
+/* The window film has stopped and saved its spot in the .t: start it in
+ * full screen from there (Fullscreen button, and v96.82 key F). */
+static void mrg_fullscreen_restart(Object *file, Object *mode, Object *c2p,
+                                   Object *h264, Object *lace, Object *scale,
+                                   Object *audio_rate, Object *fast_buffer,
+                                   Object *no_audio, Object *mono_audio,
+                                   Object *video_mode, Object *info,
+                                   struct Window *window, int row)
+{
+    g_info_want_track = g_audio_n > 1 ? g_audio_sel : 0;  /* MKA1: keep choice */
+    mrg_film_info_apply(g_film_path, info, window, 0);
+    SetGadgetAttrs((struct Gadget *)mode, window, NULL,
+                   CHOOSER_Selected, (ULONG)row, TAG_DONE);
+    update_mode_controls(mode, c2p, lace, scale, window, TRUE);
+    update_skip_after(mode, h264, video_mode, window);
+    mrg_sub_enable(window);                               /* S2b */
+    SetWindowPointer(window, TAG_DONE);
+    start_player(file, mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
+                 no_audio, mono_audio, video_mode, info, window);
+    mrg_buttons_update(window);
+}
+
 static void mrg_switch_fullscreen(Object *file, Object *mode, Object *c2p,
                                   Object *h264, Object *lace, Object *scale,
                                   Object *audio_rate, Object *fast_buffer,
@@ -1785,16 +1899,9 @@ static void mrg_switch_fullscreen(Object *file, Object *mode, Object *c2p,
         return;
     }
     g_player_was_running = 0;
-    g_info_want_track = g_audio_n > 1 ? g_audio_sel : 0;  /* MKA1: keep choice */
-    mrg_film_info_apply(g_film_path, info, window, 0);
-    SetGadgetAttrs((struct Gadget *)mode, window, NULL,
-                   CHOOSER_Selected, (ULONG)row, TAG_DONE);
-    update_mode_controls(mode, c2p, lace, scale, window, TRUE);
-    update_skip_after(mode, h264, video_mode, window);
-    SetWindowPointer(window, TAG_DONE);
-    start_player(file, mode, c2p, h264, lace, scale, audio_rate, fast_buffer,
-                 no_audio, mono_audio, video_mode, info, window);
-    mrg_buttons_update(window);
+    mrg_fullscreen_restart(file, mode, c2p, h264, lace, scale, audio_rate,
+                           fast_buffer, no_audio, mono_audio, video_mode,
+                           info, window, row);
 }
 
 /* P96W62: follow the running film on the timeline.  mrberry writes the
@@ -1804,6 +1911,10 @@ static void mrg_switch_fullscreen(Object *file, Object *mode, Object *c2p,
 #define MRG_POS_FILE "T:MintVID-pi.pos"
 #define MRG_POS_HOLD_TICKS 40          /* 40 x 250 ms = 10 s */
 static int g_pos_hold;
+/* MKA1d: the user moved the timeline while a film runs (or is paused);
+ * ">" then jumps there like ">>" instead of only ending the pause.
+ * Cleared when the timeline follows the film again or after a jump. */
+static int g_slider_touched;
 static ULONG g_pos_last = (ULONG)-1;
 
 static void mrg_pos_poll(struct Window *window)
@@ -1831,6 +1942,7 @@ static void mrg_pos_poll(struct Window *window)
         }
     }
     if (g_pos_hold > 0) { g_pos_hold--; return; }
+    if (!g_player_paused) g_slider_touched = 0;   /* MKA1d: follows the film */
     if (!g_time_slider || !g_film_seek || !g_film_len_s) return;
     for (i = 0; buf[i] >= '0' && buf[i] <= '9'; i++)
         sec = sec * 10 + (ULONG)(buf[i] - '0');
@@ -1892,6 +2004,7 @@ static void mrg_jump(Object *file, Object *mode, Object *c2p,
     g_still_active = 0;                 /* P96W79: ">>" also from the still */
     g_still_resume = 0;
     g_pos_hold = 0;
+    g_slider_touched = 0;               /* MKA1d */
     g_pos_last = (ULONG)-1;
     /* re-read the film (.t now holds the stop position), then put the
      * slider back to the time the user chose */
@@ -2287,6 +2400,7 @@ int main(void)
     Object *file_label;
     Object *display_label;
     Object *audio_track_label;          /* MKA1 */
+    Object *sub_track_label;            /* S2 */
     Object *c2p_label;
     Object *h264_label;
     Object *scale_label;
@@ -2355,6 +2469,7 @@ int main(void)
     file_label = NULL;
     display_label = NULL;
     audio_track_label = NULL;
+    sub_track_label = NULL;
     c2p_label = NULL;
     h264_label = NULL;
     audio_rate_label = NULL;
@@ -2384,6 +2499,9 @@ int main(void)
     g_audio_labels.lh_Head = (struct Node *)&g_audio_labels.lh_Tail;   /* MKA1 */
     g_audio_labels.lh_Tail = NULL;
     g_audio_labels.lh_TailPred = (struct Node *)&g_audio_labels.lh_Head;
+    g_sub_labels.lh_Head = (struct Node *)&g_sub_labels.lh_Tail;       /* S2 */
+    g_sub_labels.lh_Tail = NULL;
+    g_sub_labels.lh_TailPred = (struct Node *)&g_sub_labels.lh_Head;
     c2p_modes.lh_Head = (struct Node *)&c2p_modes.lh_Tail;
     c2p_modes.lh_Tail = NULL;
     c2p_modes.lh_TailPred = (struct Node *)&c2p_modes.lh_Head;
@@ -2584,6 +2702,19 @@ int main(void)
     audio_track_label = (Object *)NewObject(LABEL_GetClass(), NULL,
                                             LABEL_Text, (ULONG)"Audio",
                                             TAG_DONE);
+    /* S2: subtitle chooser, filled per film (mrg_sub_chooser_update) */
+    strcpy(g_sub_text[0], "-");
+    add_chooser_node(&g_sub_labels, g_sub_text[0]);
+    g_sub_ch = (Object *)NewObject(CHOOSER_GetClass(), NULL,
+                                   GA_ID, G_SUB_TRACK,
+                                   GA_RelVerify, TRUE,
+                                   GA_Disabled, TRUE,
+                                   CHOOSER_Labels, (ULONG)&g_sub_labels,
+                                   CHOOSER_Selected, 0,
+                                   TAG_DONE);
+    sub_track_label = (Object *)NewObject(LABEL_GetClass(), NULL,
+                                          LABEL_Text, (ULONG)"Subtitles",
+                                          TAG_DONE);
     c2p = (Object *)NewObject(CHOOSER_GetClass(), NULL,
                               GA_ID, G_C2P,
                               GA_RelVerify, TRUE,
@@ -2696,7 +2827,8 @@ int main(void)
         !video_mode || !g_skip_after || !skip_after_label || !info ||
         !file_label || !display_label || !c2p_label || !h264_label ||
         !scale_label || !audio_rate_label || !fast_buffer_label ||
-        !video_mode_label || !g_audio_ch || !audio_track_label)
+        !video_mode_label || !g_audio_ch || !audio_track_label ||
+        !g_sub_ch || !sub_track_label)
         goto cleanup;
 
     /* Keep the option area comfortably inside a 640-pixel A1200 Workbench.
@@ -2714,6 +2846,8 @@ int main(void)
                                        CHILD_Label, (ULONG)display_label,
                                        LAYOUT_AddChild, (ULONG)g_audio_ch,   /* MKA1 */
                                        CHILD_Label, (ULONG)audio_track_label,
+                                       LAYOUT_AddChild, (ULONG)g_sub_ch,     /* S2 */
+                                       CHILD_Label, (ULONG)sub_track_label,
                                        TAG_DONE);
     if (!controls_top)
         goto cleanup;
@@ -2915,7 +3049,18 @@ int main(void)
                     /* P96W79: read the last status once more - the player may
                      * have written "Paused"/"Resume" and ended in this tick */
                     poll_player_status(info, window);
-                    if (g_still_active) {
+                    if (g_full_req) {
+                        /* v96.82: F in the video window -> full screen */
+                        int row = mode_row(MR_DISPLAY_PISTORM_HARD_FULLSCREEN);
+                        g_full_req = 0;
+                        if (row >= 0 && g_launch_display == MR_DISPLAY_PISTORM_HARD_WINDOW)
+                            mrg_fullscreen_restart(file, mode, c2p, h264, lace, scale,
+                                                   audio_rate, fast_buffer, no_audio,
+                                                   mono_audio, video_mode, info,
+                                                   window, row);
+                        else
+                            mrg_film_info_apply(g_film_path, info, window, 0);
+                    } else if (g_still_active) {
                         /* P96W79: the still ended (Space = continue, or
                          * Esc / window closed = stay paused, no picture) */
                         int resume = g_still_resume;
@@ -2941,7 +3086,7 @@ int main(void)
                 }
                 g_player_was_running = running;
                 if (running) mrg_pos_poll(window);
-                else { g_pos_hold = 0; g_pos_last = (ULONG)-1; }
+                else { g_pos_hold = 0; g_pos_last = (ULONG)-1; g_slider_touched = 0; }
                 mrg_buttons_update(window);
             }
             status_timer_start();
@@ -3018,8 +3163,22 @@ int main(void)
                     break;
                 }
 
+                case G_SUB_TRACK: {
+                    /* S2: subtitle file for this film (used at the next
+                     * start or ">>"; mrberry keeps it in the .t as S:) */
+                    ULONG sel = 0;
+                    GetAttr(CHOOSER_Selected, g_sub_ch, &sel);
+                    if (g_sub_n < 1 || (int)sel == g_sub_sel) break;
+                    g_sub_sel = (int)sel;
+                    g_sub_touched = 1;
+                    if (find_player())
+                        set_info(info, window, "Subtitles are used after >> or the next start.");
+                    break;
+                }
+
                 case G_MODE:
                     mrg_time_enable(window);
+                    mrg_sub_enable(window);           /* S2b */
                     if (mrg_audio_fix_for_display(window) && /* MKA1c */
                         !find_player() && g_film_path[0]) {
                         ULONG level = 0;
@@ -3097,6 +3256,16 @@ int main(void)
                         /* P96W78: mrberry stops at the spot (Ctrl-D) */
                         signal_player(SIGBREAKF_CTRL_D);
                         set_info(info, window, "Pausing...");
+                    } else if (find_player() && g_player_paused && g_slider_touched &&
+                               g_film_seek &&
+                               (g_launch_display == MR_DISPLAY_PISTORM_HARD_WINDOW ||
+                                g_launch_display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN)) {
+                        /* MKA1d: paused and the timeline was moved -> ">"
+                         * continues at the new time (same as ">>") */
+                        g_slider_touched = 0;
+                        mrg_jump(file, mode, c2p, h264, lace, scale,
+                                 audio_rate, fast_buffer, no_audio,
+                                 mono_audio, video_mode, info, window);
                     } else if (find_player()) {
                         signal_player(SIGBREAKF_CTRL_D);
                         g_player_paused = !g_player_paused;
@@ -3139,7 +3308,10 @@ int main(void)
 
                 case G_TIME:
                     mrg_time_label_update(window);
-                    if (find_player()) g_pos_hold = MRG_POS_HOLD_TICKS;
+                    if (find_player()) {
+                        g_pos_hold = MRG_POS_HOLD_TICKS;
+                        g_slider_touched = 1;          /* MKA1d */
+                    }
                     break;
 
                 case G_PLAYLIST:
@@ -3210,6 +3382,8 @@ cleanup:
                 if (display_label) DisposeObject(display_label);
                 if (g_audio_ch) DisposeObject(g_audio_ch);          /* MKA1 */
                 if (audio_track_label) DisposeObject(audio_track_label);
+                if (g_sub_ch) DisposeObject(g_sub_ch);              /* S2 */
+                if (sub_track_label) DisposeObject(sub_track_label);
             }
         }
 
@@ -3276,6 +3450,8 @@ cleanup:
     free_chooser_nodes(&skip_after_modes);
     free_chooser_nodes(&g_audio_labels);                 /* MKA1 */
     g_audio_ch = NULL;
+    free_chooser_nodes(&g_sub_labels);                   /* S2 */
+    g_sub_ch = NULL;
     g_skip_after = NULL;
     g_time_slider = NULL;
     g_time_label = NULL;

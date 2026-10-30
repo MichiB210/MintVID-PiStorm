@@ -45,6 +45,7 @@ includes it in full (MIT licence). MintVID's own README is in
 | Audio | **E-AC3 (Dolby Digital Plus)**, stereo | FFmpeg on CPU1 | stereo PCM over HDMI |
 | Audio | AAC, MP3, MP2, AC3, PCM | Amiga (Paula player by Darren 'boingball' Banfi) | Paula, full screen only ("PiStorm / VC Hard Fullscreen (Paula)", mrberry PAULA) |
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
+| Subtitles | **SRT** (text) | drawn by the Amiga (mrberry) | second picture layer of the Pi above the film, full screen only |
 
 The Pi 3A+ decodes H.264 up to 1080p at 30 fps (Raspberry Pi product brief).
 For smooth playback use up to 1080p25/30 or 720p up to 60 fps with a moderate
@@ -81,12 +82,37 @@ also with Paula sound: MintVID-pi shows the paused spot as a still
 picture in a window, and Play (or Space) continues in full screen with
 Paula sound.
 
+In the PiStorm window: Space pauses, **F** switches to full screen at the
+same spot (when the film was started from MintVID-pi), Esc or 0 stops.
+
 MKV films with several audio tracks: the "Audio" chooser in MintVID-pi
 lists every track (language, format, name). Without a choice the track
 marked as default in the MKV plays. The chosen track is remembered in
 film.t. Tracks that cannot play with the chosen output are refused (e.g.
 MP3 over HDMI, E-AC3 through Paula, DTS/Opus/FLAC anywhere); a film with
 no HDMI-capable track plays without sound in full screen.
+
+Subtitles (SRT, full screen only): put an SRT file with the film's name
+next to it (`movie.srt`, or `movie.<name>.srt`, e.g. `movie.de_forced.srt`,
+`movie.englisch_CC.srt`). The "Subtitles" chooser in MintVID-pi lists them.
+At the first start the "forced" file in the language of the audio track is
+chosen (else the first forced file, else none); your choice is remembered in
+film.t. The text is drawn by the Amiga (white, black outline, up to two lines)
+on a second picture layer of the Pi above the film. Key O switches the
+subtitles off/on, + and - move them by 0.1 s (HDMI sound). SRT files in UTF-8
+or Windows encoding work. Image subtitles (VobSub .idx/.sub) are not supported
+yet. Shell: `mrberry movie.mkv SUB=2`, `SUB=OFF`, `SUB=file.srt`, `NOSUB`.
+
+Tips:
+
+- Start films from the SD card if you can; USB sticks can be slower. On an
+  NTFS stick do not rename files on the Amiga (the NTFS driver crashed in a
+  test) - rename them on the PC.
+- Full screen is recommended. There the Pi decodes and shows the picture
+  itself. In the P96 window every picture is copied to the Amiga and drawn
+  by it, so depending on the resolution, the file, the audio tracks it
+  contains and the audio format (e.g. AC3) the window playback may not stay
+  smooth.
 
 Since v96.76 VPberry is no longer needed. All other MintVID playback
 modes work as in upstream MintVID.
@@ -129,7 +155,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.80
+This builds all runtime files and compares them with the released v96.82
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

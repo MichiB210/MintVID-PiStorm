@@ -65,6 +65,10 @@ BVP_CTRL_IDLE         equ 5      ; P96W45: keep the window alive (pause)
 BVP_CTRL_TIMESHIFT    equ 6      ; P96W47: D1 = us the caller paused
 BVP_CTRL_CLOCKSTART   equ 7      ; CLK81: D0 = Pi timer when the free clock started (0 = none)
 BVP_CTRL_FORCEISP     equ 8      ; ISP82: D1 = 1 cinema always via ISP (test), 0 = normal
+BVP_CTRL_OSD          equ 10     ; O1: D1 = OSD request block (test), 0 = none
+BVP_CTRL_OSDCLOCK     equ 13     ; S1: D1 = 1 query the Pi clock ~1/s; D0 = clock block
+BVP_CTRL_OSDPIC       equ 12     ; O3: D1 = new RGBA picture (same w x h) while the film plays
+BVP_CTRL_OSDSHOW      equ 11     ; O2: D1 = 1 show OSD, 0 hide (while the film plays)
 BVP_CTRL_ISPOUT       equ 9      ; N84: D1 = 0 normal, -1 no N83 upscale, (W<<16)|H ISP output size (test)
 BVP_PKT_CONFIG        equ 1
 BVP_PKT_FRAME_START   equ 2
@@ -331,6 +335,18 @@ BVP_SV_StateOK:
         bra.w   BVP_SV_Done
 
 BVP_SV_Data:
+        tst.l   s1_enabled                ; S1: Pi clock for subtitles
+        beq.s   s1_sv_none
+        jsr     s1_clk_maybe
+s1_sv_none:
+        tst.l   o3_req                    ; O3: new OSD picture pending
+        beq.s   o3_sv_none
+        jsr     o3_apply
+o3_sv_none:
+        tst.l   o2_req                    ; O2: OSD show/hide wish pending
+        beq.s   o2_sv_none
+        jsr     o2_apply
+o2_sv_none:
         tst.l   bvp_p96_mode
         beq.s   p96w20_sv_nofast
         move.l  #1,p96w20_fast
@@ -599,6 +615,14 @@ BVP_Control:
         beq.s   BVP_CTL_ForceIsp
         cmpi.l  #BVP_CTRL_ISPOUT,d0
         beq.s   BVP_CTL_IspOut
+        cmpi.l  #BVP_CTRL_OSD,d0
+        beq.s   BVP_CTL_Osd
+        cmpi.l  #BVP_CTRL_OSDSHOW,d0
+        beq.s   BVP_CTL_OsdShow
+        cmpi.l  #BVP_CTRL_OSDPIC,d0
+        beq.w   BVP_CTL_OsdPic
+        cmpi.l  #BVP_CTRL_OSDCLOCK,d0
+        beq.w   BVP_CTL_OsdClock
         moveq   #BVPERR_UNSUPPORTED,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
@@ -658,6 +682,76 @@ BVP_CTL_ForceIsp:
 BVP_CTL_IspOut:
         move.l  d1,n84_isp_out
         bra.s   BVP_CTL_OK
+; O1: OSD test request block (see o1_setup).  Set before OpenStream.
+BVP_CTL_Osd:
+        move.l  d1,o1_req
+        bra.s   BVP_CTL_OK
+; O2: show/hide the OSD layer while the film plays.  Only notes the wish;
+; the PARAMETER_SET goes out at the start of the next SendVideo (o2_apply),
+; where the library owns the VCHIQ queues (same place as the window clock
+; queries).  Its reply is consumed by the normal dispatcher (o2_reply).
+BVP_CTL_OsdShow:
+        tst.l   o1_ok
+        beq.s   BVP_CTL_OsdNo
+        move.l  d1,o2_want
+        move.l  #1,o2_req
+        addq.l  #1,o2_requests
+        bra.s   BVP_CTL_OK
+BVP_CTL_OsdNo:
+        moveq   #BVPERR_UNSUPPORTED,d0
+        move.l  d0,BVP_LAST_ERROR(a6)
+        rts
+; S1: subtitles need the film time on screen.  In cinema with HDMI sound the
+; Pi audio clock is the master; while enabled the library asks it about once
+; a second (PARAMETER_GET CLOCK_TIME, fire and forget at SendVideo start, as
+; the window clock queries) and keeps the last answer in s1_block:
+;   +0 replies  +4 media time hi  +8 media time lo (us)  +12 Pi timer of the
+;   sample  +16 queries  +20 lost/failed
+BVP_CTL_OsdClock:
+        tst.l   o1_ok                     ; only with a working OSD layer
+        bne.s   s1_ctl_ok
+        moveq   #0,d0
+        rts
+s1_ctl_ok:
+        move.l  d1,s1_enabled
+        lea     s1_block,a0
+        move.l  a0,d0
+        clr.l   BVP_LAST_ERROR(a6)
+        rts
+; O3: new OSD picture.  Copied at once into the library's DMA buffer (the
+; caller may reuse its memory); sent at the start of the next SendVideo.
+BVP_CTL_OsdPic:
+        tst.l   o1_ok
+        beq.s   BVP_CTL_OsdNo
+        tst.l   o3_dead
+        bne.s   BVP_CTL_OsdNo
+        tst.l   d1
+        beq.s   BVP_CTL_OsdNo
+        movem.l d1/a0-a1/a6,-(sp)
+        move.l  d1,a0
+        move.l  o1_buf,a1
+        move.l  o1_bytes,d0
+        lsr.l   #2,d0
+        subq.l  #1,d0
+o3_ctl_copy:
+        move.l  (a0)+,(a1)+
+        subq.l  #1,d0
+        bpl.s   o3_ctl_copy
+        move.l  4.w,a6
+        move.l  o1_bytes,o1_dma_len
+        move.l  o1_buf,a0
+        lea     o1_dma_len,a1
+        moveq   #0,d0
+        jsr     CachePreDMA(a6)
+        move.l  o1_bytes,o1_dma_len
+        move.l  o1_buf,a0
+        lea     o1_dma_len,a1
+        moveq   #0,d0
+        jsr     CachePostDMA(a6)
+        movem.l (sp)+,d1/a0-a1/a6
+        move.l  #1,o3_req
+        addq.l  #1,o3_requests
+        bra.w   BVP_CTL_OK
 BVP_CTL_Bad:
         moveq   #BVPERR_BADSTATE,d0
         move.l  d0,BVP_LAST_ERROR(a6)
@@ -1525,7 +1619,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 (28.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F (30.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -9934,6 +10028,8 @@ h19_input_bulk_done:
         lea     8(a2),a0
         bsr     load_le32
         move.l  d0,bulk_actual
+        tst.l   o3_bulk_pending           ; O3: our OSD picture bulk
+        bne.w   o3_bulk_done
 
         ; VPv47: audio and video share one MMAL/VCHIQ service. BULK_TX itself
         ; is globally serialized; this flag therefore identifies the current
@@ -12569,8 +12665,16 @@ h19_mmal_data:
         beq.w   h19_buffer_to_host
         cmp.l   #MMAL_EVENT_TO_HOST,d0
         beq.w   h19_event
+        cmp.l   #MMAL_PORT_PARAMETER_SET,d0
+        bne.s   o2_h19_not_set
+        jmp     o2_reply                  ; O2: OSD reply (others consumed)
+o2_h19_not_set:
         cmp.l   #MMAL_PORT_PARAMETER_GET,d0
         bne.w   h19_consume
+        tst.l   s1_pending                ; S1: subtitle clock answer?
+        beq.s   s1_h19_not
+        jmp     s1_clk_reply
+s1_h19_not:
         jmp     p96w_clk_reply
 
 h19_buffer_to_host:
@@ -12629,6 +12733,10 @@ h19_buffer_to_host:
         ; The audio buffer uses its own unique context/cookie. Consume that
         ; return here before the video-input ownership checks see it.
         move.l  buffer_drv_context,d0
+        ; O1: the OSD renderer gives its picture buffer back (e.g. on
+        ; close) - not a video buffer, just consume it.
+        cmp.l   #O1_BUFFER_CONTEXT,d0
+        beq.w   h19_consume
         ; VPv47: two independent audio MMAL input contexts. Mark the exact
         ; renderer-owned slot returned without disturbing the other slot.
         move.l  d0,d1
@@ -21212,7 +21320,7 @@ hdmi_v40o_graphics_name:
         dc.b "graphics.library",0
         even
 hdmi_v40o_window_title:
-        dc.b "H264 Player - 1=100%  2=Vollflaeche  3=Direkt  0=Ende",0
+        dc.b "MintVID-pi  -  Space = Pause   F = Fullscreen   Esc = Stop",0   ; v96.81: VPr8 keys 1/2/3 are gone
         even
 hdmi_v40o_newwindow:
         dc.w 80,60                       ; LeftEdge, TopEdge
@@ -49979,9 +50087,21 @@ n83_router_size_ok:
         move.l  v6_src_aligned_w,d0
         andi.l  #63,d0
         bne.s   n79p_router_k
-        jmp     n79p_direct_setup_graph
+        jsr     n79p_direct_setup_graph
+        bra.s   o1_router_after
 n79p_router_k:
-        jmp     v12a_setup_isp_graph
+        jsr     v12a_setup_isp_graph
+o1_router_after:
+        ; O1: OSD test layer once the film graph stands (cinema only)
+        tst.l   d0
+        bne.s   o1_router_done
+        tst.l   o1_req
+        beq.s   o1_router_done
+        cmpi.l  #3,v41_display_style
+        bne.s   o1_router_done
+        jsr     o1_setup                 ; keeps D0, failure only logged
+o1_router_done:
+        rts
 
 ; N79P: unchanged N79 direct graph setup (copy, labels prefixed n79p_d_).
 n79p_direct_setup_graph:
@@ -51398,6 +51518,1201 @@ n83_calc_store:
         lea     n83_pfx_h,a1
         jsr     n15_log_hex32
         movem.l (sp)+,d0-d4
+        rts
+
+; ====================================================================
+; O1 - OSD feasibility test (28.10.2026): a second ril.video_render on a
+; layer above the film shows one RGBA picture (from mrberry, BVP_CTRL_OSD)
+; for the whole film.  Built once at graph setup, before any frame is sent,
+; so no extra traffic while the film plays.  Cinema (style 3) only.
+; Request block (big endian, owned by mrberry until CloseStream):
+;   +0 'OSD1'  +4 width (mult. of 32)  +8 height (mult. of 16)
+;   +12 alpha mode (0 = 255, 1 = 255 + MIX)  +16 RGBA data pointer
+;   +20 dest x (-1 = centred)  +24 dest y (-1 = near the bottom)
+; The host copy of the picture is freed as soon as BULK_TX_DONE arrived
+; (the VideoCore keeps its own copy).  A returned O1 buffer is ignored by
+; h19_buffer_to_host (context O1_BUFFER_CONTEXT).
+; ====================================================================
+O1_LAYER            equ 11              ; above the film (HDMI_V14_LAYER 10)
+O1_BUFFER_CONTEXT   equ $05D10001
+O1_PARAM_CONTEXT    equ $05D30001
+O1_DATA_MAX         equ $00100000       ; O3: 1 MiB RGBA max (e.g. 1280x128)
+O1_PL_OFFSET        equ $00100000       ; pagelist after the data
+O1_ALLOC_SIZE       equ $00102000       ; data + pagelist page + alignment
+O1_MAGIC            equ $4F534431       ; 'OSD1'
+
+o1_setup:
+        movem.l d0-d7/a0-a6,-(sp)
+        clr.l   o1_stage
+        clr.l   o1_ok
+        lea     o1_msg_begin,a1
+        jsr     n12_log
+        clr.l   o2_hide_move
+        move.l  o1_req,a0
+        cmpi.l  #O1_MAGIC,(a0)
+        beq.s   o1_magic_ok
+        cmpi.l  #O2_MAGIC,(a0)
+        bne.w   o1_fail
+        move.l  28(a0),o2_hide_move       ; O2: 0 = hide by alpha, 1 = move away
+o1_magic_ok:
+        jsr     o2_read_display_size
+        move.l  #1,o1_stage
+        move.l  4(a0),d0
+        move.l  d0,o1_w
+        move.l  8(a0),d1
+        move.l  d1,o1_h
+        beq.w   o1_fail
+        tst.l   d0
+        beq.w   o1_fail
+        move.l  d0,d2
+        andi.l  #31,d2
+        bne.w   o1_fail
+        move.l  d1,d2
+        andi.l  #15,d2
+        bne.w   o1_fail
+        mulu.w  d1,d0                     ; w*h (both < 65536)
+        lsl.l   #2,d0                     ; RGBA
+        cmp.l   #O1_DATA_MAX,d0
+        bhi.w   o1_fail
+        move.l  d0,o1_bytes
+        move.l  #255,o1_alpha
+        tst.l   12(a0)
+        beq.s   o1_alpha_set
+        move.l  #$800000FF,o1_alpha       ; MMAL_DISPLAY_ALPHA_FLAGS_MIX | 255
+o1_alpha_set:
+        ; destination: centred, 1/12 of the screen above the bottom
+        move.l  20(a0),d0
+        cmpi.l  #-1,d0
+        bne.s   o1_dx_ok
+        move.l  o2_disp_w,d0              ; O2: TV picture, not the Workbench
+        sub.l   o1_w,d0
+        bpl.s   o1_dx_pos
+        moveq   #0,d0
+o1_dx_pos:
+        lsr.l   #1,d0
+o1_dx_ok:
+        move.l  d0,o1_dest_x
+        move.l  24(a0),d0
+        cmpi.l  #-1,d0
+        bne.s   o1_dy_ok
+        move.l  o2_disp_h,d0              ; O2: TV picture, not the Workbench
+        move.l  d0,d1
+        divu.w  #12,d1
+        andi.l  #$FFFF,d1
+        sub.l   o1_h,d0
+        sub.l   d1,d0
+        bpl.s   o1_dy_ok
+        moveq   #0,d0
+o1_dy_ok:
+        move.l  d0,o1_dest_y
+        move.l  o1_dest_x,o2_show_x
+        move.l  o1_dest_y,o2_show_y
+        move.l  o1_alpha,o2_show_alpha
+        move.l  #1,o2_shown
+
+        ; ---- DMA-safe host copy (4 KiB aligned, below the VC alias limit)
+        move.l  #2,o1_stage
+        move.l  4.w,a6
+        move.l  #O1_ALLOC_SIZE,d0
+        move.l  #MEMF_FASTCLEAR,d1
+        jsr     AllocMem(a6)
+        move.l  d0,o1_alloc
+        beq.w   o1_fail
+        add.l   #$00000fff,d0
+        and.l   #$fffff000,d0
+        move.l  d0,o1_buf
+        move.l  d0,d1
+        add.l   #O1_ALLOC_SIZE-$1000,d1
+        cmp.l   #$3f000000,d1
+        bcc.w   o1_fail
+        move.l  o1_req,a0
+        move.l  16(a0),a0                 ; source RGBA
+        move.l  o1_buf,a1
+        move.l  o1_bytes,d0
+        lsr.l   #2,d0
+        subq.l  #1,d0
+o1_copy:
+        move.l  (a0)+,(a1)+
+        subq.l  #1,d0
+        bpl.s   o1_copy
+        ; pagelist: length, type WRITE, one contiguous run
+        move.l  o1_buf,a0
+        add.l   #O1_PL_OFFSET,a0
+        move.l  a0,o1_pagelist
+        move.l  o1_bytes,d0
+        jsr     store_le32
+        move.l  o1_pagelist,a0
+        move.b  #PAGELIST_WRITE,4(a0)
+        clr.b   5(a0)
+        clr.b   6(a0)
+        clr.b   7(a0)
+        move.l  o1_bytes,d0
+        add.l   #$00000fff,d0
+        lsr.l   #8,d0
+        lsr.l   #4,d0
+        subq.l  #1,d0
+        move.l  o1_buf,d1
+        or.l    #$c0000000,d1
+        or.l    d0,d1
+        lea     8(a0),a0
+        move.l  d1,d0
+        jsr     store_le32
+        ; push picture + pagelist out of the CPU cache
+        move.l  4.w,a6
+        move.l  #O1_ALLOC_SIZE-$1000,o1_dma_len
+        move.l  o1_buf,a0
+        lea     o1_dma_len,a1
+        moveq   #0,d0
+        jsr     CachePreDMA(a6)
+        move.l  #O1_ALLOC_SIZE-$1000,o1_dma_len
+        move.l  o1_buf,a0
+        lea     o1_dma_len,a1
+        moveq   #0,d0
+        jsr     CachePostDMA(a6)
+
+        ; errors in the MMAL helpers return here instead of close_prog
+        move.l  #1,v12a_local_get_active
+        move.l  #1,v12c_local_set_active
+
+        ; ---- second ril.video_render (style 3 selects that name)
+        move.l  #3,o1_stage
+        move.l  v12a_isp_handle,o1_save_handle
+        jsr     v12a_create_isp
+        move.l  v12a_isp_handle,o1_handle
+        move.l  o1_save_handle,v12a_isp_handle
+        tst.l   d0
+        bne.w   o1_fail_mmal
+
+        ; ---- INPUT 0 = RGBA w x h, one buffer
+        move.l  #4,o1_stage
+        move.l  o1_handle,component_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  port_last_handle,o1_input
+        move.l  o1_input,input_port_handle
+        move.l  #MMAL_ES_VIDEO,port_fmt_type
+        move.l  #MMAL_ENCODING_RGBA,port_fmt_encoding
+        clr.l   port_fmt_variant
+        clr.l   port_fmt_bitrate
+        clr.l   port_fmt_flags
+        clr.l   port_fmt_extra
+        move.l  o1_w,port_video_width
+        move.l  o1_h,port_video_height
+        clr.l   port_crop_x
+        clr.l   port_crop_y
+        move.l  o1_w,port_crop_width
+        move.l  o1_h,port_crop_height
+        clr.l   port_fps_num
+        move.l  #1,port_fps_den
+        move.l  #1,port_par_num
+        move.l  #1,port_par_den
+        clr.l   port_color_space
+        move.l  port_buf_num_min,d0
+        cmpi.l  #2,d0                     ; O3: 2, old one held while new one shows
+        bcc.s   o1_num_ok
+        moveq   #2,d0
+o1_num_ok:
+        move.l  d0,port_buf_num
+        move.l  o1_bytes,d0
+        cmp.l   port_buf_size_min,d0
+        bcc.s   o1_size_ok
+        move.l  port_buf_size_min,d0
+o1_size_ok:
+        move.l  d0,port_buf_size
+        move.l  #5,o1_stage
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        move.l  #1,v12c_local_set_active
+        jsr     port_info_set_input
+        move.l  #1,v12c_local_set_active
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  #6,o1_stage
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  port_last_handle,d0
+        cmp.l   o1_input,d0
+        bne.w   o1_fail_mmal
+        cmpi.l  #MMAL_ENCODING_RGBA,port_fmt_encoding
+        bne.w   o1_fail_mmal
+        move.l  port_buf_size,o1_port_size
+
+        ; ---- layer, place and alpha
+        move.l  #7,o1_stage
+        jsr     o1_set_displayregion
+        tst.l   d0
+        bne.w   o1_fail_mmal
+
+        ; ---- enable INPUT 0 (local-0 / local-1 helper as for audio_render)
+        move.l  #8,o1_stage
+        move.l  o1_handle,component_handle
+        move.l  o1_input,input_port_handle
+        move.l  #MMAL_PORT_INPUT,port_query_type
+        clr.l   port_query_index
+        jsr     port_info_get
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        tst.l   v12f_local_port
+        bne.s   o1_enable_second
+        jsr     port_enable_current
+        bra.s   o1_enable_done
+o1_enable_second:
+        move.l  o1_input,d0
+        move.l  #MMAL_PORT_INPUT,d1
+        jsr     v9f_port_enable
+o1_enable_done:
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  #9,o1_stage
+        move.l  o1_handle,component_handle
+        jsr     component_enable_worker
+        tst.l   d0
+        bne.w   o1_fail_mmal
+
+        ; ---- the picture
+        move.l  #10,o1_stage
+        jsr     o1_send_buffer
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  #11,o1_stage
+        jsr     o1_wait_bulk
+        tst.l   d0
+        bne.w   o1_fail_mmal
+        move.l  #1,o1_ok
+        lea     o1_msg_ok,a1
+        jsr     n12_log
+        bra.s   o1_end
+o1_fail_mmal:
+o1_fail:
+        lea     o1_msg_fail,a1
+        jsr     n12_log
+o1_end:
+        clr.l   v12a_local_get_active
+        clr.l   v12c_local_set_active
+        ; the graph state the stream continues with (as n79j_setup_*)
+        move.l  v12a_decoder_handle,component_handle
+        move.l  v12a_saved_input_handle,input_port_handle
+        move.l  o1_stage,d0
+        lea     o1_pfx_stage,a1
+        jsr     n15_log_hex32
+        move.l  o1_port_size,d0
+        lea     o1_pfx_size,a1
+        jsr     n15_log_hex32
+        move.l  o1_dest_x,d0
+        lea     o1_pfx_x,a1
+        jsr     n15_log_hex32
+        move.l  o1_dest_y,d0
+        lea     o1_pfx_y,a1
+        jsr     n15_log_hex32
+        move.l  o2_dispctrl,d0           ; O2: TV picture size
+        lea     o2_pfx_dispctrl,a1
+        jsr     n15_log_hex32
+        move.l  o2_disp_w,d0
+        lea     o2_pfx_dw,a1
+        jsr     n15_log_hex32
+        move.l  o2_disp_h,d0
+        lea     o2_pfx_dh,a1
+        jsr     n15_log_hex32
+        move.l  o1_dr_status,d0          ; O1b: display region reply
+        lea     o1_pfx_drst,a1
+        jsr     n15_log_hex32
+        move.l  o1_dr_ctx,d0
+        lea     o1_pfx_drctx,a1
+        jsr     n15_log_hex32
+        move.l  o1_bulk_result,d0
+        lea     o1_pfx_bulk,a1
+        jsr     n15_log_hex32
+        ; O3: keep the DMA buffer for new pictures while the OSD works;
+        ; o2_close frees it.  After a failure free it now.
+        tst.l   o1_ok
+        bne.s   o1_no_free
+        move.l  o1_alloc,d0
+        beq.s   o1_no_free
+        move.l  d0,a1
+        move.l  #O1_ALLOC_SIZE,d0
+        move.l  4.w,a6
+        jsr     FreeMem(a6)
+        clr.l   o1_alloc
+o1_no_free:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+
+; ------------------------------------------------------------
+; O2: fill one 128-byte PARAMETER_SET DISPLAYREGION record at A2 for the OSD
+; renderer from o1_dest_x/y, o1_w/h, o1_alpha; context o1_df_ctx.
+; ------------------------------------------------------------
+o1_dr_fill:
+        movem.l d0-d1/d7/a0,-(sp)
+        move.l  a2,a0
+        moveq   #31,d7
+o1_df_clear:
+        clr.l   (a0)+
+        dbra    d7,o1_df_clear
+
+        move.l  a2,a0
+        move.l  #VCHIQ_MSG_DATA,d0
+        or.l    v12f_local_bits,d0
+        move.l  mmal_remote_port,d1
+        and.l   #$00000fff,d1
+        or.l    d1,d0
+        jsr     store_le32
+        lea     4(a2),a0
+        move.l  #116,d0
+        jsr     store_le32
+        lea     8(a2),a0
+        move.l  #MMAL_MAGIC,d0
+        jsr     store_le32
+        lea     12(a2),a0
+        move.l  #MMAL_PORT_PARAMETER_SET,d0
+        jsr     store_le32
+        lea     20(a2),a0
+        move.l  o1_df_ctx,d0
+        jsr     store_le32
+        lea     32(a2),a0
+        move.l  o1_handle,d0
+        jsr     store_le32
+        lea     36(a2),a0
+        move.l  o1_input,d0
+        jsr     store_le32
+
+        ; MMAL_DISPLAYREGION_T begins at worker param offset +40.
+        lea     40(a2),a0
+        move.l  #MMAL_PARAMETER_DISPLAYREGION,d0
+        jsr     store_le32
+        lea     44(a2),a0
+        move.l  #84,d0
+        jsr     store_le32
+        lea     48(a2),a0
+        move.l  #HDMI_V14_DISPLAY_SET,d0
+        jsr     store_le32
+        ; +52 display_num = 1, explicitly selected by DISPLAY_SET_NUM.
+        lea     52(a2),a0
+        move.l  #HDMI_V18_DISPLAY_NUM,d0
+        jsr     store_le32
+        lea     56(a2),a0
+        moveq   #0,d0                   ; O1: not fullscreen, own dest_rect
+        jsr     store_le32
+        ; +60 transform = 0. dest_rect = complete current P96/Workbench screen.
+        lea     64(a2),a0
+        move.l  o1_dest_x,d0
+        jsr     store_le32
+        lea     68(a2),a0
+        move.l  o1_dest_y,d0
+        jsr     store_le32
+        lea     72(a2),a0
+        move.l  o1_w,d0
+        jsr     store_le32
+        lea     76(a2),a0
+        move.l  o1_h,d0
+        jsr     store_le32
+        lea     112(a2),a0
+        move.l  #O1_LAYER,d0
+        jsr     store_le32
+        ; +116 copyprotect = 0, left cleared.
+        lea     120(a2),a0
+        move.l  o1_alpha,d0              ; O1: 255 (+ MIX flag in mode 1)
+        jsr     store_le32
+
+        movem.l (sp)+,d0-d1/d7/a0
+        rts
+
+; ====================================================================
+; O2 (28.10.2026): OSD on/off while the film plays, OSD placed on the TV
+; picture.  o2_apply runs at the start of SendVideo (library owns the
+; queues), sends PARAMETER_SET DISPLAYREGION without waiting (as the
+; window clock queries); the reply goes through h19_mmal_data -> o2_reply.
+; Hide: o2_hide_move 0 = alpha MIX|0 (layer stays), 1 = moved below the
+; screen bottom.
+; ====================================================================
+O2_MAGIC            equ $4F534432       ; 'OSD2'
+O2_PARAM_CONTEXT    equ $05D50001
+O2_HVS_DISPCTRL1    equ $F2400050       ; channel 1 (DISPLIST1 $F2400024)
+
+o2_read_display_size:
+        movem.l d0-d1/a0,-(sp)
+        move.l  #O2_HVS_DISPCTRL1,a0
+        jsr     load_le32
+        move.l  d0,o2_dispctrl
+        move.l  d0,d1
+        lsr.l   #8,d1
+        lsr.l   #4,d1
+        andi.l  #$00000fff,d1             ; width  bits 23..12
+        andi.l  #$00000fff,d0             ; height bits 11..0
+        cmpi.l  #640,d1
+        bcs.s   o2_rds_default
+        cmpi.l  #4096,d1
+        bhi.s   o2_rds_default
+        cmpi.l  #400,d0
+        bcs.s   o2_rds_default
+        cmpi.l  #2304,d0
+        bhi.s   o2_rds_default
+        move.l  d1,o2_disp_w
+        move.l  d0,o2_disp_h
+        bra.s   o2_rds_done
+o2_rds_default:
+        move.l  #1920,o2_disp_w
+        move.l  #1080,o2_disp_h
+o2_rds_done:
+        movem.l (sp)+,d0-d1/a0
+        rts
+
+o2_apply:
+        movem.l d0-d7/a0-a6,-(sp)
+        clr.l   o2_req
+        tst.l   o1_ok
+        beq.w   o2_ap_done
+        tst.l   v10h_error_seen
+        bne.w   o2_ap_done
+        tst.l   o2_reply_pending
+        beq.s   o2_ap_go
+        move.l  #1,o2_req                 ; one at a time: try next frame
+        bra.w   o2_ap_done
+o2_ap_go:
+        move.l  o2_want,d0
+        cmp.l   o2_shown,d0
+        beq.w   o2_ap_done                ; already so
+        move.l  o2_show_x,o1_dest_x
+        move.l  o2_show_y,o1_dest_y
+        move.l  o2_show_alpha,o1_alpha
+        tst.l   d0
+        bne.s   o2_ap_values
+        tst.l   o2_hide_move
+        bne.s   o2_ap_move
+        move.l  #$80000000,o1_alpha       ; MIX with 0: fully transparent
+        bra.s   o2_ap_values
+o2_ap_move:
+        move.l  o2_disp_h,d1
+        add.l   #16,d1
+        move.l  d1,o1_dest_y              ; below the bottom edge
+o2_ap_values:
+        jsr     bvp_engine_env
+        jsr     dma_post_all
+        move.l  #128,d0
+        jsr     h26a_reserve_tx
+        tst.l   d0
+        bne.s   o2_ap_fail
+        move.l  #O2_PARAM_CONTEXT,o1_df_ctx
+        jsr     o1_dr_fill
+        add.l   #128,port_tx_pos
+        move.l  slot_ptr,a0
+        lea     SLAVE_TXPOS(a0),a0
+        move.l  port_tx_pos,d0
+        jsr     store_le32
+        move.l  o2_want,o2_shown
+        move.l  #1,o2_reply_pending
+        addq.l  #1,o2_sends
+        jsr     p96w12_kick               ; flush + doorbell (DMA-owned)
+        jsr     dma_post_all
+        bra.s   o2_ap_done
+o2_ap_fail:
+        addq.l  #1,o2_fails
+o2_ap_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; From h19_mmal_data with A2 = message: PARAMETER_SET reply.  Ours is
+; counted; every SET reply is consumed as before O2.
+o2_reply:
+        movem.l d0,-(sp)
+        lea     20(a2),a0
+        jsr     load_le32
+        cmp.l   #O2_PARAM_CONTEXT,d0
+        bne.s   o2_rp_out
+        clr.l   o2_reply_pending
+        addq.l  #1,o2_replies
+        move.l  bulk_rx_size,d0
+        cmpi.l  #28,d0
+        bcs.s   o2_rp_out
+        lea     32(a2),a0
+        jsr     load_le32
+        move.l  d0,o2_last_status
+        tst.l   d0
+        beq.s   o2_rp_out
+        addq.l  #1,o2_bad_status
+o2_rp_out:
+        movem.l (sp)+,d0
+        jmp     h19_consume
+
+; CloseStream: let an outstanding OSD reply arrive before the synchronous
+; teardown, then log.  The OSD renderer itself goes with the service close.
+o2_close:
+        movem.l d0-d7/a0-a6,-(sp)
+        jsr     bvp_engine_env
+        clr.l   s1_enabled
+        tst.l   o1_ok
+        beq.w   o2_cl_reset
+        tst.l   v10h_error_seen
+        bne.s   o2_cl_log
+        tst.l   p96w_wait_timeouts
+        bne.s   o2_cl_log
+        move.l  #400,d7
+o2_cl_loop:
+        tst.l   o2_reply_pending
+        bne.s   o2_cl_busy
+        tst.l   s1_pending
+        beq.s   o2_cl_log
+o2_cl_busy:
+        jsr     dma_post_all
+        move.l  slot_ptr,a0
+        lea     60(a0),a0
+        jsr     load_le32
+        cmp.l   port_rx_pos,d0
+        bls.s   o2_cl_wait
+        jsr     h26a_map_rx_current
+        tst.l   d0
+        bne.s   o2_cl_log
+        move.l  a2,a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_msgid
+        lea     4(a2),a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_size
+        jsr     v9g_h19_dispatch
+        jsr     dma_post_all
+        bra.s   o2_cl_next
+o2_cl_wait:
+        jsr     short_delay
+o2_cl_next:
+        subq.l  #1,d7
+        bne.s   o2_cl_loop
+o2_cl_log:
+        move.l  o2_requests,d0
+        lea     o2_pfx_req,a1
+        jsr     n15_log_hex32
+        move.l  o2_sends,d0
+        lea     o2_pfx_sends,a1
+        jsr     n15_log_hex32
+        move.l  o2_replies,d0
+        lea     o2_pfx_replies,a1
+        jsr     n15_log_hex32
+        move.l  o2_bad_status,d0
+        lea     o2_pfx_bad,a1
+        jsr     n15_log_hex32
+        move.l  o2_last_status,d0
+        lea     o2_pfx_last,a1
+        jsr     n15_log_hex32
+        move.l  o2_fails,d0
+        lea     o2_pfx_fails,a1
+        jsr     n15_log_hex32
+        move.l  o2_reply_pending,d0
+        lea     o2_pfx_pend,a1
+        jsr     n15_log_hex32
+        move.l  o3_requests,d0
+        lea     o3_pfx_req,a1
+        jsr     n15_log_hex32
+        move.l  o3_sent,d0
+        lea     o3_pfx_sent,a1
+        jsr     n15_log_hex32
+        move.l  o3_done,d0
+        lea     o3_pfx_done,a1
+        jsr     n15_log_hex32
+        move.l  o3_defers,d0
+        lea     o3_pfx_defers,a1
+        jsr     n15_log_hex32
+        move.l  o3_bad,d0
+        lea     o3_pfx_bad,a1
+        jsr     n15_log_hex32
+        move.l  o3_dead,d0
+        lea     o3_pfx_dead,a1
+        jsr     n15_log_hex32
+        move.l  o3_max_us,d0
+        lea     o3_pfx_max,a1
+        jsr     n15_log_hex32
+        move.l  o3_total_us,d0
+        lea     o3_pfx_total,a1
+        jsr     n15_log_hex32
+        move.l  s1_block+16,d0
+        lea     s1_pfx_q,a1
+        jsr     n15_log_hex32
+        move.l  s1_block,d0
+        lea     s1_pfx_r,a1
+        jsr     n15_log_hex32
+        move.l  s1_block+20,d0
+        lea     s1_pfx_f,a1
+        jsr     n15_log_hex32
+        move.l  s1_rtt_max,d0
+        lea     s1_pfx_rtt,a1
+        jsr     n15_log_hex32
+o2_cl_reset:
+        clr.l   o1_ok
+        clr.l   o2_req
+        clr.l   o2_want
+        clr.l   o2_shown
+        clr.l   o2_reply_pending
+        clr.l   o2_requests
+        clr.l   o2_sends
+        clr.l   o2_replies
+        clr.l   o2_bad_status
+        clr.l   o2_last_status
+        clr.l   o2_fails
+        clr.l   o3_req
+        clr.l   o3_bulk_pending
+        clr.l   o3_requests
+        clr.l   o3_sent
+        clr.l   o3_done
+        clr.l   o3_defers
+        clr.l   o3_bad
+        clr.l   o3_dead
+        clr.l   o3_max_us
+        clr.l   o3_total_us
+        clr.l   s1_pending
+        clr.l   s1_started
+        clr.l   s1_rtt_max
+        lea     s1_block,a0
+        moveq   #5,d0
+o2_cl_s1clr:
+        clr.l   (a0)+
+        dbra    d0,o2_cl_s1clr
+        move.l  o1_alloc,d0               ; O3: DMA picture buffer
+        beq.s   o2_cl_nofree
+        move.l  d0,a1
+        move.l  #O1_ALLOC_SIZE,d0
+        move.l  4.w,a6
+        jsr     FreeMem(a6)
+        clr.l   o1_alloc
+o2_cl_nofree:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; ====================================================================
+; O3 (28.10.2026): new OSD picture while the film plays.  From the start
+; of SendVideo: only when no other BULK_TX is outstanding (BULK_TX is
+; serialized on the shared service, h19_input_bulk_done relies on that).
+; BUFFER_FROM_HOST + BULK_TX as at setup, then wait for our BULK_TX_DONE
+; while every other message goes through the normal dispatcher.  The
+; buffer the renderer gives back (BUFFER_TO_HOST, O1 context) is ignored
+; by h19_buffer_to_host.  A timeout ends O3 for this film (o3_dead).
+; ====================================================================
+o3_apply:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   o1_ok
+        beq.w   o3_ap_clear
+        tst.l   o3_dead
+        bne.w   o3_ap_clear
+        tst.l   v10h_error_seen
+        bne.w   o3_ap_clear
+        tst.l   eos_sent
+        bne.w   o3_ap_clear
+        tst.l   input_bulk_pending
+        bne.w   o3_ap_defer
+        tst.l   vpv39_audio_bulk_pending
+        bne.w   o3_ap_defer
+        clr.l   o3_req
+        jsr     bvp_engine_env
+        jsr     vpv98_read_sys_us
+        move.l  d0,o3_t0
+        jsr     dma_post_all
+        move.l  #1,o3_bulk_pending
+        jsr     o1_send_buffer            ; ends DMA-owned, doorbell rung
+        tst.l   d0
+        bne.w   o3_ap_fail
+        addq.l  #1,o3_sent
+        move.l  #$00040000,d7
+o3_ap_loop:
+        jsr     short_delay
+        jsr     dma_post_all
+        move.l  slot_ptr,a0
+        lea     60(a0),a0
+        jsr     load_le32
+        cmp.l   port_rx_pos,d0
+        bls.s   o3_ap_check
+        jsr     h26a_map_rx_current
+        tst.l   d0
+        bne.s   o3_ap_fail
+        move.l  a2,a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_msgid
+        lea     4(a2),a0
+        jsr     load_le32
+        move.l  d0,bulk_rx_size
+        jsr     v9g_h19_dispatch
+        tst.l   v10h_error_seen
+        bne.s   o3_ap_fail
+o3_ap_check:
+        tst.l   o3_bulk_pending
+        beq.s   o3_ap_ok
+        jsr     dma_pre_all
+        subq.l  #1,d7
+        bne.s   o3_ap_loop
+        jsr     dma_post_all
+o3_ap_fail:
+        move.l  #1,o3_dead
+        clr.l   o3_bulk_pending
+        bra.s   o3_ap_done
+o3_ap_ok:
+        jsr     vpv98_read_sys_us
+        sub.l   o3_t0,d0
+        add.l   d0,o3_total_us
+        cmp.l   o3_max_us,d0
+        bls.s   o3_ap_done
+        move.l  d0,o3_max_us
+        bra.s   o3_ap_done
+o3_ap_defer:
+        addq.l  #1,o3_defers              ; o3_req stays: next SendVideo
+        bra.s   o3_ap_done
+o3_ap_clear:
+        clr.l   o3_req
+o3_ap_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; From h19_input_bulk_done, D0 = bulk_actual, while o3_bulk_pending.
+o3_bulk_done:
+        clr.l   o3_bulk_pending
+        addq.l  #1,o3_done
+        cmp.l   o1_bytes,d0
+        beq.s   o3_bd_ok
+        addq.l  #1,o3_bad
+o3_bd_ok:
+        jmp     h19_consume
+
+
+; ====================================================================
+; S1 (28.10.2026): Pi clock for subtitles (see BVP_CTL_OsdClock).
+; ====================================================================
+S1_CLK_CTX          equ $05D70000
+S1_PERIOD_US        equ 1000000
+S1_TIMEOUT_US       equ 500000
+
+s1_clk_maybe:
+        movem.l d0-d7/a0-a6,-(sp)
+        tst.l   bvp_p96_mode              ; cinema only
+        bne.w   s1_cm_done
+        tst.l   v10h_error_seen
+        bne.w   s1_cm_done
+        tst.l   n73_first_pcm_published
+        beq.w   s1_cm_done
+        tst.l   n73_clock_armed
+        beq.w   s1_cm_done
+        tst.l   vpv116_clock_handle
+        beq.w   s1_cm_done
+        jsr     vpv98_read_sys_us
+        move.l  d0,d2
+        tst.l   s1_pending
+        beq.s   s1_cm_free
+        sub.l   s1_req_sys,d0
+        cmpi.l  #S1_TIMEOUT_US,d0
+        bcs.w   s1_cm_done
+        clr.l   s1_pending                ; lost: try again later
+        addq.l  #1,s1_block+20
+        bra.w   s1_cm_done
+s1_cm_free:
+        tst.l   s1_started
+        beq.s   s1_cm_go
+        sub.l   s1_next_sys,d0
+        bmi.w   s1_cm_done
+s1_cm_go:
+        move.l  #1,s1_started
+        move.l  d2,d0
+        add.l   #S1_PERIOD_US,d0
+        move.l  d0,s1_next_sys
+        jsr     bvp_engine_env
+        jsr     dma_post_all
+        move.l  #48,d0
+        jsr     h26a_reserve_tx
+        tst.l   d0
+        bne.w   s1_cm_fail
+        move.l  a2,a0
+        moveq   #11,d7
+s1_cm_clear:
+        clr.l   (a0)+
+        dbra    d7,s1_cm_clear
+        move.l  a2,a0
+        move.l  #VCHIQ_MSG_DATA,d0
+        or.l    v12f_local_bits,d0
+        move.l  mmal_remote_port,d1
+        and.l   #$00000fff,d1
+        or.l    d1,d0
+        jsr     store_le32
+        lea     4(a2),a0
+        moveq   #40,d0
+        jsr     store_le32
+        lea     8(a2),a0
+        move.l  #MMAL_MAGIC,d0
+        jsr     store_le32
+        lea     12(a2),a0
+        move.l  #MMAL_PORT_PARAMETER_GET,d0
+        jsr     store_le32
+        addq.l  #1,s1_seq
+        move.l  s1_seq,d0
+        andi.l  #$0000ffff,d0
+        ori.l   #S1_CLK_CTX,d0
+        move.l  d0,s1_ctx
+        lea     20(a2),a0
+        jsr     store_le32
+        lea     32(a2),a0
+        move.l  vpv116_clock_handle,d0
+        jsr     store_le32
+        lea     36(a2),a0
+        move.l  vpv117_clock_port0,d0
+        jsr     store_le32
+        lea     40(a2),a0
+        move.l  #MMAL_PARAMETER_CLOCK_TIME,d0
+        jsr     store_le32
+        lea     44(a2),a0
+        moveq   #16,d0
+        jsr     store_le32
+        add.l   #48,port_tx_pos
+        move.l  slot_ptr,a0
+        lea     SLAVE_TXPOS(a0),a0
+        move.l  port_tx_pos,d0
+        jsr     store_le32
+        jsr     vpv98_read_sys_us
+        move.l  d0,s1_req_sys
+        move.l  #1,s1_pending
+        addq.l  #1,s1_block+16
+        jsr     p96w12_kick              ; flush + doorbell (DMA-owned)
+        jsr     dma_post_all
+        bra.s   s1_cm_done
+s1_cm_fail:
+        addq.l  #1,s1_block+20
+s1_cm_done:
+        movem.l (sp)+,d0-d7/a0-a6
+        rts
+
+; From h19_mmal_data (PARAMETER_GET reply) while s1_pending.
+s1_clk_reply:
+        movem.l d1-d3,-(sp)
+        lea     20(a2),a0
+        jsr     load_le32
+        cmp.l   s1_ctx,d0
+        bne.s   s1_cr_other
+        clr.l   s1_pending
+        jsr     vpv98_read_sys_us
+        move.l  d0,d3
+        sub.l   s1_req_sys,d0             ; round trip
+        cmp.l   s1_rtt_max,d0
+        bls.s   s1_cr_rtt
+        move.l  d0,s1_rtt_max
+s1_cr_rtt:
+        lsr.l   #1,d0
+        add.l   s1_req_sys,d0
+        move.l  d0,d3                     ; sample = middle of the round trip
+        move.l  bulk_rx_size,d0
+        cmpi.l  #44,d0
+        bcs.s   s1_cr_fail
+        lea     32(a2),a0
+        jsr     load_le32
+        tst.l   d0
+        bne.s   s1_cr_fail
+        lea     48(a2),a0
+        jsr     load_le32
+        move.l  d0,d1                     ; media time hi
+        bmi.s   s1_cr_fail                ; unknown / negative
+        lea     44(a2),a0
+        jsr     load_le32
+        move.l  d1,s1_block+4
+        move.l  d0,s1_block+8
+        move.l  d3,s1_block+12
+        addq.l  #1,s1_block               ; last: the block is complete
+        bra.s   s1_cr_out
+s1_cr_fail:
+        addq.l  #1,s1_block+20
+s1_cr_out:
+        movem.l (sp)+,d1-d3
+        jmp     h19_consume
+s1_cr_other:
+        movem.l (sp)+,d1-d3
+        jmp     p96w_clk_reply            ; not ours (window clock)
+
+; ------------------------------------------------------------
+; O1: BUFFER_FROM_HOST (picture) + BULK_TX, as vpv01_send_tone_block.
+; ------------------------------------------------------------
+o1_send_buffer:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        move.l  #320,d0
+        jsr     h26a_reserve_tx
+        tst.l   d0
+        bne.w   o1_send_fail
+        move.l  a2,a0
+        moveq   #79,d7
+o1_send_clear:
+        clr.l   (a0)+
+        dbra    d7,o1_send_clear
+        move.l  a2,a0
+        move.l  #VCHIQ_MSG_DATA,d0
+        or.l    v12f_local_bits,d0
+        move.l  mmal_remote_port,d1
+        and.l   #$00000fff,d1
+        or.l    d1,d0
+        jsr     store_le32
+        lea     4(a2),a0
+        move.l  #292,d0
+        jsr     store_le32
+        lea     8(a2),a0
+        move.l  #MMAL_MAGIC,d0
+        jsr     store_le32
+        lea     12(a2),a0
+        move.l  #MMAL_BUFFER_FROM_HOST,d0
+        jsr     store_le32
+        lea     20(a2),a0
+        move.l  #O1_BUFFER_CONTEXT,d0
+        jsr     store_le32
+        lea     32(a2),a0
+        move.l  #MMAL_MAGIC,d0
+        jsr     store_le32
+        lea     36(a2),a0
+        move.l  o1_handle,d0
+        jsr     store_le32
+        lea     40(a2),a0
+        move.l  o1_input,d0
+        jsr     store_le32
+        lea     44(a2),a0
+        move.l  #O1_BUFFER_CONTEXT,d0
+        jsr     store_le32
+        lea     76(a2),a0
+        move.l  o1_buf,d0
+        jsr     store_le32
+        lea     80(a2),a0
+        move.l  o1_port_size,d0
+        jsr     store_le32
+        lea     84(a2),a0
+        move.l  o1_bytes,d0
+        jsr     store_le32
+        lea     92(a2),a0
+        move.l  #MMAL_BUFFER_FLAG_FRAME_END,d0
+        jsr     store_le32
+        lea     96(a2),a0                 ; PTS/DTS unknown: show at once
+        moveq   #0,d0
+        jsr     store_le32
+        lea     100(a2),a0
+        move.l  #$80000000,d0
+        jsr     store_le32
+        lea     104(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+        lea     108(a2),a0
+        move.l  #$80000000,d0
+        jsr     store_le32
+        lea     304(a2),a3
+        move.l  a3,a0
+        move.l  #VCHIQ_MSG_BULK_TX,d0
+        or.l    v12f_local_bits,d0
+        move.l  mmal_remote_port,d1
+        and.l   #$00000fff,d1
+        or.l    d1,d0
+        jsr     store_le32
+        lea     4(a3),a0
+        move.l  #8,d0
+        jsr     store_le32
+        lea     8(a3),a0
+        move.l  o1_pagelist,d0
+        or.l    #$c0000000,d0
+        jsr     store_le32
+        lea     12(a3),a0
+        move.l  o1_bytes,d0
+        jsr     store_le32
+        add.l   #320,port_tx_pos
+        move.l  slot_ptr,a0
+        lea     SLAVE_TXPOS(a0),a0
+        move.l  port_tx_pos,d0
+        jsr     store_le32
+        move.l  slot_ptr,a0
+        lea     MASTER_TRIG_FIR(a0),a0
+        moveq   #1,d0
+        jsr     store_le32
+        move.l  slot_ptr,a0
+        lea     MASTER_TRIG_ARM(a0),a0
+        jsr     load_le32
+        move.l  d0,d6
+        jsr     dma_pre_all
+        tst.l   d6
+        beq.s   o1_send_no_bell
+        moveq   #0,d0
+        move.l  d0,VCHIQ_BELL2
+o1_send_no_bell:
+        moveq   #0,d0
+        bra.s   o1_send_done
+o1_send_fail:
+        moveq   #1,d0
+o1_send_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+; ------------------------------------------------------------
+; O1: wait for BULK_TX_DONE of the picture (the renderer keeps the buffer,
+; so no BUFFER_TO_HOST is expected).  Other traffic is consumed; at graph
+; setup nothing else is in flight.  Returns CPU-owned shared RAM.
+; ------------------------------------------------------------
+o1_wait_bulk:
+        movem.l d1-d7/a0-a3/a6,-(sp)
+        move.l  #V10_CLEANUP_POLL_COUNT,d7
+o1_wait_loop:
+        jsr     short_delay
+        jsr     dma_post_all
+        move.l  slot_ptr,a0
+        lea     MASTER_TXPOS(a0),a0
+        jsr     load_le32
+        cmp.l   port_rx_pos,d0
+        bhi.s   o1_wait_have
+        jsr     dma_pre_all
+        subq.l  #1,d7
+        bne.s   o1_wait_loop
+        jsr     dma_post_all
+        bra.w   o1_wait_fail
+o1_wait_have:
+        jsr     h26a_map_rx_current
+        tst.l   d0
+        bne.w   o1_wait_fail
+        move.l  a2,a0
+        jsr     load_le32
+        move.l  d0,o1_rx_msgid
+        lea     4(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_rx_size
+        addq.l  #1,o1_rx_count
+        move.l  o1_rx_msgid,d0
+        and.l   #$00000fff,d0
+        cmp.l   v12f_local_port,d0
+        bne.s   o1_wait_consume
+        move.l  o1_rx_msgid,d0
+        and.l   #$ff000000,d0
+        cmp.l   #VCHIQ_MSG_BULK_TX_DONE,d0
+        bne.s   o1_wait_consume
+        move.l  o1_rx_size,d0
+        cmp.l   #4,d0
+        bcs.s   o1_wait_consume
+        lea     8(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_bulk_result
+        cmp.l   o1_bytes,d0
+        bne.s   o1_wait_consume
+        move.l  o1_rx_size,d0
+        jsr     v12a_rx_consume_payload
+        tst.l   d0
+        bne.s   o1_wait_fail
+        moveq   #0,d0
+        bra.s   o1_wait_done
+o1_wait_consume:
+        move.l  o1_rx_size,d0
+        jsr     v12a_rx_consume_payload
+        tst.l   d0
+        bne.s   o1_wait_fail
+        jsr     dma_pre_all
+        subq.l  #1,d7
+        bne.w   o1_wait_loop
+        jsr     dma_post_all
+o1_wait_fail:
+        moveq   #1,d0
+o1_wait_done:
+        movem.l (sp)+,d1-d7/a0-a3/a6
+        rts
+
+; O1: display region of the OSD renderer (copy of hdmi_v40o_set_displayregion)
+o1_set_displayregion:
+        movem.l d1-d7/a0-a3,-(sp)
+        clr.l   o1_dr_status
+        clr.l   o1_dr_rx_size
+        clr.l   o1_dr_type
+        clr.l   o1_dr_ctx
+
+        ; Worker payload is 32-byte prefix before param + 84-byte displayregion
+        ; = 116 bytes. With 8-byte VCHIQ header, reserve/alignment stride = 128.
+        tst.l   v12f_local_port
+        beq.s   o1_dr_tx_legacy
+        move.l  #128,d0
+        jsr     h26a_reserve_tx
+        tst.l   d0
+        bne.w   o1_dr_fail
+        bra.s   o1_dr_tx_ready
+o1_dr_tx_legacy:
+        move.l  slot_ptr,a0
+        move.l  #34,d0
+        lsl.l   #8,d0
+        lsl.l   #4,d0
+        adda.l  d0,a0
+        move.l  port_tx_pos,d0
+        adda.l  d0,a0
+        move.l  a0,a2
+o1_dr_tx_ready:
+        move.l  #O1_PARAM_CONTEXT,o1_df_ctx
+        jsr     o1_dr_fill
+        add.l   #128,port_tx_pos
+        move.l  slot_ptr,a0
+        lea     SLAVE_TXPOS(a0),a0
+        move.l  port_tx_pos,d0
+        jsr     store_le32
+        move.l  slot_ptr,a0
+        lea     MASTER_TRIG_FIR(a0),a0
+        moveq   #1,d0
+        jsr     store_le32
+        move.l  slot_ptr,a0
+        lea     MASTER_TRIG_ARM(a0),a0
+        jsr     load_le32
+        move.l  d0,d6
+        jsr     dma_pre_all
+        tst.l   d6
+        beq.s   o1_dr_wait_setup
+        moveq   #0,d0
+        move.l  d0,VCHIQ_BELL2
+o1_dr_wait_setup:
+        move.l  #POLL_COUNT,d7
+o1_dr_wait:
+        jsr     short_delay
+        jsr     dma_post_all
+        move.l  slot_ptr,a0
+        lea     MASTER_TXPOS(a0),a0
+        jsr     load_le32
+        cmp.l   port_rx_pos,d0
+        bhi.s   o1_dr_have
+        jsr     dma_pre_all
+        subq.l  #1,d7
+        bne.s   o1_dr_wait
+        jsr     dma_post_all
+        bra.w   o1_dr_fail
+
+o1_dr_have:
+        jsr     v12a_rx_map_data
+        tst.l   d0
+        bne.w   o1_dr_fail
+        lea     4(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_dr_rx_size
+        cmp.l   #28,d0
+        bcs.w   o1_dr_fail
+        lea     8(a2),a0
+        jsr     load_le32
+        cmp.l   #MMAL_MAGIC,d0
+        bne.w   o1_dr_fail_consume
+        lea     12(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_dr_type            ; O1 diagnostics
+        cmp.l   #MMAL_PORT_PARAMETER_SET,d0
+        bne.w   o1_dr_fail_consume
+        lea     20(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_dr_ctx
+        cmp.l   #O1_PARAM_CONTEXT,d0     ; O1b: was still $12D30001
+        bne.w   o1_dr_fail_consume
+        lea     32(a2),a0
+        jsr     load_le32
+        move.l  d0,o1_dr_status
+        move.l  o1_dr_rx_size,d0
+        jsr     v12a_rx_consume_payload
+        tst.l   d0
+        bne.w   o1_dr_fail
+        move.l  o1_dr_status,d0
+        tst.l   d0
+        bne.w   o1_dr_fail
+        move.l  #1,o1_dr_ok
+        moveq   #0,d0
+        bra.s   o1_dr_done
+
+o1_dr_fail_consume:
+        move.l  o1_dr_rx_size,d0
+        jsr     v12a_rx_consume_payload
+o1_dr_fail:
+        clr.l   o1_dr_ok
+        moveq   #1,d0
+o1_dr_done:
+        movem.l (sp)+,d1-d7/a0-a3
         rts
 
 ; ====================================================================
@@ -67334,6 +68649,71 @@ n83_msg_upscale:
         dc.b "N83_ISP_UPSCALE",0
 n84_msg_wide:
         dc.b "N84_TOO_WIDE_NO_UPSCALE",0
+o1_msg_begin:
+        dc.b "O1_OSD_BEGIN",0
+o1_msg_ok:
+        dc.b "O1_OSD_OK",0
+o1_msg_fail:
+        dc.b "O1_OSD_FAIL",0
+o1_pfx_stage:
+        dc.b "O1 STAGE=",0
+o1_pfx_size:
+        dc.b "O1 PORT_BUF_SIZE=",0
+o1_pfx_x:
+        dc.b "O1 DEST_X=",0
+o1_pfx_y:
+        dc.b "O1 DEST_Y=",0
+o1_pfx_drst:
+        dc.b "O1 DR_STATUS=",0
+o1_pfx_drctx:
+        dc.b "O1 DR_CONTEXT=",0
+o1_pfx_bulk:
+        dc.b "O1 BULK_DONE_BYTES=",0
+o2_pfx_dispctrl:
+        dc.b "O2 HVS_DISPCTRL1=",0
+o2_pfx_dw:
+        dc.b "O2 DISP_W=",0
+o2_pfx_dh:
+        dc.b "O2 DISP_H=",0
+o2_pfx_req:
+        dc.b "O2 KEY_REQUESTS=",0
+o2_pfx_sends:
+        dc.b "O2 SENDS=",0
+o2_pfx_replies:
+        dc.b "O2 REPLIES=",0
+o2_pfx_bad:
+        dc.b "O2 BAD_STATUS=",0
+o2_pfx_last:
+        dc.b "O2 LAST_STATUS=",0
+o2_pfx_fails:
+        dc.b "O2 TX_FAILS=",0
+o2_pfx_pend:
+        dc.b "O2 PENDING_AT_CLOSE=",0
+o3_pfx_req:
+        dc.b "O3 PIC_REQUESTS=",0
+o3_pfx_sent:
+        dc.b "O3 PIC_SENT=",0
+o3_pfx_done:
+        dc.b "O3 PIC_BULK_DONE=",0
+o3_pfx_defers:
+        dc.b "O3 DEFERS=",0
+o3_pfx_bad:
+        dc.b "O3 BAD_SIZE=",0
+o3_pfx_dead:
+        dc.b "O3 DEAD=",0
+o3_pfx_max:
+        dc.b "O3 MAX_US=",0
+o3_pfx_total:
+        dc.b "O3 TOTAL_US=",0
+s1_pfx_q:
+        dc.b "S1 CLOCK_QUERIES=",0
+s1_pfx_r:
+        dc.b "S1 CLOCK_REPLIES=",0
+s1_pfx_f:
+        dc.b "S1 CLOCK_LOST=",0
+s1_pfx_rtt:
+        dc.b "S1 CLOCK_RTT_MAX_US=",0
+        even
 n83_pfx_w:
         dc.b "N83 OUT_W=",0
 n83_pfx_h:
@@ -68033,6 +69413,7 @@ BVP_CloseStreamN9:
         move.l  a6,bvp_libbase_global
         movem.l d1-d7/a0-a5,-(sp)
         jsr     p96w_clk_close            ; P96W32: before the teardown
+        jsr     o2_close                  ; O2: wait for an OSD reply, log
         clr.l   p96w20_fast               ; P96W20: normal pause for teardown
         lea     n11_name_close_in,a1
         jsr     n12_log
@@ -70833,6 +72214,70 @@ n81_active:                  ds.l 1
 n81_active_sys:              ds.l 1
 n82_force_isp:               ds.l 1   ; ISP82: cinema always via ISP
 n84_isp_out:                 ds.l 1   ; N84 test: 0 / -1 / (W<<16)|H
+o1_req:                      ds.l 1   ; O1: OSD request block or 0
+o1_stage:                    ds.l 1
+o1_ok:                       ds.l 1
+o1_w:                        ds.l 1
+o1_h:                        ds.l 1
+o1_bytes:                    ds.l 1
+o1_port_size:                ds.l 1
+o1_alpha:                    ds.l 1
+o1_dest_x:                   ds.l 1
+o1_dest_y:                   ds.l 1
+o1_alloc:                    ds.l 1
+o1_buf:                      ds.l 1
+o1_pagelist:                 ds.l 1
+o1_dma_len:                  ds.l 1
+o1_handle:                   ds.l 1
+o1_input:                    ds.l 1
+o1_save_handle:              ds.l 1
+o1_rx_msgid:                 ds.l 1
+o1_rx_size:                  ds.l 1
+o1_rx_count:                 ds.l 1
+o1_bulk_result:              ds.l 1
+o1_dr_status:                ds.l 1
+o1_dr_rx_size:               ds.l 1
+o1_dr_ok:                    ds.l 1
+o1_dr_type:                  ds.l 1
+o1_dr_ctx:                   ds.l 1
+o1_df_ctx:                   ds.l 1   ; O2: context for o1_dr_fill
+o2_req:                      ds.l 1
+o2_want:                     ds.l 1
+o2_shown:                    ds.l 1
+o2_hide_move:                ds.l 1
+o2_show_x:                   ds.l 1
+o2_show_y:                   ds.l 1
+o2_show_alpha:               ds.l 1
+o2_disp_w:                   ds.l 1
+o2_disp_h:                   ds.l 1
+o2_dispctrl:                 ds.l 1
+o2_reply_pending:            ds.l 1
+o2_requests:                 ds.l 1
+o2_sends:                    ds.l 1
+o2_replies:                  ds.l 1
+o2_bad_status:               ds.l 1
+o2_last_status:              ds.l 1
+o2_fails:                    ds.l 1
+o3_req:                      ds.l 1
+o3_bulk_pending:             ds.l 1
+o3_requests:                 ds.l 1
+o3_sent:                     ds.l 1
+o3_done:                     ds.l 1
+o3_defers:                   ds.l 1
+o3_bad:                      ds.l 1
+o3_dead:                     ds.l 1
+o3_max_us:                   ds.l 1
+o3_total_us:                 ds.l 1
+o3_t0:                       ds.l 1
+s1_enabled:                  ds.l 1
+s1_pending:                  ds.l 1
+s1_started:                  ds.l 1
+s1_next_sys:                 ds.l 1
+s1_req_sys:                  ds.l 1
+s1_seq:                      ds.l 1
+s1_ctx:                      ds.l 1
+s1_rtt_max:                  ds.l 1
+s1_block:                    ds.l 6
 n83_upscale:                 ds.l 1   ; N83: ISP upscales small films
 n81_hb_last:                 ds.l 1
 n81_free_mode:               ds.l 1
@@ -71392,6 +72837,9 @@ p96w_ac_done:
 ;  68 written by mrberry: AV offset us, signed, + = picture later (P96W37)
 ;  72 written by the library: non-zero = user stop in the video window
 ;     (Esc, 0 or close gadget, P96W38).  mrberry polls it like its own Esc.
+;  76 written by the library: Space presses in the video window (P96W45)
+;  80 written by the library: F presses in the video window (v96.82,
+;     MintVID-pi switches to full screen at the same spot)
 ; ----------------------------------------------------------------------------
 P96W_CLK_CTX         equ $A96C0000
 P96W_CLK_PERIOD_US   equ 200000
@@ -71403,7 +72851,7 @@ P96W_CLK_TIMEOUT_US  equ 1000000
 p96w_clk_open:
         movem.l d0/a0,-(sp)
         lea     p96w_sync,a0
-        moveq   #19,d0
+        moveq   #20,d0
 p96w_co_clr:
         clr.l   (a0)+
         dbra    d0,p96w_co_clr
@@ -71572,6 +73020,10 @@ p96w38_pk_vanilla:
         beq.s   p96w45_pk_space
         cmpi.w  #$001B,d3              ; Esc
         beq.s   p96w38_pk_stop
+        cmpi.w  #$0066,d3              ; v96.82: 'f' = full screen
+        beq.s   v9682_pk_full
+        cmpi.w  #$0046,d3              ; 'F'
+        beq.s   v9682_pk_full
         cmpi.w  #$0030,d3              ; '0'
         bne.s   p96w38_pk_next
 p96w38_pk_stop:
@@ -71587,6 +73039,11 @@ p96w45_pk_space:
         bne.s   p96w38_pk_next
         addq.l  #1,p96w_sync+76
         bra.s   p96w38_pk_next
+v9682_pk_full:
+        btst    #25,d3                 ; no key repeat
+        bne.w   p96w38_pk_next
+        addq.l  #1,p96w_sync+80
+        bra.w   p96w38_pk_next
 p96w38_pk_done:
         movem.l (sp)+,d0-d3/a0-a2/a6
         rts
@@ -72382,7 +73839,7 @@ p96w_ring_pts_lo:     ds.l 16
 p96w_ring_pts_hi:     ds.l 16
 p96w_ring_len:        ds.l 16
 p96w_spin:            ds.l 1
-p96w_sync:            ds.l 20
+p96w_sync:            ds.l 21          ; v96.82: +80 fullscreen key count
         cnop    0,4
 p96w_stage:           ds.b VPV48_FAAD_INPUT_SIZE
 

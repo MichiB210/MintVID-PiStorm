@@ -6,6 +6,7 @@
 #include "../core/mr_mkv_tracks.h"
 #include "mr_berryvp.h"
 #include "mrb_paula.h"
+#include "mrb_sub.h"
 #include <exec/types.h>
 #include <dos/dos.h>
 #include <intuition/intuition.h>
@@ -30,6 +31,121 @@ extern ULONG bvp_exec_setsignal(ULONG newSignals, ULONG signalSet);
 extern void mrb_source_set_read_kb(unsigned kb);   /* core/mr_source.c, W77 */
 extern int mr_berryvp_force_isp;                    /* mr_berryvp.c, ISP82 */
 extern unsigned long mr_berryvp_isp_out;            /* mr_berryvp.c, N84 */
+extern void *mr_berryvp_osd_req;                    /* mr_berryvp.c, O1 */
+
+/* ---- O1: OSD feasibility test ------------------------------------------
+ * OSDTEST (or OSDTEST=MIX) builds one RGBA picture, 512x96: transparent
+ * background, a half transparent dark box, "OSD TEST" in opaque white, an
+ * opaque red and a half transparent green square.  berryvp.library shows it
+ * on a second video_render layer above the film (cinema only), centred near
+ * the bottom.  It shows whether a layer over the film works, whether the
+ * per-pixel alpha is used, and whether the film stays smooth. */
+/* O3: OSDTEST=COUNT uses a 1280x128 picture (subtitle size) and sends a
+ * new one every second with a counter - the worst case for subtitles. */
+static int o1_w = 512, o1_h = 96;
+static uint32_t o1_block[8];
+/* O2: key O shows/hides the OSD while the film plays (cinema).
+ * OSDTEST=MOVE hides it by moving it below the screen instead of alpha 0. */
+static int o2_key_osd;
+static int o2_osd_shown = 1;
+static int o3_count_mode;
+extern ULONG ac309i_read_sys_us(void);
+/* S1: SRT subtitles (mrb_sub.c) on the OSD layer, cinema only. */
+static int s1_on;                     /* .srt loaded, OSD request set */
+static int s1_user_off;               /* key O: subtitles off */
+static int s1_nosub;                  /* NOSUB */
+static const char *s1_name_arg;       /* SUB=file */
+static volatile unsigned long *s1_blk;/* library clock block (BVP_CTRL_OSDCLOCK) */
+static int s1_have_resume;
+static uint32_t s1_resume_sys;
+static long s1_offset_ms;             /* '+'/'-' (HDMI sound): + = later */
+static unsigned long s1_shows, s1_hides;
+static void s1_after_pause(void)
+{
+    s1_resume_sys = (uint32_t)ac309i_read_sys_us();
+    s1_have_resume = 1;
+}
+static unsigned long o3_counter;
+static ULONG o3_last_us;
+static uint8_t *o1_pixels;
+static const uint8_t o1_font[16][7] = {         /* 5x7, bit 4 = left */
+    {0x0e,0x11,0x11,0x11,0x11,0x11,0x0e},       /* O */
+    {0x0f,0x10,0x10,0x0e,0x01,0x01,0x1e},       /* S */
+    {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e},       /* D */
+    {0x1f,0x04,0x04,0x04,0x04,0x04,0x04},       /* T */
+    {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f},       /* E */
+    {0,0,0,0,0,0,0},                            /* space */
+    {0x0e,0x11,0x13,0x15,0x19,0x11,0x0e},       /* 0 */
+    {0x04,0x0c,0x04,0x04,0x04,0x04,0x0e},       /* 1 */
+    {0x0e,0x11,0x01,0x02,0x04,0x08,0x1f},       /* 2 */
+    {0x1f,0x02,0x04,0x02,0x01,0x11,0x0e},       /* 3 */
+    {0x02,0x06,0x0a,0x12,0x1f,0x02,0x02},       /* 4 */
+    {0x1f,0x10,0x1e,0x01,0x01,0x11,0x0e},       /* 5 */
+    {0x06,0x08,0x10,0x1e,0x11,0x11,0x0e},       /* 6 */
+    {0x1f,0x01,0x02,0x04,0x08,0x08,0x08},       /* 7 */
+    {0x0e,0x11,0x11,0x0e,0x11,0x11,0x0e},       /* 8 */
+    {0x0e,0x11,0x11,0x0f,0x01,0x02,0x0c}        /* 9 */
+};
+static void o1_px(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    uint8_t *p;
+    if (x < 0 || y < 0 || x >= o1_w || y >= o1_h) return;
+    p = o1_pixels + ((size_t)y * (size_t)o1_w + (size_t)x) * 4u;
+    p[0] = r; p[1] = g; p[2] = b; p[3] = a;
+}
+static void o1_rect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    int x, y;
+    for (y = y0; y < y0 + h; y++)
+        for (x = x0; x < x0 + w; x++) o1_px(x, y, r, g, b, a);
+}
+static int o1_glyph(char c)
+{
+    switch (c) {
+    case 'O': return 0; case 'S': return 1; case 'D': return 2;
+    case 'T': return 3; case 'E': return 4;
+    default:
+        if (c >= '0' && c <= '9') return 6 + (c - '0');
+        return 5;
+    }
+}
+/* Whole picture: transparent, dark box, text centred, red + green square. */
+static void o1_draw(const char *text, int scale)
+{
+    int i, row, col, x0, y0, n = (int)strlen(text), adv = 6 * scale;
+    memset(o1_pixels, 0, (size_t)o1_w * (size_t)o1_h * 4u);
+    o1_rect(8, 8, o1_w - 16, o1_h - 16, 16, 16, 48, 160);      /* dark box, alpha 160 */
+    o1_rect(20, o1_h / 2 - 16, 32, 32, 255, 0, 0, 255);        /* red, opaque */
+    o1_rect(o1_w - 52, o1_h / 2 - 16, 32, 32, 0, 255, 0, 128); /* green, half */
+    x0 = (o1_w - n * adv + scale) / 2;
+    y0 = (o1_h - 7 * scale) / 2;
+    for (i = 0; i < n; i++) {
+        int g = o1_glyph(text[i]);
+        for (row = 0; row < 7; row++)
+            for (col = 0; col < 5; col++)
+                if (o1_font[g][row] & (0x10 >> col))
+                    o1_rect(x0 + i * adv + col * scale, y0 + row * scale,
+                            scale, scale, 255, 255, 255, 255);
+    }
+}
+static int o1_build(int mix, int move, int count)
+{
+    if (count) { o1_w = 1280; o1_h = 128; o3_count_mode = 1; }
+    o1_pixels = (uint8_t *)malloc((size_t)o1_w * (size_t)o1_h * 4u);
+    if (!o1_pixels) return 0;
+    if (count) o1_draw("OSD 0000", 12);
+    else o1_draw("OSD TEST", 8);
+    o1_block[0] = 0x4F534432UL;                 /* 'OSD2' (O2) */
+    o1_block[1] = (uint32_t)o1_w;
+    o1_block[2] = (uint32_t)o1_h;
+    o1_block[3] = mix ? 1u : 0u;
+    o1_block[4] = (uint32_t)(unsigned long)o1_pixels;
+    o1_block[5] = 0xFFFFFFFFUL;                 /* centred */
+    o1_block[6] = 0xFFFFFFFFUL;                 /* near the bottom */
+    o1_block[7] = move ? 1u : 0u;               /* O2: hide by moving away */
+    mr_berryvp_osd_req = o1_block;
+    return 1;
+}
 extern ULONG ac309i_read_sys_us(void);
 
 /* D4: keep the ~4 KiB BerryVP bridge context out of the Amiga CLI stack.
@@ -142,12 +258,20 @@ static void n76_hlog(const char *s);
 /* P96W38: the library's P96 video window takes the keyboard focus when it
  * opens or is clicked.  The library then reports Esc / 0 / close gadget in
  * its sync block (libbase+120, 'P96S', long 18 = byte offset 72). */
+static int v9682_full;                 /* v96.82: F in the video window */
+static int p58_switch;
 static int p96w38_window_stop(void)
 {
     unsigned long v;
     if (!g_bvp.lib) return 0;
     v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
     if (!v || ((volatile unsigned long *)v)[0] != 0x50393653UL) return 0;   /* 'P96S' */
+    /* v96.82: F (long 20, +80) = stop here and let MintVID-pi go on in
+     * full screen at this spot (same as its Fullscreen button, Ctrl-F) */
+    if (mr_berryvp_stream_flags && ((volatile unsigned long *)v)[20] != 0) {
+        if (!v9682_full) { v9682_full = 1; p58_switch = 1; n76_hlog("V9682_WINDOW_KEY_F"); }
+        return 1;
+    }
     return ((volatile unsigned long *)v)[18] != 0;
 }
 
@@ -203,6 +327,9 @@ static int p05_input_poll_stop(void)
             /* P96W70: Paula fine offset, 50 ms per press */
             if (code == '+') p70_key_delta += 50;
             if (code == '-') p70_key_delta -= 50;
+            /* O2: O = OSD on/off */
+            if ((code == 'o' || code == 'O') && !(qual & IEQUALIFIER_REPEAT))
+                o2_key_osd = 1;
         }
     }
     return stop;
@@ -598,7 +725,6 @@ static void ac309i_pacer_init(ac309i_pacer *p, const mr_video_info *vi, int enab
 /* P96W58: Ctrl-F = stop for the MintVID-pi "Fullscreen" button.  Same as a
  * stop (Ctrl-C), but the .t position is written without the 30-s recap, so
  * the cinema restart continues right where the window film was. */
-static int p58_switch;
 static int p58_stop_sig(ULONG sig)
 {
     if (sig & SIGBREAKF_CTRL_F) p58_switch = 1;
@@ -758,6 +884,7 @@ static int p45_pause_loop(ac309i_pacer *pace, uint32_t *eac3_wall)
     n76_hlog(line);
     if (!stop)
         p06_status_write(P06_STATE_PLAYING, "H.264 / VideoCore", p45_status_text);
+    s1_after_pause();                 /* S1: old clock samples are stale */
     return stop;
 }
 
@@ -1224,12 +1351,117 @@ static void p65_hb(unsigned long sent, unsigned long queued)
             (unsigned long)(p54_last_vpts_raw / 1000ULL), queued);
     fflush(n76_hostlog);
 }
+/* S1: film time on screen in ms (0 = not known yet).
+ * HDMI sound: the Pi audio clock (sampled by the library about once a
+ * second) plus the Pi timer since the sample.  Paula / no sound: the free
+ * Pi clock (CLK81) from its start, as P96W78. */
+static int s1_now_ms(uint32_t *ms)
+{
+    uint32_t now = (uint32_t)ac309i_read_sys_us();
+    uint64_t film;
+    if (P67_FREE) {
+        uint32_t cs = (uint32_t)bvp_call_control(g_bvp.lib, P68_CTRL_CLOCKSTART);
+        if (!cs || (uint32_t)(now - cs) > 0x7fffffffu) return 0;
+        film = (uint64_t)(uint32_t)(now - cs);
+    } else {
+        uint32_t sample;
+        if (!s1_blk) {
+            unsigned long v = (unsigned long)bvp_call_control2(g_bvp.lib, 13, 1);
+            if (v < 0x1000UL) return 0;           /* OSD not ready yet / old library */
+            s1_blk = (volatile unsigned long *)v;
+        }
+        if (!s1_blk[0]) return 0;                 /* no clock answer yet */
+        sample = (uint32_t)s1_blk[3];
+        if (s1_have_resume && (int32_t)(sample - s1_resume_sys) < 0) return 0;
+        film = (((uint64_t)s1_blk[1]) << 32) | (uint64_t)s1_blk[2];
+        film += (uint64_t)(uint32_t)(now - sample);
+    }
+    if (p50_t_set) film += p50_base_us;
+    film /= 1000u;
+    if (s1_offset_ms > 0 && film < (uint64_t)s1_offset_ms) film = 0;
+    else film -= (uint64_t)(int64_t)s1_offset_ms;
+    *ms = (uint32_t)film;
+    return 1;
+}
+static void s1_tick(void)
+{
+    uint32_t ms;
+    int r;
+    if (!s1_on || s1_user_off || !g_bvp.lib) return;
+    if (!s1_now_ms(&ms)) return;
+    r = mrb_sub_tick(ms);
+    if (r == MRB_SUB_SHOW) {
+        LONG rc = bvp_call_control2(g_bvp.lib, 12, (unsigned long)mrb_sub_pixels());
+        if (rc != 0) {
+            s1_on = 0;
+            if (n76_hostlog) { fprintf(n76_hostlog, "S1_PIC_FAIL rc=%ld\n", (long)rc); fflush(n76_hostlog); }
+            return;
+        }
+        (void)bvp_call_control2(g_bvp.lib, 11, 1);
+        s1_shows++;
+        if (n76_hostlog && s1_shows <= 5) {
+            fprintf(n76_hostlog, "S1_SHOW cue=%d film_ms=%lu\n", mrb_sub_shown(), (unsigned long)ms);
+            fflush(n76_hostlog);
+        }
+    } else if (r == MRB_SUB_HIDE) {
+        (void)bvp_call_control2(g_bvp.lib, 11, 0);
+        s1_hides++;
+    }
+}
 static void p70_apply_keys(void)
 {
-    long d = p70_key_delta;
+    long d;
+    s1_tick();
+    if (o2_key_osd && s1_on) {
+        /* S1: key O = subtitles off / on */
+        o2_key_osd = 0;
+        s1_user_off = !s1_user_off;
+        if (g_bvp.lib) (void)bvp_call_control2(g_bvp.lib, 11, 0);
+        mrb_sub_reset();                  /* on again: draw the current cue */
+        if (n76_hostlog) { fprintf(n76_hostlog, "S1_KEY_O off=%d\n", s1_user_off); fflush(n76_hostlog); }
+    }
+    if (o2_key_osd) {
+        o2_key_osd = 0;
+        if (g_bvp.lib && mr_berryvp_osd_req) {
+            LONG rc;
+            o2_osd_shown = !o2_osd_shown;
+            rc = bvp_call_control2(g_bvp.lib, 11, o2_osd_shown ? 1UL : 0UL);
+            if (n76_hostlog) {
+                fprintf(n76_hostlog, "O2_OSD_KEY show=%d rc=%ld\n", o2_osd_shown, (long)rc);
+                fflush(n76_hostlog);
+            }
+        }
+    }
+    /* O3: OSDTEST=COUNT - a new picture every second */
+    if (o3_count_mode && g_bvp.lib && mr_berryvp_osd_req) {
+        ULONG now = ac309i_read_sys_us();
+        if (!o3_last_us) o3_last_us = now;
+        else if ((ULONG)(now - o3_last_us) >= 1000000UL) {
+            char t[16];
+            LONG rc;
+            o3_last_us = now;
+            o3_counter++;
+            snprintf(t, sizeof t, "OSD %04lu", o3_counter % 10000UL);
+            o1_draw(t, 12);
+            rc = bvp_call_control2(g_bvp.lib, 12, (unsigned long)o1_pixels);
+            if (n76_hostlog && (o3_counter <= 3 || rc != 0)) {
+                fprintf(n76_hostlog, "O3_PIC n=%lu rc=%ld\n", o3_counter, (long)rc);
+                fflush(n76_hostlog);
+            }
+            if (rc != 0) o3_count_mode = 0;
+        }
+    }
+    d = p70_key_delta;
     if (!d) return;
     p70_key_delta = 0;
-    if (!p67_pa) return;
+    if (!p67_pa) {
+        /* S1: HDMI sound - '+'/'-' move the subtitles by 100 ms */
+        if (s1_on) {
+            s1_offset_ms += d * 2;
+            if (n76_hostlog) { fprintf(n76_hostlog, "S1_OFFSET_MS=%ld\n", s1_offset_ms); fflush(n76_hostlog); }
+        }
+        return;
+    }
     p70_fine_ms += d;
     if (p70_fine_ms > 3000) p70_fine_ms = 3000;
     if (p70_fine_ms < -3000) p70_fine_ms = -3000;
@@ -1314,12 +1546,120 @@ static int p70_t_have_fine;
 static int mka_cli_track;              /* AUDIO= given on the command line */
 static unsigned mka_t_track;           /* AT: line of the last .t read */
 
+/* S2: SRT files of the film (<base>.srt, <base>.<label>.srt), sorted by
+ * label.  SUB=n picks file n (1-based), SUB=OFF none; the .t keeps the
+ * choice as S:<label> / S:OFF.  Without either: start rule
+ * (mrb_sub_pick_default: forced file in the sound's language, else the
+ * first forced file, else none). */
+static char s2_label[MRB_SUB_FILES][64];
+static char s2_path[MRB_SUB_FILES][512];
+static unsigned s2_n;
+static char s2_t_label[64];          /* S: of the last .t read */
+static int s2_t_have;
+static int s2_cli_n = -1;            /* SUB=n (0 = OFF), -1 = not given */
+static const char *s2_used_label;    /* for the .t: NULL = do not write */
+
+static unsigned s2_scan(const char *film)
+{
+    char dir[512], base[256];
+    const char *fp = (const char *)FilePart((CONST_STRPTR)film);
+    const char *pp = (const char *)PathPart((CONST_STRPTR)film);
+    size_t dl = (size_t)(pp - film), i;
+    char *dot;
+    BPTR lock;
+    struct FileInfoBlock *fib;
+    s2_n = 0;
+    if (dl >= sizeof dir) return 0;
+    memcpy(dir, film, dl);
+    dir[dl] = 0;
+    strncpy(base, fp, sizeof base - 1);
+    base[sizeof base - 1] = 0;
+    dot = strrchr(base, '.');
+    if (dot) *dot = 0;
+    lock = Lock((CONST_STRPTR)dir, SHARED_LOCK);
+    if (!lock) return 0;
+    fib = (struct FileInfoBlock *)AllocDosObject(DOS_FIB, NULL);
+    if (fib && Examine(lock, fib)) {
+        while (ExNext(lock, fib) && s2_n < MRB_SUB_FILES) {
+            char label[64];
+            if (fib->fib_DirEntryType >= 0) continue;          /* directory */
+            if (!mrb_sub_file_label(base, (const char *)fib->fib_FileName, label, sizeof label))
+                continue;
+            strcpy(s2_label[s2_n], label);
+            strcpy(s2_path[s2_n], dir);
+            AddPart((STRPTR)s2_path[s2_n], fib->fib_FileName, sizeof s2_path[s2_n]);
+            s2_n++;
+        }
+    }
+    if (fib) FreeDosObject(DOS_FIB, fib);
+    UnLock(lock);
+    for (i = 1; i < s2_n; i++) {                 /* sort by label (stable numbers) */
+        size_t j = i;
+        while (j > 0 && strcmp(s2_label[j - 1], s2_label[j]) > 0) {
+            char tl[64], tp[512];
+            strcpy(tl, s2_label[j]); strcpy(tp, s2_path[j]);
+            strcpy(s2_label[j], s2_label[j - 1]); strcpy(s2_path[j], s2_path[j - 1]);
+            strcpy(s2_label[j - 1], tl); strcpy(s2_path[j - 1], tp);
+            j--;
+        }
+    }
+    return s2_n;
+}
+
+static void p54_name(char *dst, size_t size, const char *film);
+/* S2: only the S: line of the film's .t (the .t is read fully only with
+ * RESUME). */
+static void s2_read_t(const char *film)
+{
+    char name[512], line[96];
+    FILE *f;
+    p54_name(name, sizeof name, film);
+    f = fopen(name, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        if ((line[0] == 'S' || line[0] == 's') && (line[1] == ':' || line[1] == '=')) {
+            strncpy(s2_t_label, line + 2, sizeof s2_t_label - 1);
+            s2_t_label[sizeof s2_t_label - 1] = 0;
+            s2_t_have = 1;
+        }
+    }
+    fclose(f);
+}
+
+static const char *s2_audio_lang(void)
+{
+    if (mr_mkv_atrack_count && mr_mkv_audio_chosen >= 1 &&
+        mr_mkv_audio_chosen <= mr_mkv_atrack_count)
+        return mr_mkv_atracks[mr_mkv_audio_chosen - 1].lang;
+    return "";
+}
+
+/* 1-based file to show, 0 = none.  *why: "cli", "t" or "auto". */
+static int s2_choose(const char **why)
+{
+    unsigned i;
+    if (s2_cli_n >= 0) {
+        *why = "cli";
+        return (s2_cli_n >= 1 && (unsigned)s2_cli_n <= s2_n) ? s2_cli_n : 0;
+    }
+    if (s2_t_have) {
+        *why = "t";
+        if (!strcmp(s2_t_label, "OFF")) return 0;
+        for (i = 0; i < s2_n; i++) if (!strcmp(s2_label[i], s2_t_label)) return (int)i + 1;
+    }
+    *why = "auto";
+    return mrb_sub_pick_default((const char (*)[64])s2_label, s2_n, s2_audio_lang());
+}
+
 static int p54_read(const char *film, uint64_t *t_us, int *have_t, long *window)
 {
     char name[512], line[64];
     p55_audio_read[0] = 0;
     p70_t_have_fine = 0;
     mka_t_track = 0;
+    s2_t_have = 0;
     FILE *f;
     p54_name(name, sizeof name, film);
     f = fopen(name, "r");
@@ -1344,6 +1684,10 @@ static int p54_read(const char *film, uint64_t *t_us, int *have_t, long *window)
                    (line[2] == ':' || line[2] == '=')) {
             unsigned long n = strtoul(line + 3, NULL, 10);   /* MKA1 */
             if (n >= 1 && n <= MKA_TRACK_MAX) mka_t_track = (unsigned)n;
+        } else if ((line[0] == 'S' || line[0] == 's') && (line[1] == ':' || line[1] == '=')) {
+            strncpy(s2_t_label, line + 2, sizeof s2_t_label - 1);   /* S2 */
+            s2_t_label[sizeof s2_t_label - 1] = 0;
+            s2_t_have = 1;
         } else if ((line[0] == 'A' || line[0] == 'a') && (line[1] == ':' || line[1] == '=')) {
             strncpy(p55_audio_read, line + 2, sizeof p55_audio_read - 1);
             p55_audio_read[sizeof p55_audio_read - 1] = 0;
@@ -1373,6 +1717,8 @@ static void p54_write(const char *film, uint64_t film_us, const char *audio,
     if (!strcmp(audio, "PAULA")) fprintf(f, "P:%ld\n", p70_fine_ms);   /* P96W70 */
     if (mr_mkv_atrack_count > 1 && mr_mkv_audio_chosen)
         fprintf(f, "AT:%u\n", mr_mkv_audio_chosen);                     /* MKA1 */
+    if (s2_used_label) fprintf(f, "S:%s\n", s2_used_label);           /* S2 */
+    else if (s2_t_have) fprintf(f, "S:%s\n", s2_t_label);             /* keep it */
     fclose(f);
     printf("Resume position saved: %s (T=%s).\n", name, t);
     if (n76_hostlog) {
@@ -1525,6 +1871,18 @@ static int p56_info(const char *film)
     printf("SOUND=%s\n", sound);
     printf("SEEK=%d\n", mr_demux_can_seek(d) ? 1 : 0);
     mka_info_tracks();                          /* MKA1 */
+    {
+        /* S2: subtitle files: SUBS=n, SUB<i>=label|forced, SUB_CHOSEN=k */
+        const char *why;
+        unsigned i;
+        int k;
+        s2_scan(film);
+        k = s2_choose(&why);
+        printf("SUBS=%u\n", s2_n);
+        for (i = 0; i < s2_n; i++)
+            printf("SUB%u=%s|%d\n", i + 1, s2_label[i], mrb_sub_is_forced(s2_label[i]));
+        if (s2_n) printf("SUB_CHOSEN=%d\nSUB_WHY=%s\n", k, why);
+    }
     if (r_have) {
         char t[16];
         p50_fmt(t, sizeof t, r_have_t ? r_t : 0);
@@ -1635,6 +1993,25 @@ int main(int argc, char **argv)
             } else if (!strcmp(a, "STILL") || !strcmp(a, "still") || !strcmp(a, "Still")) {
                 p79_still = 1;                    /* P96W79: still picture (Paula pause) */
                 p96s_off = 1;                     /* no clock queries, draw at once */
+            } else if (!strcmp(a, "NOSUB") || !strcmp(a, "nosub")) {
+                s1_nosub = 1;                     /* S1: no subtitles */
+            } else if (!strncmp(a, "SUB=", 4) || !strncmp(a, "sub=", 4)) {
+                /* S2: SUB=n (file n of the film), SUB=OFF, or SUB=<file> */
+                if (!strcmp(a + 4, "OFF") || !strcmp(a + 4, "off")) s2_cli_n = 0;
+                else if (a[4] >= '1' && a[4] <= '9' && strtoul(a + 4, NULL, 10) <= MRB_SUB_FILES &&
+                         a[4 + strspn(a + 4, "0123456789")] == 0)
+                    s2_cli_n = (int)strtoul(a + 4, NULL, 10);
+                else s1_name_arg = a + 4;         /* S1: subtitle file */
+            } else if (!strncmp(a, "OSDTEST", 7) || !strncmp(a, "osdtest", 7)) {
+                /* O1/O2 test: OSD picture on a second layer (cinema).
+                 * OSDTEST, OSDTEST=MIX, OSDTEST=MOVE, OSDTEST=MIXMOVE */
+                int mix = strstr(a, "MIX") || strstr(a, "mix");
+                int move = strstr(a, "MOVE") || strstr(a, "move");
+                int count = strstr(a, "COUNT") || strstr(a, "count");
+                if (!o1_build(mix, move, count)) {
+                    printf("Error: no memory for the OSD test picture.\n");
+                    return 10;
+                }
             } else if (!strncmp(a, "ISPOUT=", 7) || !strncmp(a, "ispout=", 7)) {
                 /* N84 test: ISPOUT=OFF (no N83 upscale) or ISPOUT=WxH */
                 unsigned long w = 0, h = 0;
@@ -1957,6 +2334,47 @@ int main(int argc, char **argv)
         }
     }
 
+    /* S1: <film>.srt next to the film -> subtitles on the OSD layer
+     * (cinema only; not with OSDTEST, STILL or NOSUB). */
+    if (!s1_nosub && !mr_berryvp_osd_req && !mr_berryvp_stream_flags && !p79_still) {
+        static char s1_used[512];
+        unsigned n = 0;
+        if (s1_name_arg) {
+            n = mrb_sub_load(argv[1], s1_name_arg, s1_used, sizeof s1_used);
+        } else {
+            /* S2: choose among <film>.srt / <film>.<label>.srt */
+            const char *why = "auto";
+            int k;
+            s2_scan(argv[1]);
+            if (s2_n && s2_cli_n < 0 && !s2_t_have) s2_read_t(argv[1]);
+            k = s2_n ? s2_choose(&why) : 0;
+            if (s2_n && strcmp(why, "auto"))   /* chosen by the user: keep it */
+                s2_used_label = k ? s2_label[k - 1] : "OFF";
+            if (k) n = mrb_sub_load(argv[1], s2_path[k - 1], s1_used, sizeof s1_used);
+            if (n76_hostlog) {
+                fprintf(n76_hostlog, "S2_SUBS files=%u chosen=%d why=%s lang=%s\n",
+                        s2_n, k, why, s2_audio_lang());
+                fflush(n76_hostlog);
+            }
+        }
+        if (n) {
+            o1_block[0] = 0x4F534432UL;                 /* 'OSD2' */
+            o1_block[1] = MRB_SUB_W;
+            o1_block[2] = MRB_SUB_H;
+            o1_block[3] = 0;
+            o1_block[4] = (uint32_t)(unsigned long)mrb_sub_pixels();   /* transparent */
+            o1_block[5] = 0xFFFFFFFFUL;
+            o1_block[6] = 0xFFFFFFFFUL;
+            o1_block[7] = 0;
+            mr_berryvp_osd_req = o1_block;
+            s1_on = 1;
+            printf("Subtitles: %s (%u).\n", s1_used, n);
+        }
+        if (n76_hostlog) {
+            fprintf(n76_hostlog, "S1_SRT cues=%u file=%s\n", n, s1_used);
+            fflush(n76_hostlog);
+        }
+    }
     DBG_PRINTF("[D05] before mr_berryvp_open\n");
     st = mr_berryvp_open(bvp, vi);
     DBG_PRINTF("[D06] after mr_berryvp_open st=%ld\n", (long)st);
@@ -2414,12 +2832,14 @@ int main(int argc, char **argv)
             if ((uint32_t)(ac309i_read_sys_us() - drain_start) >=
                 (P67_FREE ? 5000000u : 2000000u)) break;
             if (p67_pa) mrb_paula_service(p67_pa);
+            s1_tick();                    /* S1: subtitles to the end */
         }
     }
     if (p67_pa && !aborted) {
         /* P96W67: let Paula play what it still holds (max 6 s). */
         uint32_t t0 = (uint32_t)ac309i_read_sys_us();
         while (!mrb_paula_idle(p67_pa)) {
+            s1_tick();
             if (p05_input_poll_stop() || p58_stop_sig(bvp_exec_setsignal(0, 0))) break;
             if ((uint32_t)(ac309i_read_sys_us() - t0) >= 6000000u) break;
             Delay(1);
@@ -2516,6 +2936,7 @@ int main(int argc, char **argv)
         if (wait_us) {
             uint32_t wait_start = (uint32_t)ac309i_read_sys_us();
             while ((uint32_t)(ac309i_read_sys_us() - wait_start) < wait_us) {
+                s1_tick();
                 if (p05_input_poll_stop()) {
                     n76_hlog("P05_ESC_STOP_DRAIN");
                     aborted = 1;
@@ -2560,6 +2981,11 @@ int main(int argc, char **argv)
             p54_have_stop = 1;
         }
     }
+    if (s1_on && n76_hostlog) {
+        fprintf(n76_hostlog, "S1_STATS shows=%lu hides=%lu offset_ms=%ld clock_replies=%lu\n",
+                s1_shows, s1_hides, s1_offset_ms, s1_blk ? (unsigned long)s1_blk[0] : 0UL);
+        fflush(n76_hostlog);
+    }
     DBG_PRINTF("Closing BerryVP stream (EOS + Workbench return) ...\n");
     st = mr_berryvp_close(bvp);
     p05_input_close();
@@ -2583,8 +3009,10 @@ int main(int argc, char **argv)
 
     /* P96W78: "Paused" with ENDED = Paula pause; MintVID-pi offers Play.
      * P96W79: "Resume" with ENDED = Space in the still: Play again. */
+    /* v96.82: "Fullscreen" with ENDED = F in the window: MintVID-pi
+     * starts the film in full screen at the spot just saved in the .t */
     p06_status_write(P06_STATE_ENDED, "H.264 / VideoCore",
-                     p78_pause_stop ? "Paused" :
+                     p78_pause_stop ? "Paused" : v9682_full ? "Fullscreen" :
                      (p79_resume ? "Resume" : (aborted ? "Stopped" : "Finished")));
     n76_hlog(p78_pause_stop ? "P06_STATUS_ENDED_PAUSED" :
              p79_resume ? "P06_STATUS_ENDED_RESUME" :
