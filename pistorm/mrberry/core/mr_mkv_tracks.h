@@ -29,4 +29,25 @@ extern int mr_mkv_audio_want_bad;
  * (mrberry sets it for HDMI sound).  NULL = every supported track. */
 extern int (*mr_mkv_audio_usable)(const mr_audio_info *ai);
 
+/* v96.84: subtitle tracks of the opened MKV (text: S_TEXT/UTF8 = SRT,
+ * S_TEXT/ASS and S_TEXT/SSA; image formats are listed but not shown).
+ * mr_mkv_sub_track = Matroska track number whose blocks go to
+ * mr_mkv_sub_cb (0 = none); may change while the film plays. */
+#define MR_MKV_STRACK_MAX 16
+#define MR_MKV_SUB_SRT 1
+#define MR_MKV_SUB_ASS 2
+typedef struct {
+    uint64_t number;
+    int kind;                       /* MR_MKV_SUB_*, 0 = not supported */
+    int is_default, is_forced;
+    char codec[24];
+    char lang[12];
+    char name[48];
+} mr_mkv_strack;
+extern mr_mkv_strack mr_mkv_stracks[MR_MKV_STRACK_MAX];
+extern unsigned mr_mkv_strack_count;
+extern uint64_t mr_mkv_sub_track;
+extern void (*mr_mkv_sub_cb)(uint64_t pts_us, uint64_t dur_us,
+                             const uint8_t *data, size_t len, int kind);
+
 #endif

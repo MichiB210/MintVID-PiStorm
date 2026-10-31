@@ -1426,6 +1426,8 @@ static char s2_label[MRB_SUB_FILES][64];
 static char s2_path[MRB_SUB_FILES][512];
 static unsigned s2_n;
 static const char *s2_used_label;
+static uint64_t s2_mkv[MRB_SUB_FILES];
+static unsigned s2_activate(const char *film, int k, char *used, size_t used_size);
 /* v96.83: S = next subtitle file of the film: Off -> 1 -> 2 ... -> Off.
  * Its name is shown for 2 s; the choice goes into the .t (S:). */
 static void s3_next_file(void)
@@ -1436,14 +1438,12 @@ static void s3_next_file(void)
     if (!s1_on || !s3_film || !s2_n || !g_bvp.lib) return;
     next = (s3_cur + 1) % (int)(s2_n + 1);
     if (next) {
-        if (!mrb_sub_load(s3_film, s2_path[next - 1], NULL, 0)) {
-            /* empty / unreadable file: show it, but nothing to draw */
-            mrb_sub_clear();
-        }
+        if (!s2_activate(s3_film, next, NULL, 0))
+            mrb_sub_clear();     /* empty / unreadable: nothing to draw */
         snprintf(t, sizeof t, "Subtitles: %s", s2_label[next - 1]);
         s2_used_label = s2_label[next - 1];
     } else {
-        mrb_sub_clear();
+        (void)s2_activate(s3_film, 0, NULL, 0);
         strcpy(t, "Subtitles: Off");
         s2_used_label = "OFF";
     }
@@ -1649,6 +1649,7 @@ static unsigned s2_scan(const char *film)
     }
     if (fib) FreeDosObject(DOS_FIB, fib);
     UnLock(lock);
+    for (i = 0; i < MRB_SUB_FILES; i++) s2_mkv[i] = 0;
     for (i = 1; i < s2_n; i++) {                 /* sort by label (stable numbers) */
         size_t j = i;
         while (j > 0 && strcmp(s2_label[j - 1], s2_label[j]) > 0) {
@@ -1659,7 +1660,60 @@ static unsigned s2_scan(const char *film)
             j--;
         }
     }
+    {
+        /* v96.84: text subtitle tracks inside the MKV come first,
+         * label "<lang>[ <name>][ forced] (MKV)" */
+        unsigned m = 0, t;
+        for (t = 0; t < mr_mkv_strack_count; t++) if (mr_mkv_stracks[t].kind) m++;
+        if (m > MRB_SUB_FILES) m = MRB_SUB_FILES;
+        if (m) {
+            unsigned keep = s2_n + m > MRB_SUB_FILES ? MRB_SUB_FILES - m : s2_n, w = 0;
+            for (i = keep; i-- > 0;) {
+                strcpy(s2_label[i + m], s2_label[i]);
+                strcpy(s2_path[i + m], s2_path[i]);
+                s2_mkv[i + m] = 0;
+            }
+            for (t = 0; t < mr_mkv_strack_count && w < m; t++) {
+                const mr_mkv_strack *st = &mr_mkv_stracks[t];
+                char *l = s2_label[w];
+                if (!st->kind) continue;
+                snprintf(l, 64, "%s", st->lang[0] ? st->lang : "und");
+                if (st->name[0]) { strncat(l, " ", 63 - strlen(l)); strncat(l, st->name, 63 - strlen(l)); }
+                if (st->is_forced && !mrb_sub_is_forced(l)) strncat(l, " forced", 63 - strlen(l));
+                strncat(l, " (MKV)", 63 - strlen(l));
+                s2_path[w][0] = 0;
+                s2_mkv[w] = st->number;
+                w++;
+            }
+            s2_n = keep + m;
+        }
+    }
     return s2_n;
+}
+
+/* v96.84: a subtitle block of the chosen MKV track (mr_mkv.c) */
+static void s2_mkv_block(uint64_t pts_us, uint64_t dur_us, const uint8_t *data,
+                         size_t len, int kind)
+{
+    (void)mrb_sub_add((uint32_t)(pts_us / 1000u), (uint32_t)((pts_us + dur_us) / 1000u),
+                      data, len, kind == MR_MKV_SUB_ASS);
+}
+
+/* Show entry k (1-based, 0 = none): an SRT file or an MKV track.
+ * Returns the number of cues (an MKV track: 1, its cues come while the
+ * film is read). */
+static unsigned s2_activate(const char *film, int k, char *used, size_t used_size)
+{
+    mr_mkv_sub_track = 0;
+    if (k < 1 || (unsigned)k > s2_n) { mrb_sub_clear(); return 0; }
+    if (s2_mkv[k - 1]) {
+        mrb_sub_clear();
+        mr_mkv_sub_cb = s2_mkv_block;
+        mr_mkv_sub_track = s2_mkv[k - 1];
+        if (used && used_size) { strncpy(used, s2_label[k - 1], used_size - 1); used[used_size - 1] = 0; }
+        return 1;
+    }
+    return mrb_sub_load(film, s2_path[k - 1], used, used_size);
 }
 
 static void p54_name(char *dst, size_t size, const char *film);
@@ -2406,7 +2460,7 @@ int main(int argc, char **argv)
             k = s2_n ? s2_choose(&why) : 0;
             if (s2_n && strcmp(why, "auto"))   /* chosen by the user: keep it */
                 s2_used_label = k ? s2_label[k - 1] : "OFF";
-            if (k) n = mrb_sub_load(argv[1], s2_path[k - 1], s1_used, sizeof s1_used);
+            if (k) n = s2_activate(argv[1], k, s1_used, sizeof s1_used);
             /* v96.83: with SRT files the OSD layer is made also for Off,
              * so key S can switch subtitles on while the film plays */
             if (s2_n && mrb_sub_buffers()) {

@@ -45,7 +45,7 @@ includes it in full (MIT licence). MintVID's own README is in
 | Audio | **E-AC3 (Dolby Digital Plus)**, stereo | FFmpeg on CPU1 | stereo PCM over HDMI |
 | Audio | AAC, MP3, MP2, AC3, PCM | Amiga (Paula player by Darren 'boingball' Banfi) | Paula, full screen only ("PiStorm / VC Hard Fullscreen (Paula)", mrberry PAULA) |
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
-| Subtitles | **SRT** (text) | drawn by the Amiga (mrberry) | second picture layer of the Pi above the film, full screen only |
+| Subtitles | **SRT** (file or MKV track), ASS/SSA in MKV as plain text | drawn by the Amiga (mrberry) | second picture layer of the Pi above the film, full screen only |
 
 The Pi 3A+ decodes H.264 up to 1080p at 30 fps (Raspberry Pi product brief).
 For smooth playback use up to 1080p25/30 or 720p up to 60 fps with a moderate
@@ -92,8 +92,9 @@ film.t. Tracks that cannot play with the chosen output are refused (e.g.
 MP3 over HDMI, E-AC3 through Paula, DTS/Opus/FLAC anywhere); a film with
 no HDMI-capable track plays without sound in full screen.
 
-Subtitles (SRT, full screen only): put an SRT file with the film's name
-next to it (`movie.srt`, or `movie.<name>.srt`, e.g. `movie.de_forced.srt`,
+Subtitles (full screen only): text subtitle tracks inside an MKV (SRT, and
+ASS/SSA as plain text) are listed as "<language> ... (MKV)". Or put an SRT
+file with the film's name next to it (`movie.srt`, or `movie.<name>.srt`, e.g. `movie.de_forced.srt`,
 `movie.englisch_CC.srt`). The "Subtitles" chooser in MintVID-pi lists them.
 At the first start the "forced" file in the language of the audio track is
 chosen (else the first forced file, else none); your choice is remembered in
@@ -102,8 +103,13 @@ on a second picture layer of the Pi above the film. Key S switches to the next
 subtitle file while the film plays (Off, 1, 2, ...; the name is shown for two
 seconds), key O switches the subtitles off/on, + and - move them by 0.1 s
 (HDMI sound). SRT files in UTF-8
-or Windows encoding work. Image subtitles (VobSub .idx/.sub) are not supported
-yet. Shell: `mrberry movie.mkv SUB=2`, `SUB=OFF`, `SUB=file.srt`, `NOSUB`.
+or Windows encoding work. Image subtitles (VobSub .idx/.sub, PGS) are not
+supported yet.
+
+Note: the subtitle font has the Latin-1 characters only (Western European
+languages: English, German, French, Spanish, Italian, ... with ä ö ü ß é ñ).
+Other letters - Eastern European (ł č ş ő), Greek, Cyrillic, Asian, Arabic,
+Hebrew - are shown as "?". Shell: `mrberry movie.mkv SUB=2`, `SUB=OFF`, `SUB=file.srt`, `NOSUB`.
 
 Tips:
 
@@ -157,7 +163,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.83
+This builds all runtime files and compares them with the released v96.84
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

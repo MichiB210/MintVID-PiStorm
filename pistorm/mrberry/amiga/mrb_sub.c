@@ -211,6 +211,7 @@ static unsigned parse_srt(char *t)
     return ncues;
 }
 
+static void cue_cap_reset(void);
 /* v96.83: the cues alone (key S loads another file while the film plays;
  * the picture buffers stay) */
 static void clear_cues(void)
@@ -218,6 +219,7 @@ static void clear_cues(void)
     unsigned i;
     for (i = 0; i < ncues; i++) free(cues[i].text);
     free(cues); cues = NULL; ncues = 0;
+    cue_cap_reset();
 }
 
 /* Picture and work buffers, once per film.  1 = ok. */
@@ -600,3 +602,73 @@ int mrb_sub_pick_default(const char labels[][64], unsigned n, const char *lang)
         if (mrb_sub_is_forced(labels[i])) return (int)i + 1;
     return 0;
 }
+
+/* ---- v96.84: subtitle blocks from the MKV while the film plays ---------
+ * text = the block (UTF-8).  ass: Matroska ASS/SSA block
+ * "ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text"; only the
+ * text is used (\N = new line, {...} styling removed). */
+static unsigned cue_cap;
+int mrb_sub_add(uint32_t start_ms, uint32_t end_ms, const uint8_t *data, size_t len, int ass)
+{
+    char *raw, *lat, *p, *d, text[512];
+    size_t tl = 0, i;
+    unsigned pos;
+    if (!data || !len || len > 8192 || ncues >= 20000) return 0;
+    raw = (char *)malloc(len + 1);
+    if (!raw) return 0;
+    memcpy(raw, data, len);
+    raw[len] = 0;
+    p = raw;
+    if (ass) {
+        int commas = 0;
+        while (*p && commas < 8) if (*p++ == ',') commas++;
+        if (commas < 8) p = raw;
+    }
+    /* \N, \n -> new line, \h -> space */
+    for (d = p, i = 0; p[i]; i++) {
+        if (p[i] == '\\' && (p[i + 1] == 'N' || p[i + 1] == 'n')) { *d++ = '\n'; i++; }
+        else if (p[i] == '\\' && p[i + 1] == 'h') { *d++ = ' '; i++; }
+        else if (p[i] == '\r') continue;
+        else *d++ = p[i];
+    }
+    *d = 0;
+    lat = to_latin1((const unsigned char *)p, strlen(p));
+    free(raw);
+    if (!lat) return 0;
+    for (p = lat; p && *p;) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        clean_line(p);
+        if (*p && tl + strlen(p) + 2 < sizeof text) {
+            if (tl) text[tl++] = '\n';
+            memcpy(text + tl, p, strlen(p));
+            tl += strlen(p);
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+    text[tl] = 0;
+    free(lat);
+    if (!tl) return 0;
+    if (end_ms <= start_ms) end_ms = start_ms + 4000;
+    if (ncues == cue_cap || !cues) {
+        unsigned nc = cue_cap ? cue_cap * 2 : 256;
+        mrb_cue *c;
+        if (ncues < cue_cap && cues) nc = cue_cap;
+        c = (mrb_cue *)realloc(cues, nc * sizeof *c);
+        if (!c) return 0;
+        cues = c; cue_cap = nc;
+    }
+    /* sorted by start (blocks come in order; a seek may go back) */
+    pos = ncues;
+    while (pos > 0 && cues[pos - 1].start_ms > start_ms) pos--;
+    if (pos > 0 && cues[pos - 1].start_ms == start_ms &&
+        !strcmp(cues[pos - 1].text, text)) return 0;      /* read twice */
+    memmove(cues + pos + 1, cues + pos, (ncues - pos) * sizeof *cues);
+    cues[pos].start_ms = start_ms;
+    cues[pos].end_ms = end_ms;
+    cues[pos].text = strdup(text);
+    if (!cues[pos].text) { memmove(cues + pos, cues + pos + 1, (ncues - pos) * sizeof *cues); return 0; }
+    ncues++;
+    return 1;
+}
+static void cue_cap_reset(void) { cue_cap = 0; }

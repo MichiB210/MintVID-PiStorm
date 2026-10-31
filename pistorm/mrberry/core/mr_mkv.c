@@ -191,6 +191,14 @@ static void copy_text(char *dst, size_t cap, const uint8_t *src, size_t n)
 
 int (*mr_mkv_audio_usable)(const mr_audio_info *ai);   /* MKA1c */
 
+/* v96.84: subtitle tracks (see mr_mkv_tracks.h) */
+mr_mkv_strack mr_mkv_stracks[MR_MKV_STRACK_MAX];
+unsigned mr_mkv_strack_count;
+uint64_t mr_mkv_sub_track;
+void (*mr_mkv_sub_cb)(uint64_t pts_us, uint64_t dur_us,
+                      const uint8_t *data, size_t len, int kind);
+static uint64_t mkv_block_dur_ticks;    /* BlockDuration of the BlockGroup */
+
 static int track_usable(const mr_mkv_atrack *t)
 {
     return t->supported && (!mr_mkv_audio_usable || mr_mkv_audio_usable(&t->ai));
@@ -226,7 +234,7 @@ static void mkv_pick_audio(mr_mkv *m)
 static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
 {
     size_t pos = 0, codec_len = 0, private_len = 0, lang_len = 0, name_len = 0;
-    uint64_t number = 0, type = 0, duration = 0, flag_default = 1;
+    uint64_t number = 0, type = 0, duration = 0, flag_default = 1, flag_forced = 0;
     const char *codec = NULL;
     const uint8_t *priv = NULL, *lang = NULL, *tname = NULL;
     mr_video_info vi;
@@ -248,9 +256,28 @@ static void parse_track(mr_mkv *m, const uint8_t *p, size_t len)
         else if (e.id == 0x22b59d) { lang = q; lang_len = (size_t)e.size; } /* BCP47 wins */
         else if (e.id == 0x536e) { tname = q; name_len = (size_t)e.size; }
         else if (e.id == 0x88 && e.size <= 8) flag_default = uint_be(q, (size_t)e.size);
+        else if (e.id == 0x55aa && e.size <= 8) flag_forced = uint_be(q, (size_t)e.size);
         pos = (size_t)e.end;
     }
     if (!number || !codec) return;
+    if (type == 0x11 && mr_mkv_strack_count < MR_MKV_STRACK_MAX) {
+        /* v96.84: subtitle track */
+        mr_mkv_strack *t = &mr_mkv_stracks[mr_mkv_strack_count++];
+        memset(t, 0, sizeof *t);
+        t->number = number;
+        t->is_default = flag_default != 0;
+        t->is_forced = flag_forced != 0;
+        copy_text(t->codec, sizeof t->codec, (const uint8_t *)codec, codec_len);
+        if (lang) copy_text(t->lang, sizeof t->lang, lang, lang_len);
+        else strcpy(t->lang, "eng");
+        if (tname) copy_text(t->name, sizeof t->name, tname, name_len);
+        if (codec_is(codec, codec_len, "S_TEXT/UTF8")) t->kind = MR_MKV_SUB_SRT;
+        else if (codec_is(codec, codec_len, "S_TEXT/ASS") ||
+                 codec_is(codec, codec_len, "S_TEXT/SSA") ||
+                 codec_is(codec, codec_len, "S_ASS") ||
+                 codec_is(codec, codec_len, "S_SSA")) t->kind = MR_MKV_SUB_ASS;
+        return;
+    }
     if (type == 1 && !m->video_track) {
         if (codec_is(codec, codec_len, "V_MPEG4/ISO/AVC"))
             vi.fourcc = MR_FOURCC('a','v','c','1');
@@ -381,6 +408,7 @@ static mr_status open_common(mr_mkv *m)
     m->timecode_scale = 1000000;
     mkv_duration_ticks = 0; mr_mkv_duration_us = 0;
     mr_mkv_atrack_count = 0; mr_mkv_audio_chosen = 0;   /* MKA1 */
+    mr_mkv_strack_count = 0;                             /* v96.84 */
     for (pos = segment.payload; pos < segment.end;) {
         if (!elem_at(m, pos, segment.end, &e)) return MR_EFORMAT;
         if (e.id == 0x1f43b675) { m->first_cluster = pos; break; }
@@ -441,6 +469,21 @@ static mr_status emit_block(mr_mkv *m, const ebml_elem *e, mr_packet *pkt)
         nt + 3 > e->size) return MR_EFORMAT;
     rel = (int16_t)(((unsigned)m->packet[nt] << 8) | m->packet[nt + 1]);
     flags = m->packet[nt + 2];
+    if (mr_mkv_sub_track && track == mr_mkv_sub_track && mr_mkv_sub_cb &&
+        !((flags >> 1) & 3)) {
+        /* v96.84: a subtitle block of the chosen track (never laced) */
+        unsigned si;
+        int kind = 0;
+        int64_t st = (int64_t)m->cluster_timecode + rel;
+        if (st < 0) st = 0;
+        for (si = 0; si < mr_mkv_strack_count; si++)
+            if (mr_mkv_stracks[si].number == track) kind = mr_mkv_stracks[si].kind;
+        if (kind)
+            mr_mkv_sub_cb((uint64_t)st * m->timecode_scale / 1000U,
+                          mkv_block_dur_ticks * m->timecode_scale / 1000U,
+                          m->packet + nt + 3, (size_t)e->size - nt - 3, kind);
+        return MR_EAGAIN;
+    }
     if (track != m->video_track && track != m->audio_track) return MR_EAGAIN;
     pos = nt + 3;
     lacing = (flags >> 1) & 3;
@@ -546,10 +589,27 @@ mr_status mr_mkv_next_packet(mr_mkv *m, mr_packet *pkt)
             if (!read_at(m, e.payload, b, (size_t)e.size)) return MR_EFORMAT;
             m->cluster_timecode = uint_be(b, (size_t)e.size);
         } else if (e.id == 0xa3) {
-            mr_status st = emit_block(m, &e, pkt);
+            mr_status st;
+            mkv_block_dur_ticks = 0;
+            st = emit_block(m, &e, pkt);
             if (st != MR_EAGAIN) return st;
         } else if (e.id == 0xa0 && !e.unknown) {
             uint64_t child = e.payload;
+            /* v96.84: BlockDuration (0x9b) of this group (subtitles) */
+            mkv_block_dur_ticks = 0;
+            if (mr_mkv_sub_track) {
+                uint64_t c2 = e.payload;
+                while (c2 < e.end) {
+                    ebml_elem d;
+                    if (!elem_at(m, c2, e.end, &d) || d.unknown || d.end <= c2) break;
+                    if (d.id == 0x9b && d.size <= 8) {
+                        uint8_t b[8];
+                        if (read_at(m, d.payload, b, (size_t)d.size))
+                            mkv_block_dur_ticks = uint_be(b, (size_t)d.size);
+                    }
+                    c2 = d.end;
+                }
+            }
             while (child < e.end) {
                 ebml_elem block;
                 if (!elem_at(m, child, e.end, &block)) return MR_EFORMAT;

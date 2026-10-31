@@ -23,6 +23,8 @@ void mrb_sub_reset(void);
 int mrb_sub_buffers(void);
 void mrb_sub_clear(void);
 void mrb_sub_banner(const char *text);
+/* v96.84: MKV subtitle block -> cue (ass = ASS/SSA block) */
+int mrb_sub_add(uint32_t start_ms, uint32_t end_ms, const uint8_t *data, size_t len, int ass);
 /* S2: several SRT files per film */
 #define MRB_SUB_FILES 16
 int mrb_sub_file_label(const char *base, const char *fname, char *label, size_t size);
