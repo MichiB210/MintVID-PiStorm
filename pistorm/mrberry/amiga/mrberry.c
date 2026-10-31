@@ -265,6 +265,13 @@ static void n76_hlog(const char *s);
  * opens or is clicked.  The library then reports Esc / 0 / close gadget in
  * its sync block (libbase+120, 'P96S', long 18 = byte offset 72). */
 static int v9682_full;                 /* v96.82: F in the video window */
+/* v96.85: Tab / Shift-Tab = next / previous chapter (MKV), without
+ * chapters +/- 10 minutes.  mrberry stops with the target spot in the .t
+ * and status ENDED "Jump"; MintVID-pi starts the film again there. */
+static int s4_dir;                     /* request: +1 / -1 */
+static int s4_check(void);
+static int s4_jump;                    /* stopping for a jump */
+static unsigned long s4_win_fwd, s4_win_back;
 static int p58_switch;
 static int p96w38_window_stop(void)
 {
@@ -277,6 +284,12 @@ static int p96w38_window_stop(void)
     if (mr_berryvp_stream_flags && ((volatile unsigned long *)v)[20] != 0) {
         if (!v9682_full) { v9682_full = 1; p58_switch = 1; n76_hlog("V9682_WINDOW_KEY_F"); }
         return 1;
+    }
+    if (mr_berryvp_stream_flags) {             /* v96.85: Tab in the window */
+        unsigned long f = ((volatile unsigned long *)v)[21];
+        unsigned long b = ((volatile unsigned long *)v)[22];
+        if (f != s4_win_fwd) { s4_win_fwd = f; s4_dir = 1; }
+        if (b != s4_win_back) { s4_win_back = b; s4_dir = -1; }
     }
     return ((volatile unsigned long *)v)[18] != 0;
 }
@@ -309,6 +322,7 @@ static int p05_input_poll_stop(void)
         if (!p96w38_logged) { p96w38_logged = 1; n76_hlog("P96W38_WINDOW_STOP"); }
         return 1;
     }
+    if (s4_dir && s4_check()) return 1;        /* v96.85: Tab in the window */
     if (!p05_input_window || !p05_input_window->UserPort)
         return 0;
 
@@ -322,6 +336,10 @@ static int p05_input_poll_stop(void)
             /* Amiga raw key 0x45 = ESC. Ignore key-up (bit 7 set). */
             if ((code & 0x80u) == 0 && ((code & 0x7fu) == 0x45u))
                 stop = 1;
+            /* v96.86: raw 0x42 = Tab; Shift-Tab arrives only as RAWKEY
+             * (the keymap gives no character for it) */
+            if (code == 0x42u && !(qual & IEQUALIFIER_REPEAT))
+                s4_dir = (qual & (IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT)) ? -1 : 1;
             /* P96W45: raw 0x40 = Space (key down, no auto-repeat) */
             if (code == 0x40u && !(qual & IEQUALIFIER_REPEAT))
                 p45_key_space = 1;
@@ -336,11 +354,15 @@ static int p05_input_poll_stop(void)
             /* O2: O = OSD on/off */
             if ((code == 'o' || code == 'O') && !(qual & IEQUALIFIER_REPEAT))
                 o2_key_osd = 1;
+            /* v96.85: Tab / Shift-Tab = chapter / 10 min jump */
+            if (code == 0x09 && !(qual & IEQUALIFIER_REPEAT))
+                s4_dir = (qual & (IEQUALIFIER_LSHIFT | IEQUALIFIER_RSHIFT)) ? -1 : 1;
             /* v96.83: S = next subtitle file */
             if ((code == 's' || code == 'S') && !(qual & IEQUALIFIER_REPEAT))
                 s3_key = 1;
         }
     }
+    if (!stop && s4_dir && s4_check()) stop = 1;   /* v96.85: Tab */
     return stop;
 }
 
@@ -1392,6 +1414,77 @@ static int s1_now_ms(uint32_t *ms)
     *ms = (uint32_t)film;
     return 1;
 }
+/* v96.85: film time on screen in us (best guess), for Tab */
+static int s4_seek_ok;
+static uint64_t s4_len_us, s4_target_us;
+static uint64_t s4_now_us(void)
+{
+    uint64_t base = p50_t_set ? p50_base_us : 0;
+    uint32_t now = (uint32_t)ac309i_read_sys_us();
+    if (mr_berryvp_stream_flags && g_bvp.lib) {          /* window: frame shown */
+        unsigned long v = *(volatile unsigned long *)((volatile unsigned char *)g_bvp.lib + 120);
+        if (v && ((volatile unsigned long *)v)[0] == 0x50393653UL && ((volatile unsigned long *)v)[5])
+            return ((((uint64_t)((volatile unsigned long *)v)[6]) << 32) |
+                    ((volatile unsigned long *)v)[7]) + base;
+    }
+    if (P67_FREE && g_bvp.lib) {                         /* Paula / no sound */
+        uint32_t cs = (uint32_t)bvp_call_control(g_bvp.lib, P68_CTRL_CLOCKSTART);
+        if (cs && (uint32_t)(now - cs) < 0x7fffffffu) return (uint64_t)(uint32_t)(now - cs) + base;
+    }
+    if (s1_blk && s1_blk[0])                             /* HDMI: Pi audio clock */
+        return ((((uint64_t)s1_blk[1]) << 32) | s1_blk[2]) +
+               (uint64_t)(uint32_t)(now - (uint32_t)s1_blk[3]) + base;
+    if (p54_have_raw)                                    /* last frame read, ~1.5 s ahead */
+        return p54_last_vpts_raw > 1500000u ? p54_last_vpts_raw - 1500000u : 0;
+    return base;
+}
+static int s4_from_gui(void)
+{
+    struct Task *me = FindTask(NULL);
+    return me && me->tc_Node.ln_Name && !strcmp(me->tc_Node.ln_Name, "MintVID-pi player");
+}
+/* 1 = stop now for the jump (target in s4_target_us) */
+static int s4_check(void)
+{
+    int dir = s4_dir;
+    uint64_t now, target;
+    unsigned i;
+    s4_dir = 0;
+    if (s4_jump) return 1;
+    if (!s4_from_gui() || !s4_seek_ok || p79_still) {
+        n76_hlog("S4_TAB_IGNORED (Shell start or no seek)");
+        return 0;
+    }
+    now = s4_now_us();
+    if (mr_mkv_chapter_count) {
+        if (dir > 0) {
+            target = (uint64_t)-1;
+            for (i = 0; i < mr_mkv_chapter_count; i++)
+                if (mr_mkv_chapters_us[i] > now + 2000000u) { target = mr_mkv_chapters_us[i]; break; }
+        } else {
+            target = 0;                                  /* 3 s into a chapter: its start */
+            for (i = 0; i < mr_mkv_chapter_count; i++)
+                if (mr_mkv_chapters_us[i] + 3000000u < now) target = mr_mkv_chapters_us[i];
+        }
+        if (target == (uint64_t)-1) target = now + 600000000u;   /* after the last */
+    } else {
+        target = dir > 0 ? now + 600000000u : (now > 600000000u ? now - 600000000u : 0);
+    }
+    if (s4_len_us && target + 5000000u >= s4_len_us) {
+        n76_hlog("S4_TAB_IGNORED (past the end)");
+        return 0;
+    }
+    s4_target_us = target;
+    s4_jump = 1;
+    p58_switch = 1;                                      /* stop like Ctrl-F, no recap */
+    if (n76_hostlog) {
+        fprintf(n76_hostlog, "S4_TAB dir=%d now_ms=%lu target_ms=%lu chapters=%u\n", dir,
+                (unsigned long)(now / 1000u), (unsigned long)(target / 1000u), mr_mkv_chapter_count);
+        fflush(n76_hostlog);
+    }
+    return 1;
+}
+
 static void s1_tick(void)
 {
     uint32_t ms;
@@ -2278,6 +2371,12 @@ int main(int argc, char **argv)
                          "Could not open media file");
         return 10;
     }
+    s4_seek_ok = mr_demux_can_seek(d);             /* v96.85: Tab */
+    s4_len_us = mr_demux_duration_us(d);
+    if (n76_hostlog && mr_mkv_chapter_count) {
+        fprintf(n76_hostlog, "S4_CHAPTERS=%u\n", mr_mkv_chapter_count);
+        fflush(n76_hostlog);
+    }
     DBG_PRINTF("[D03] before mr_demux_video\n");
     vi = mr_demux_video(d);
     DBG_PRINTF("[D04] after mr_demux_video ptr=%p\n", (void *)vi);
@@ -3097,6 +3196,7 @@ int main(int argc, char **argv)
             p54_stop_us = at;
             p54_have_stop = 1;
         }
+        if (s4_jump) { p54_stop_us = s4_target_us; p54_have_stop = 1; }   /* v96.85 */
     }
     if (s1_on && n76_hostlog) {
         fprintf(n76_hostlog, "S1_STATS shows=%lu hides=%lu offset_ms=%ld clock_replies=%lu\n",
@@ -3130,6 +3230,7 @@ int main(int argc, char **argv)
      * starts the film in full screen at the spot just saved in the .t */
     p06_status_write(P06_STATE_ENDED, "H.264 / VideoCore",
                      p78_pause_stop ? "Paused" : v9682_full ? "Fullscreen" :
+                     s4_jump ? "Jump" :
                      (p79_resume ? "Resume" : (aborted ? "Stopped" : "Finished")));
     n76_hlog(p78_pause_stop ? "P06_STATUS_ENDED_PAUSED" :
              p79_resume ? "P06_STATUS_ENDED_RESUME" :

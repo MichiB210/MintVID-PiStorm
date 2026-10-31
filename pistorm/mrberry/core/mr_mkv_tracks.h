@@ -50,4 +50,10 @@ extern uint64_t mr_mkv_sub_track;
 extern void (*mr_mkv_sub_cb)(uint64_t pts_us, uint64_t dur_us,
                              const uint8_t *data, size_t len, int kind);
 
+/* v96.85: chapter start times (us, sorted) of the first edition, from the
+ * Chapters element before the first cluster. */
+#define MR_MKV_CHAPTER_MAX 256
+extern uint64_t mr_mkv_chapters_us[MR_MKV_CHAPTER_MAX];
+extern unsigned mr_mkv_chapter_count;
+
 #endif

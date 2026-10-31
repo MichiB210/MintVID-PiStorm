@@ -1619,7 +1619,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F (30.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 (31.10.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -21320,7 +21320,7 @@ hdmi_v40o_graphics_name:
         dc.b "graphics.library",0
         even
 hdmi_v40o_window_title:
-        dc.b "MintVID-pi  -  Space = Pause   F = Fullscreen   Esc = Stop",0   ; v96.81: VPr8 keys 1/2/3 are gone
+        dc.b "MintVID-pi  -  Space = Pause   Tab = >>   F = Fullscreen   Esc = Stop",0   ; v96.81: VPr8 keys 1/2/3 are gone
         even
 hdmi_v40o_newwindow:
         dc.w 80,60                       ; LeftEdge, TopEdge
@@ -72840,6 +72840,8 @@ p96w_ac_done:
 ;  76 written by the library: Space presses in the video window (P96W45)
 ;  80 written by the library: F presses in the video window (v96.82,
 ;     MintVID-pi switches to full screen at the same spot)
+;  84 / 88 written by the library: Tab / Shift-Tab presses in the video
+;     window (v96.85: next / previous chapter, else +/- 10 minutes)
 ; ----------------------------------------------------------------------------
 P96W_CLK_CTX         equ $A96C0000
 P96W_CLK_PERIOD_US   equ 200000
@@ -72851,7 +72853,7 @@ P96W_CLK_TIMEOUT_US  equ 1000000
 p96w_clk_open:
         movem.l d0/a0,-(sp)
         lea     p96w_sync,a0
-        moveq   #20,d0
+        moveq   #22,d0
 p96w_co_clr:
         clr.l   (a0)+
         dbra    d0,p96w_co_clr
@@ -73012,6 +73014,8 @@ p96w38_pk_next:
         beq.s   p96w38_pk_stop
         cmpi.w  #$0040,d3              ; P96W45: raw Space, key down
         beq.s   p96w45_pk_space
+        cmpi.w  #$0042,d3              ; v96.86: raw Tab (Shift-Tab comes only raw)
+        beq.w   v9685_pk_tab
         bra.s   p96w38_pk_next
 p96w38_pk_vanilla:
         cmpi.l  #IDCMP_VANILLAKEY,d2
@@ -73022,6 +73026,8 @@ p96w38_pk_vanilla:
         beq.s   p96w38_pk_stop
         cmpi.w  #$0066,d3              ; v96.82: 'f' = full screen
         beq.s   v9682_pk_full
+        cmpi.w  #$0009,d3              ; v96.85: Tab / Shift-Tab
+        beq.s   v9685_pk_tab
         cmpi.w  #$0046,d3              ; 'F'
         beq.s   v9682_pk_full
         cmpi.w  #$0030,d3              ; '0'
@@ -73043,6 +73049,18 @@ v9682_pk_full:
         btst    #25,d3                 ; no key repeat
         bne.w   p96w38_pk_next
         addq.l  #1,p96w_sync+80
+        bra.w   p96w38_pk_next
+v9685_pk_tab:
+        btst    #25,d3                 ; no key repeat
+        bne.w   p96w38_pk_next
+        move.l  d3,d0
+        swap    d0
+        andi.w  #$0003,d0              ; IEQUALIFIER_LSHIFT | RSHIFT
+        bne.s   v9685_pk_back
+        addq.l  #1,p96w_sync+84
+        bra.w   p96w38_pk_next
+v9685_pk_back:
+        addq.l  #1,p96w_sync+88
         bra.w   p96w38_pk_next
 p96w38_pk_done:
         movem.l (sp)+,d0-d3/a0-a2/a6
@@ -73839,7 +73857,7 @@ p96w_ring_pts_lo:     ds.l 16
 p96w_ring_pts_hi:     ds.l 16
 p96w_ring_len:        ds.l 16
 p96w_spin:            ds.l 1
-p96w_sync:            ds.l 21          ; v96.82: +80 fullscreen key count
+p96w_sync:            ds.l 23          ; v96.82: +80 F count; v96.85: +84 Tab, +88 Shift-Tab
         cnop    0,4
 p96w_stage:           ds.b VPV48_FAAD_INPUT_SIZE
 

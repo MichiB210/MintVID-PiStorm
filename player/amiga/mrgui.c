@@ -682,6 +682,7 @@ static int g_paula_paused;
 static int g_still_active;
 static int g_still_resume;
 static int g_full_req;              /* v96.82: F in the video window */
+static int g_tab_req;               /* v96.85: Tab = chapter / 10 min jump */
 static int g_launch_display = -1;   /* display of the last launch */
 static Object *g_mode;              /* P96W59: Display chooser */
 /* MKA1: audio track chooser (MKV).  g_audio_n = tracks of the film,
@@ -1465,6 +1466,11 @@ static void poll_player_status(Object *info, struct Window *window)
     player_status_seq = ps.seq;
     g_player_paused = ps.state == MR_PLAYER_STATE_PLAYING &&
                       !strcmp(ps.text, "Paused");
+    if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Jump")) {
+        g_tab_req = 1;                            /* v96.85: Tab */
+        set_info(info, window, "Jumping...");
+        return;
+    }
     if (ps.state == MR_PLAYER_STATE_ENDED && !strcmp(ps.text, "Fullscreen")) {
         g_full_req = 1;                           /* v96.82: key F */
         set_info(info, window, "Switching to fullscreen...");
@@ -3049,7 +3055,21 @@ int main(void)
                     /* P96W79: read the last status once more - the player may
                      * have written "Paused"/"Resume" and ended in this tick */
                     poll_player_status(info, window);
-                    if (g_full_req) {
+                    if (g_tab_req) {
+                        /* v96.85: Tab - mrberry saved the target in the .t;
+                         * start again there with the same display */
+                        int row = mode_row((mr_display_mode)g_launch_display);
+                        g_tab_req = 0;
+                        g_pos_hold = 0;
+                        g_slider_touched = 0;
+                        if (row >= 0)
+                            mrg_fullscreen_restart(file, mode, c2p, h264, lace, scale,
+                                                   audio_rate, fast_buffer, no_audio,
+                                                   mono_audio, video_mode, info,
+                                                   window, row);
+                        else
+                            mrg_film_info_apply(g_film_path, info, window, 0);
+                    } else if (g_full_req) {
                         /* v96.82: F in the video window -> full screen */
                         int row = mode_row(MR_DISPLAY_PISTORM_HARD_FULLSCREEN);
                         g_full_req = 0;

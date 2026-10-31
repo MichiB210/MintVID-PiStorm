@@ -85,6 +85,11 @@ Paula sound.
 In the PiStorm window: Space pauses, **F** switches to full screen at the
 same spot (when the film was started from MintVID-pi), Esc or 0 stops.
 
+**Tab** jumps to the next chapter of an MKV, **Shift-Tab** back to the start
+of the chapter (or the previous one). Films without chapters jump 10 minutes
+forward / back. Works in full screen and in the window when the film was
+started from MintVID-pi (the film restarts at the new spot).
+
 MKV films with several audio tracks: the "Audio" chooser in MintVID-pi
 lists every track (language, format, name). Without a choice the track
 marked as default in the MKV plays. The chosen track is remembered in
@@ -163,7 +168,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.84
+This builds all runtime files and compares them with the released v96.86
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

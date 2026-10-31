@@ -1,4 +1,4 @@
-# MintVID for PiStorm – BerryVP / BerryCore (v96.84)
+# MintVID for PiStorm – BerryVP / BerryCore (v96.86)
 
 Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry Pi 3A+ / BCM2837):
 
@@ -22,7 +22,7 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (Raspberry
 > **`config.txt` on the SD card must contain `gpu_mem=64`.** The VideoCore
 > needs this memory for hardware decoding. Add the line if it is not there.
 
-This directory holds the complete source of all PiStorm parts of the v96.84 release. The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
+This directory holds the complete source of all PiStorm parts of the v96.86 release. The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
 
 > Deutsch: siehe [unten](#deutsch).
 
@@ -54,12 +54,12 @@ MintVID-pi (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 
 | Part | Directory | Language | Rebuild |
 |---|---|---|---|
-| MintVID-pi GUI | `../player/amiga/mrgui*.c`, `mr_gui_menu.c` | C (68k) | byte-identical to v96.84 |
-| mrberry | `mrberry/` | C (68k) | byte-identical to v96.84 |
+| MintVID-pi GUI | `../player/amiga/mrgui*.c`, `mr_gui_menu.c` | C (68k) | byte-identical to v96.86 |
+| mrberry | `mrberry/` | C (68k) | byte-identical to v96.86 |
 | VPberry (VPr8 P48, old window player, not in the release since v96.76) | `vpberry/` | 68k assembler (vasm) | byte-identical to P35 |
-| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.84 |
+| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.86 |
 | berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
-| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | byte-identical to v96.84 (5.1 mixed down to stereo) |
+| berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | byte-identical to v96.86 (5.1 mixed down to stereo) |
 | berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | Emu68 BerryCore kernel | `emu68_berrycore/` | AArch64 assembler patch | byte-identical to P32 |
 
@@ -78,7 +78,7 @@ Tools (in `PATH`):
 sh pistorm/build_all.sh
 ```
 
-Everything ends up in `pistorm/out/v96.84/`, and each file is compared against `v96.84_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
+Everything ends up in `pistorm/out/v96.86/`, and each file is compared against `v96.86_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
 
 ## Installation (Amiga side)
 
@@ -115,14 +115,16 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68**:
 
 **Untertitel (nur Vollbild):** Text-Untertitel aus der MKV (SRT, ASS/SSA als reiner Text) erscheinen als „<Sprache> … (MKV)“. Oder eine SRT-Datei mit dem Namen des Films daneben legen (`film.srt` oder `film.<Name>.srt`, z. B. `film.de_forced.srt`). Auswahl „Subtitles“ in MintVID-pi; beim ersten Start die forced-Datei in der Sprache der Tonspur, sonst die erste forced, sonst keine; die Wahl wird in der .t gemerkt. Hinweis: Die Untertitel-Schrift hat nur die Latin-1-Zeichen (westeuropäische Sprachen mit ä ö ü ß é ñ …); andere Buchstaben – osteuropäisch (ł č ş ő), Griechisch, Kyrillisch, asiatische Schriften, Arabisch, Hebräisch – erscheinen als „?“. Taste S = nächste Untertitel-Datei während des Films (Off, 1, 2 …; der Name wird 2 s eingeblendet), Taste O = aus/an, +/- = 0,1 s verschieben (HDMI-Ton).
 
+**Tab** = nächstes Kapitel (MKV), **Shift-Tab** = Kapitelanfang bzw. voriges Kapitel; Filme ohne Kapitel springen 10 Minuten vor/zurück. Im Vollbild und im Fenster, wenn der Film aus MintVID-pi gestartet wurde (der Film startet an der neuen Stelle neu).
+
 **Im Fenster:** Leertaste = Pause, **F** = weiter im Vollbild an derselben Stelle (wenn aus MintVID-pi gestartet), Esc oder 0 = Stopp.
 
 **Tipps:** Filme am besten von der SD-Karte starten. Auf einem NTFS-Stick Dateien nicht auf dem Amiga umbenennen (der NTFS-Treiber ist dabei abgestürzt), sondern am PC. Empfohlen ist das Vollbild: dort entschlüsselt und zeigt der Pi das Bild selbst. Im P96-Fenster wird jedes Bild zum Amiga kopiert und von ihm gezeichnet; je nach Auflösung, Datei, enthaltenen Tonspuren und Tonformat (z. B. AC3) läuft die Fenster-Wiedergabe dann nicht immer flüssig.
 
-**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.84/`.
+**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.86/`.
 
 **Ergebnis der Neubauten:**
-- exakt gleich (bytegleich) zum Release v96.84: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und der Emu68-BerryCore-Kern
+- exakt gleich (bytegleich) zum Release v96.86: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und der Emu68-BerryCore-Kern
 - berry_ac3 und berry_eac3 (im Release weiterhin die P35-Dateien) funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
 **Wichtig:** Ohne den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore` gibt es keinen Ton über HDMI. Bild mit Ton über Paula läuft auch mit dem Original-Kern. Den gepatchten Kern gibt es zur Zeit nur für den PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.

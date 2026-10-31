@@ -387,6 +387,49 @@ static void parse_info(mr_mkv *m, const uint8_t *p, size_t len)
     }
 }
 
+/* v96.85: chapters (first EditionEntry; hidden/disabled atoms skipped) */
+uint64_t mr_mkv_chapters_us[MR_MKV_CHAPTER_MAX];
+unsigned mr_mkv_chapter_count;
+static void parse_chapters(const uint8_t *p, size_t len)
+{
+    size_t pos = 0;
+    ebml_elem ed;
+    while (mem_elem(p, len, pos, &ed)) {
+        if (ed.id == 0x45b9) {                    /* EditionEntry */
+            const uint8_t *q = p + ed.payload;
+            size_t qlen = (size_t)ed.size, qp = 0;
+            ebml_elem a;
+            while (mem_elem(q, qlen, qp, &a)) {
+                if (a.id == 0xb6 && mr_mkv_chapter_count < MR_MKV_CHAPTER_MAX) {
+                    const uint8_t *r = q + a.payload;
+                    size_t rlen = (size_t)a.size, rp = 0;
+                    ebml_elem c;
+                    uint64_t start = 0;
+                    int have = 0, hidden = 0, enabled = 1;
+                    while (mem_elem(r, rlen, rp, &c)) {
+                        const uint8_t *v = r + c.payload;
+                        if (c.id == 0x91 && c.size <= 8) { start = uint_be(v, (size_t)c.size); have = 1; }
+                        else if (c.id == 0x98 && c.size <= 8) hidden = uint_be(v, (size_t)c.size) != 0;
+                        else if (c.id == 0x4598 && c.size <= 8) enabled = uint_be(v, (size_t)c.size) != 0;
+                        rp = (size_t)c.end;
+                    }
+                    if (have && !hidden && enabled) {
+                        unsigned i = mr_mkv_chapter_count++;
+                        uint64_t us = start / 1000U;          /* ns -> us */
+                        while (i > 0 && mr_mkv_chapters_us[i - 1] > us) {
+                            mr_mkv_chapters_us[i] = mr_mkv_chapters_us[i - 1]; i--;
+                        }
+                        mr_mkv_chapters_us[i] = us;
+                    }
+                }
+                qp = (size_t)a.end;
+            }
+            return;                                /* first edition only */
+        }
+        pos = (size_t)ed.end;
+    }
+}
+
 static void parse_tracks(mr_mkv *m, const uint8_t *p, size_t len)
 {
     size_t pos = 0; ebml_elem e;
@@ -409,13 +452,15 @@ static mr_status open_common(mr_mkv *m)
     mkv_duration_ticks = 0; mr_mkv_duration_us = 0;
     mr_mkv_atrack_count = 0; mr_mkv_audio_chosen = 0;   /* MKA1 */
     mr_mkv_strack_count = 0;                             /* v96.84 */
+    mr_mkv_chapter_count = 0;                            /* v96.85 */
     for (pos = segment.payload; pos < segment.end;) {
         if (!elem_at(m, pos, segment.end, &e)) return MR_EFORMAT;
         if (e.id == 0x1f43b675) { m->first_cluster = pos; break; }
-        if ((e.id == 0x1549a966 || e.id == 0x1654ae6b) &&
+        if ((e.id == 0x1549a966 || e.id == 0x1654ae6b || e.id == 0x1043a770) &&
             e.size != MKV_UNKNOWN && e.size <= MKV_META_MAX) {
             if (!load(m, e.payload, (size_t)e.size)) return MR_ENOMEM;
             if (e.id == 0x1549a966) parse_info(m, m->scratch, (size_t)e.size);
+            else if (e.id == 0x1043a770) parse_chapters(m->scratch, (size_t)e.size);
             else parse_tracks(m, m->scratch, (size_t)e.size);
         }
         if (e.unknown || e.end <= pos) return MR_EFORMAT;
