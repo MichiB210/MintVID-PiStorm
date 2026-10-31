@@ -60,6 +60,12 @@ static int s1_have_resume;
 static uint32_t s1_resume_sys;
 static long s1_offset_ms;             /* '+'/'-' (HDMI sound): + = later */
 static unsigned long s1_shows, s1_hides;
+/* v96.83: key S in full screen = next subtitle file (Off, 1, 2, ...) */
+static int s3_key;
+static int s3_cur;                    /* 0 = Off, n = file n of s2_* */
+static const char *s3_film;
+static uint32_t s3_banner_until;
+static int s3_banner_on;
 static void s1_after_pause(void)
 {
     s1_resume_sys = (uint32_t)ac309i_read_sys_us();
@@ -330,6 +336,9 @@ static int p05_input_poll_stop(void)
             /* O2: O = OSD on/off */
             if ((code == 'o' || code == 'O') && !(qual & IEQUALIFIER_REPEAT))
                 o2_key_osd = 1;
+            /* v96.83: S = next subtitle file */
+            if ((code == 's' || code == 'S') && !(qual & IEQUALIFIER_REPEAT))
+                s3_key = 1;
         }
     }
     return stop;
@@ -1388,6 +1397,10 @@ static void s1_tick(void)
     uint32_t ms;
     int r;
     if (!s1_on || s1_user_off || !g_bvp.lib) return;
+    if (s3_banner_on) {                       /* v96.83: name of the new file */
+        if ((int32_t)((uint32_t)ac309i_read_sys_us() - s3_banner_until) < 0) return;
+        s3_banner_on = 0;
+    }
     if (!s1_now_ms(&ms)) return;
     r = mrb_sub_tick(ms);
     if (r == MRB_SUB_SHOW) {
@@ -1408,9 +1421,52 @@ static void s1_tick(void)
         s1_hides++;
     }
 }
+/* S2 file list (defined with s2_scan below) */
+static char s2_label[MRB_SUB_FILES][64];
+static char s2_path[MRB_SUB_FILES][512];
+static unsigned s2_n;
+static const char *s2_used_label;
+/* v96.83: S = next subtitle file of the film: Off -> 1 -> 2 ... -> Off.
+ * Its name is shown for 2 s; the choice goes into the .t (S:). */
+static void s3_next_file(void)
+{
+    char t[96];
+    int next;
+    LONG rc;
+    if (!s1_on || !s3_film || !s2_n || !g_bvp.lib) return;
+    next = (s3_cur + 1) % (int)(s2_n + 1);
+    if (next) {
+        if (!mrb_sub_load(s3_film, s2_path[next - 1], NULL, 0)) {
+            /* empty / unreadable file: show it, but nothing to draw */
+            mrb_sub_clear();
+        }
+        snprintf(t, sizeof t, "Subtitles: %s", s2_label[next - 1]);
+        s2_used_label = s2_label[next - 1];
+    } else {
+        mrb_sub_clear();
+        strcpy(t, "Subtitles: Off");
+        s2_used_label = "OFF";
+    }
+    s3_cur = next;
+    s1_user_off = 0;
+    mrb_sub_banner(t);
+    rc = bvp_call_control2(g_bvp.lib, 12, (unsigned long)mrb_sub_pixels());
+    if (rc == 0) {
+        (void)bvp_call_control2(g_bvp.lib, 11, 1);
+        s3_banner_until = (uint32_t)ac309i_read_sys_us() + 2000000u;
+        s3_banner_on = 1;
+    }
+    if (n76_hostlog) {
+        fprintf(n76_hostlog, "S3_KEY_S file=%d of=%u cues=%u rc=%ld\n",
+                next, s2_n, mrb_sub_count(), (long)rc);
+        fflush(n76_hostlog);
+    }
+}
+
 static void p70_apply_keys(void)
 {
     long d;
+    if (s3_key) { s3_key = 0; s3_next_file(); }
     s1_tick();
     if (o2_key_osd && s1_on) {
         /* S1: key O = subtitles off / on */
@@ -2351,6 +2407,13 @@ int main(int argc, char **argv)
             if (s2_n && strcmp(why, "auto"))   /* chosen by the user: keep it */
                 s2_used_label = k ? s2_label[k - 1] : "OFF";
             if (k) n = mrb_sub_load(argv[1], s2_path[k - 1], s1_used, sizeof s1_used);
+            /* v96.83: with SRT files the OSD layer is made also for Off,
+             * so key S can switch subtitles on while the film plays */
+            if (s2_n && mrb_sub_buffers()) {
+                s3_film = argv[1];
+                s3_cur = n ? k : 0;
+                if (!n) { n = 1; strcpy(s1_used, "(off - key S)"); }
+            }
             if (n76_hostlog) {
                 fprintf(n76_hostlog, "S2_SUBS files=%u chosen=%d why=%s lang=%s\n",
                         s2_n, k, why, s2_audio_lang());
@@ -2368,7 +2431,7 @@ int main(int argc, char **argv)
             o1_block[7] = 0;
             mr_berryvp_osd_req = o1_block;
             s1_on = 1;
-            printf("Subtitles: %s (%u).\n", s1_used, n);
+            printf("Subtitles: %s (%u).\n", s1_used, mrb_sub_count());
         }
         if (n76_hostlog) {
             fprintf(n76_hostlog, "S1_SRT cues=%u file=%s\n", n, s1_used);

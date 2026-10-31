@@ -98,8 +98,10 @@ next to it (`movie.srt`, or `movie.<name>.srt`, e.g. `movie.de_forced.srt`,
 At the first start the "forced" file in the language of the audio track is
 chosen (else the first forced file, else none); your choice is remembered in
 film.t. The text is drawn by the Amiga (white, black outline, up to two lines)
-on a second picture layer of the Pi above the film. Key O switches the
-subtitles off/on, + and - move them by 0.1 s (HDMI sound). SRT files in UTF-8
+on a second picture layer of the Pi above the film. Key S switches to the next
+subtitle file while the film plays (Off, 1, 2, ...; the name is shown for two
+seconds), key O switches the subtitles off/on, + and - move them by 0.1 s
+(HDMI sound). SRT files in UTF-8
 or Windows encoding work. Image subtitles (VobSub .idx/.sub) are not supported
 yet. Shell: `mrberry movie.mkv SUB=2`, `SUB=OFF`, `SUB=file.srt`, `NOSUB`.
 
@@ -155,7 +157,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.82
+This builds all runtime files and compares them with the released v96.83
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

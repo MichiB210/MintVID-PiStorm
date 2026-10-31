@@ -211,11 +211,38 @@ static unsigned parse_srt(char *t)
     return ncues;
 }
 
-void mrb_sub_free(void)
+/* v96.83: the cues alone (key S loads another file while the film plays;
+ * the picture buffers stay) */
+static void clear_cues(void)
 {
     unsigned i;
     for (i = 0; i < ncues; i++) free(cues[i].text);
     free(cues); cues = NULL; ncues = 0;
+}
+
+/* Picture and work buffers, once per film.  1 = ok. */
+int mrb_sub_buffers(void)
+{
+    if (pix) return 1;
+    pix = (uint8_t *)calloc((size_t)MRB_SUB_W * MRB_SUB_H, 4u);
+    fillA = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
+    tmp1 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
+    tmp2 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
+    tmp3 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
+    if (!pix || !fillA || !tmp1 || !tmp2 || !tmp3) { mrb_sub_free(); return 0; }
+    return 1;
+}
+
+/* v96.83: no subtitles any more (key S -> Off) */
+void mrb_sub_clear(void)
+{
+    clear_cues();
+    if (shown != -1) shown = -2;      /* something may be on screen: hide */
+}
+
+void mrb_sub_free(void)
+{
+    clear_cues();
     free(pix); pix = NULL;
     free(fillA); free(tmp1); free(tmp2); free(tmp3);
     fillA = tmp1 = tmp2 = tmp3 = NULL;
@@ -244,7 +271,8 @@ unsigned mrb_sub_load(const char *film, const char *explicit_name, char *used, s
     long len;
     unsigned char *raw;
     char *txt;
-    mrb_sub_free();
+    clear_cues();
+    shown = -2;                       /* v96.83: next tick decides */
     if (explicit_name && *explicit_name) {
         strncpy(name, explicit_name, sizeof name - 1);
         name[sizeof name - 1] = 0;
@@ -267,12 +295,7 @@ unsigned mrb_sub_load(const char *film, const char *explicit_name, char *used, s
     parse_srt(txt);
     free(txt);
     if (!ncues) return 0;
-    pix = (uint8_t *)calloc((size_t)MRB_SUB_W * MRB_SUB_H, 4u);
-    fillA = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
-    tmp1 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
-    tmp2 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
-    tmp3 = (uint8_t *)malloc((size_t)MRB_SUB_W * MRB_SUB_H);
-    if (!pix || !fillA || !tmp1 || !tmp2 || !tmp3) { mrb_sub_free(); return 0; }
+    if (!mrb_sub_buffers()) return 0;
     return ncues;
 }
 
@@ -450,7 +473,12 @@ static int find_cue(uint32_t ms)
 int mrb_sub_tick(uint32_t film_ms)
 {
     int c;
-    if (!ncues || !pix) return MRB_SUB_KEEP;
+    if (!pix) return MRB_SUB_KEEP;
+    if (!ncues) {                     /* v96.83: Off - clear what is shown */
+        if (shown == -1) return MRB_SUB_KEEP;
+        shown = -1;
+        return MRB_SUB_HIDE;
+    }
     c = find_cue(film_ms);
     if (c == shown) return MRB_SUB_KEEP;
     shown = c;
@@ -462,6 +490,14 @@ int mrb_sub_tick(uint32_t film_ms)
 const char *mrb_sub_text(int i) { return (i >= 0 && (unsigned)i < ncues) ? cues[i].text : ""; }
 int mrb_sub_shown(void) { return shown; }
 void mrb_sub_reset(void) { shown = -1; }
+/* v96.83: draw a short message (e.g. the new subtitle file) in the
+ * subtitle picture; the next tick after it replaces or hides it. */
+void mrb_sub_banner(const char *text)
+{
+    if (!pix) return;
+    draw_cue(text);
+    shown = -2;
+}
 
 /* ---- S2: several SRT files per film ------------------------------------ */
 static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
