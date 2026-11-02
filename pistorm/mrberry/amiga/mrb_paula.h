@@ -45,6 +45,8 @@ void        mrb_paula_set_offset(mrb_paula *p, int32_t offset_us);
 
 /* Pause or continue sound and the audio clock. */
 void mrb_paula_pause(mrb_paula *p, int paused);
+/* v96.87: key M - mute (Paula volume 0, else 64) */
+void mrb_paula_set_mute(mrb_paula *p, int mute);
 
 /* Nothing left to decode or play. */
 int  mrb_paula_idle(mrb_paula *p);

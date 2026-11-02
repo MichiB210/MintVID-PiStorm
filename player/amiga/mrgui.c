@@ -721,6 +721,9 @@ typedef struct {
     int subs, sub_chosen;
     char sub_label[16][64];
     int sub_forced[16];
+    /* v96.87: AUDIO_HAS= / AUDIO_PAULA= / AUDIO_NAME= / AUDIO_WHY= */
+    int audio_known, audio_has, audio_paula;
+    char audio_name[48], audio_why[64];
 } mrg_film_info;
 
 static ULONG mrg_hms_to_s(const char *t)
@@ -816,6 +819,10 @@ static int mrg_film_info_read(const char *path, mrg_film_info *fi)
             else if (!strcmp(line, "RESUME_A")) mrg_copy_field(fi->resume_a, sizeof fi->resume_a, eq);
             else if (!strcmp(line, "RESUME_P")) { fi->resume_p = strtol(eq, NULL, 10); fi->have_resume_p = 1; }
             else if (!strcmp(line, "AUDIO_TRACKS")) fi->tracks = atoi(eq);
+            else if (!strcmp(line, "AUDIO_HAS")) { fi->audio_known = 1; fi->audio_has = *eq == '1'; }
+            else if (!strcmp(line, "AUDIO_PAULA")) fi->audio_paula = *eq == '1';
+            else if (!strcmp(line, "AUDIO_NAME")) mrg_copy_field(fi->audio_name, sizeof fi->audio_name, eq);
+            else if (!strcmp(line, "AUDIO_WHY")) mrg_copy_field(fi->audio_why, sizeof fi->audio_why, eq);
             else if (!strcmp(line, "SUBS")) fi->subs = atoi(eq);              /* S2 */
             else if (!strcmp(line, "SUB_CHOSEN")) fi->sub_chosen = atoi(eq);
             else if (!strncmp(line, "SUB", 3) && line[3] >= '1' && line[3] <= '9') {
@@ -920,11 +927,49 @@ static mrg_film_info g_fi;
 static int g_fi_valid;
 static long g_live_fine;
 static int mrg_paula_selected(void);
+/* v96.87: MintVID-pi refuses a film whose sound cannot play with the
+ * chosen display (DTS, Opus, FLAC; MP3/MP2/PCM over HDMI; E-AC3 over
+ * Paula; several tracks and none fits).  A film with no audio track at all
+ * plays without sound.  Returns NULL = OK, else the hint text. */
+static const char *mrg_audio_refuse(const mrg_film_info *fi, int paula)
+{
+    static char t[160];
+    const char *nm;
+    int ok, other;
+    if (!fi->audio_known || !fi->audio_has) return NULL;
+    ok = paula ? fi->audio_paula : !strcmp(fi->sound, "HDMI");
+    if (ok) return NULL;
+    other = paula ? !strcmp(fi->sound, "HDMI") : fi->audio_paula;
+    nm = fi->audio_name[0] ? fi->audio_name : "?";
+    if (fi->tracks > 1)
+        snprintf(t, sizeof t, "Not playable: none of the %d audio tracks (%s) %s%s",
+                 fi->tracks, nm, paula ? "plays with Paula" : "plays over HDMI",
+                 other ? (paula ? " - choose HDMI" : " - choose Paula") : "");
+    else if (!paula && fi->audio_why[0] && !strstr(fi->audio_why, "only through"))
+        snprintf(t, sizeof t, "Not playable over HDMI: %s - %s%s", nm, fi->audio_why,
+                 other ? " - choose Paula" : "");
+    else if (other)
+        snprintf(t, sizeof t, "Not playable: audio format %s does not play %s - choose %s",
+                 nm, paula ? "with Paula" : "over HDMI", paula ? "HDMI" : "Paula");
+    else
+        snprintf(t, sizeof t, "Not playable: audio format %s is not supported", nm);
+    return t;
+}
+
 static void mrg_sound_line(Object *info, struct Window *window)
 {
     static char l2[200];
     char snd[64];
+    const char *no;
     if (!g_fi_valid || !g_fi.playable) return;
+    no = mrg_audio_refuse(&g_fi, mrg_paula_selected());
+    if (no) { set_info(info, window, no); return; }
+    if (g_fi.audio_known && !g_fi.audio_has) {
+        snprintf(l2, sizeof l2, "No audio track - plays without sound%s",
+                 g_fi.have_resume ? " | saved" : "");
+        set_info(info, window, l2);
+        return;
+    }
     if (mrg_paula_selected()) {
         if (g_fi.audio[0] && !strstr(g_fi.audio, "E-AC")) {
             long base = mr_paula_pref_load();     /* P96W73: menu value */
@@ -1577,6 +1622,7 @@ static int mrg_args_append_time(char *args, size_t cap, const char *path)
     return mrg_args_append(args, cap, t);
 }
 
+static int g_start_silent;            /* v96.87: film has no audio track */
 static void start_player_path(const char *full_file, Object *mode,
                               Object *c2p, Object *h264,
                               Object *lace, Object *scale,
@@ -1614,6 +1660,26 @@ static void start_player_path(const char *full_file, Object *mode,
     g_paula_paused = 0;
 
     if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN ||
+        options.display == MR_DISPLAY_PISTORM_PAULA ||
+        options.display == MR_DISPLAY_PISTORM_HARD_WINDOW) {
+        /* v96.87: refuse films MintVID-pi cannot play (picture or sound) */
+        static mrg_film_info cf;
+        const mrg_film_info *f = NULL;
+        const char *no;
+        if (g_fi_valid && !strcmp(path, g_film_path)) f = &g_fi;
+        else if (mrg_film_info_read(path, &cf)) f = &cf;
+        if (f && !f->playable) {
+            static char t[160];
+            snprintf(t, sizeof t, "Not playable: %s", f->reason[0] ? f->reason : "unknown");
+            set_info(info, window, t);
+            return;
+        }
+        no = f ? mrg_audio_refuse(f, options.display == MR_DISPLAY_PISTORM_PAULA) : NULL;
+        if (no) { set_info(info, window, no); return; }
+        g_start_silent = f && f->audio_known && !f->audio_has;
+    }
+
+    if (options.display == MR_DISPLAY_PISTORM_HARD_FULLSCREEN ||
         options.display == MR_DISPLAY_PISTORM_PAULA) {
         /* PiStorm06: discard the previous child's terminal snapshot before
          * launching a new one and reset the GUI sequence latch. */
@@ -1645,7 +1711,9 @@ static void start_player_path(const char *full_file, Object *mode,
             UnLoadSeg(seglist);
             set_info(info, window, "Could not create the mrberry process.");
         } else {
-            set_info(info, window, options.display == MR_DISPLAY_PISTORM_PAULA ?
+            set_info(info, window, g_start_silent ?
+                     "Starting PiStorm playback - no audio track, plays without sound..." :
+                     options.display == MR_DISPLAY_PISTORM_PAULA ?
                      "Starting PiStorm playback, sound through Paula (+/- = sound offset)..." :
                      "Starting PiStorm VideoCore playback...");
         }
@@ -1686,7 +1754,9 @@ static void start_player_path(const char *full_file, Object *mode,
             UnLoadSeg(seglist);
             set_info(info, window, "Could not create the mrberry process.");
         } else {
-            set_info(info, window, "Starting PiStorm window playback (W:50)...");
+            set_info(info, window, g_start_silent ?
+                     "Starting PiStorm window playback - no audio track, without sound..." :
+                     "Starting PiStorm window playback (W:50)...");
         }
         return;
     }

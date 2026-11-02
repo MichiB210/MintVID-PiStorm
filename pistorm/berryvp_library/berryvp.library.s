@@ -66,6 +66,7 @@ BVP_CTRL_TIMESHIFT    equ 6      ; P96W47: D1 = us the caller paused
 BVP_CTRL_CLOCKSTART   equ 7      ; CLK81: D0 = Pi timer when the free clock started (0 = none)
 BVP_CTRL_FORCEISP     equ 8      ; ISP82: D1 = 1 cinema always via ISP (test), 0 = normal
 BVP_CTRL_OSD          equ 10     ; O1: D1 = OSD request block (test), 0 = none
+BVP_CTRL_MUTE         equ 14     ; v96.87: D1 = 1 HDMI sound muted (PCM zeros, clock runs), 0 = on
 BVP_CTRL_OSDCLOCK     equ 13     ; S1: D1 = 1 query the Pi clock ~1/s; D0 = clock block
 BVP_CTRL_OSDPIC       equ 12     ; O3: D1 = new RGBA picture (same w x h) while the film plays
 BVP_CTRL_OSDSHOW      equ 11     ; O2: D1 = 1 show OSD, 0 hide (while the film plays)
@@ -623,6 +624,8 @@ BVP_Control:
         beq.w   BVP_CTL_OsdPic
         cmpi.l  #BVP_CTRL_OSDCLOCK,d0
         beq.w   BVP_CTL_OsdClock
+        cmpi.l  #BVP_CTRL_MUTE,d0
+        beq.w   BVP_CTL_Mute
         moveq   #BVPERR_UNSUPPORTED,d0
         move.l  d0,BVP_LAST_ERROR(a6)
         rts
@@ -707,6 +710,11 @@ BVP_CTL_OsdNo:
 ; the window clock queries) and keeps the last answer in s1_block:
 ;   +0 replies  +4 media time hi  +8 media time lo (us)  +12 Pi timer of the
 ;   sample  +16 queries  +20 lost/failed
+; v96.87: mute.  The PCM keeps flowing to audio_render (its clock is the
+; master), only zeros are copied into the DMA slot instead of the sound.
+BVP_CTL_Mute:
+        move.l  d1,m1_mute
+        bra.w   BVP_CTL_OK
 BVP_CTL_OsdClock:
         tst.l   o1_ok                     ; only with a working OSD layer
         bne.s   s1_ctl_ok
@@ -1619,7 +1627,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 (31.10.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 M N88 (02.11.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -21320,7 +21328,7 @@ hdmi_v40o_graphics_name:
         dc.b "graphics.library",0
         even
 hdmi_v40o_window_title:
-        dc.b "MintVID-pi  -  Space = Pause   Tab = >>   F = Fullscreen   Esc = Stop",0   ; v96.81: VPr8 keys 1/2/3 are gone
+        dc.b "MintVID-pi  -  Space = Pause   Tab = >>   M = Mute   F = Fullscreen   Esc = Stop",0   ; v96.81: VPr8 keys 1/2/3 are gone
         even
 hdmi_v40o_newwindow:
         dc.w 80,60                       ; LeftEdge, TopEdge
@@ -50052,11 +50060,24 @@ n79p_setup_graph_router:
         ; the ISP, which upscales them to fit 1920x1080; the HVS then
         ; only shows 1:1 or downscales, which is always clean.
         cmpi.l  #-1,n84_isp_out          ; N84 test: no N83 upscale
-        beq.s   n83_router_size_ok
-        cmpi.l  #1280,v6_src_visible_w
-        bcs.s   n83_router_up
-        cmpi.l  #720,v6_src_visible_h
-        bcc.s   n83_router_size_ok
+        beq.w   n83_router_size_ok
+        ; v96.88: limits = 1280x720, but never more than the screen (HDMI
+        ; 1280x1024: Coachman, green lines when 1920x1080 was shrunk again)
+        jsr     o2_read_display_size
+        move.l  o2_disp_w,d0
+        cmpi.l  #1280,d0
+        bls.s   n88_router_w
+        move.l  #1280,d0
+n88_router_w:
+        cmp.l   v6_src_visible_w,d0
+        bhi.s   n83_router_up            ; film narrower than the limit
+        move.l  o2_disp_h,d0
+        cmpi.l  #720,d0
+        bls.s   n88_router_h
+        move.l  #720,d0
+n88_router_h:
+        cmp.l   v6_src_visible_h,d0
+        bls.w   n83_router_size_ok
 n83_router_up:
         ; N84: films much wider than 16:9 (more than 2 %, e.g. cinema
         ; format) are not upscaled for now - old N79J/direct path as P96W31.
@@ -51443,7 +51464,7 @@ v12a_setup_done:
 ; all values <= 2048, quotients <= 1920).
 ; ====================================================================
 n83_calc_out:
-        movem.l d0-d4,-(sp)
+        movem.l d0-d6,-(sp)
         move.l  n84_isp_out,d0           ; N84 test: fixed output size
         beq.s   n84_calc_auto
         move.l  d0,d4
@@ -51453,32 +51474,64 @@ n83_calc_out:
         andi.l  #$FFFF,d1                ; H
         bra     n83_calc_store
 n84_calc_auto:
+        ; v96.88: the box is the real screen (o2_read_display_size, called
+        ; by the router), at most 1920x1080.  Before: always 1920x1080, and
+        ; on a 1280x1024 monitor the HVS then shrank it = green/black lines.
+        move.l  o2_disp_w,d5             ; box W
+        move.l  o2_disp_h,d6             ; box H
+        cmpi.l  #1920,d5
+        bhi.s   n88_box_hd
+        cmpi.l  #1080,d6
+        bls.s   n88_box_ok
+n88_box_hd:
+        move.l  #1920,d5
+        move.l  #1080,d6
+n88_box_ok:
         move.l  v12a_dec_crop_w,d2       ; W
         move.l  v12a_dec_crop_h,d3       ; H
         tst.l   d2
-        beq.s   n83_calc_full
+        beq.w   n83_calc_full
         tst.l   d3
-        beq.s   n83_calc_full
+        beq.w   n83_calc_full
         move.l  d2,d0
-        mulu.w  #1080,d0                 ; W*1080
+        mulu.w  d6,d0                    ; W*boxH
         move.l  d3,d1
-        mulu.w  #1920,d1                 ; H*1920
+        mulu.w  d5,d1                    ; H*boxW
         cmp.l   d1,d0
         bcs.s   n83_calc_tall
+        ; v96.88: film wider than the screen by more than 2 % (16:9 film on
+        ; a 5:4 / 4:3 screen): full screen width, height = H*boxW/W (even)
+        move.l  d1,d4
+        divu.w  #50,d4
+        andi.l  #$FFFF,d4
+        add.l   d1,d4                    ; H*boxW * 1.02
+        cmp.l   d4,d0
+        bls.s   n88_calc_box
+        move.l  d1,d0
+        add.l   d2,d0                    ; + W (round to nearest even)
+        move.l  d2,d1
+        add.l   d1,d1                    ; 2W
+        divu.w  d1,d0
+        andi.l  #$FFFF,d0
+        add.l   d0,d0
+        move.l  d0,d1                    ; height
+        move.l  d5,d4                    ; width = box W
+        bra.s   n83_calc_round
+n88_calc_box:
         ; N84: 16:9 or up to 2 % wider (the router sends wider films the old
         ; way): exactly 1920x1080.  N83 used H*1920/W (720x404 -> 1076 lines)
         ; and the renderer then stretched it to 1080 lines in the HVS, which
         ; draws green stripes.  The ISP stretches by <= 2 % instead (clean,
         ; looks the same as before - the renderer filled the screen anyway).
-        move.l  #1920,d4
-        move.l  #1080,d1
+        move.l  d5,d4                    ; v96.88: exactly the box
+        move.l  d6,d1
         bra.s   n83_calc_round
 n83_calc_tall:
-        ; narrower: height 1080, width = W*1080/H
+        ; narrower: height = box H, width = W*boxH/H
         divu.w  d3,d0
         andi.l  #$FFFF,d0
         move.l  d0,d4
-        move.l  #1080,d1
+        move.l  d6,d1
 n83_calc_round:
         add.l   #64,d4                   ; nearest multiple of 128
         andi.l  #$FFFFFF80,d4
@@ -51486,9 +51539,10 @@ n83_calc_round:
         bcc.s   n83_calc_wmin
         move.l  #128,d4
 n83_calc_wmin:
-        cmpi.l  #1920,d4
+        cmp.l   d5,d4                    ; v96.88: not wider than the box
         bls.s   n83_calc_wmax
-        move.l  #1920,d4
+        move.l  d5,d4
+        andi.l  #$FFFFFF80,d4
 n83_calc_wmax:
         andi.l  #$FFFFFFFE,d1            ; even height
         cmpi.l  #16,d1
@@ -51497,8 +51551,9 @@ n83_calc_wmax:
 n83_calc_hmin:
         bra.s   n83_calc_store
 n83_calc_full:
-        move.l  #1920,d4
-        move.l  #1080,d1
+        move.l  d5,d4                    ; v96.88: the box
+        move.l  d6,d1
+        bra.w   n83_calc_round
 n83_calc_store:
         move.l  d4,port_video_width
         move.l  d4,port_crop_width
@@ -51517,7 +51572,7 @@ n83_calc_store:
         move.l  port_crop_height,d0
         lea     n83_pfx_h,a1
         jsr     n15_log_hex32
-        movem.l (sp)+,d0-d4
+        movem.l (sp)+,d0-d6
         rts
 
 ; ====================================================================
@@ -66316,10 +66371,18 @@ vpv47_load_slot1:
         move.l  vpv47_pcm1_pagelist_ptr,a2
 vpv47_load_have_slot:
         move.l  d5,d1
+        tst.l   m1_mute                   ; v96.87: muted -> silence
+        bne.s   m1_load_zero
 vpv47_load_copy:
         move.b  (a1)+,(a0)+
         subq.l  #1,d1
         bne.s   vpv47_load_copy
+        bra.s   m1_load_done
+m1_load_zero:
+        clr.b   (a0)+
+        subq.l  #1,d1
+        bne.s   m1_load_zero
+m1_load_done:
 
         move.l  a2,a0
         move.l  d5,d0
@@ -72269,6 +72332,7 @@ o3_dead:                     ds.l 1
 o3_max_us:                   ds.l 1
 o3_total_us:                 ds.l 1
 o3_t0:                       ds.l 1
+m1_mute:                     ds.l 1   ; v96.87: HDMI sound muted
 s1_enabled:                  ds.l 1
 s1_pending:                  ds.l 1
 s1_started:                  ds.l 1
@@ -72842,6 +72906,7 @@ p96w_ac_done:
 ;     MintVID-pi switches to full screen at the same spot)
 ;  84 / 88 written by the library: Tab / Shift-Tab presses in the video
 ;     window (v96.85: next / previous chapter, else +/- 10 minutes)
+;  92 written by the library: M presses in the video window (v96.87 mute)
 ; ----------------------------------------------------------------------------
 P96W_CLK_CTX         equ $A96C0000
 P96W_CLK_PERIOD_US   equ 200000
@@ -72853,7 +72918,7 @@ P96W_CLK_TIMEOUT_US  equ 1000000
 p96w_clk_open:
         movem.l d0/a0,-(sp)
         lea     p96w_sync,a0
-        moveq   #22,d0
+        moveq   #23,d0
 p96w_co_clr:
         clr.l   (a0)+
         dbra    d0,p96w_co_clr
@@ -73028,6 +73093,10 @@ p96w38_pk_vanilla:
         beq.s   v9682_pk_full
         cmpi.w  #$0009,d3              ; v96.85: Tab / Shift-Tab
         beq.s   v9685_pk_tab
+        cmpi.w  #$006D,d3              ; v96.87: 'm' = mute
+        beq.s   v9687_pk_mute
+        cmpi.w  #$004D,d3              ; 'M'
+        beq.s   v9687_pk_mute
         cmpi.w  #$0046,d3              ; 'F'
         beq.s   v9682_pk_full
         cmpi.w  #$0030,d3              ; '0'
@@ -73061,6 +73130,11 @@ v9685_pk_tab:
         bra.w   p96w38_pk_next
 v9685_pk_back:
         addq.l  #1,p96w_sync+88
+        bra.w   p96w38_pk_next
+v9687_pk_mute:
+        btst    #25,d3                 ; no key repeat
+        bne.w   p96w38_pk_next
+        addq.l  #1,p96w_sync+92
         bra.w   p96w38_pk_next
 p96w38_pk_done:
         movem.l (sp)+,d0-d3/a0-a2/a6
@@ -73857,7 +73931,7 @@ p96w_ring_pts_lo:     ds.l 16
 p96w_ring_pts_hi:     ds.l 16
 p96w_ring_len:        ds.l 16
 p96w_spin:            ds.l 1
-p96w_sync:            ds.l 23          ; v96.82: +80 F count; v96.85: +84 Tab, +88 Shift-Tab
+p96w_sync:            ds.l 24          ; v96.82: +80 F; v96.85: +84 Tab, +88 Shift-Tab; v96.87: +92 M
         cnop    0,4
 p96w_stage:           ds.b VPV48_FAAD_INPUT_SIZE
 

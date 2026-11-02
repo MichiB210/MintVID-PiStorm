@@ -272,6 +272,11 @@ static int s4_dir;                     /* request: +1 / -1 */
 static int s4_check(void);
 static int s4_jump;                    /* stopping for a jump */
 static unsigned long s4_win_fwd, s4_win_back;
+/* v96.87: M = mute on/off (window: count at P96S long 23, +92) */
+static int m1_key;
+static int m1_muted;
+static unsigned long m1_win;
+static int m1_win_seen;
 static int p58_switch;
 static int p96w38_window_stop(void)
 {
@@ -290,6 +295,11 @@ static int p96w38_window_stop(void)
         unsigned long b = ((volatile unsigned long *)v)[22];
         if (f != s4_win_fwd) { s4_win_fwd = f; s4_dir = 1; }
         if (b != s4_win_back) { s4_win_back = b; s4_dir = -1; }
+        {
+            unsigned long mm = ((volatile unsigned long *)v)[23];
+            if (!m1_win_seen) { m1_win_seen = 1; m1_win = mm; }
+            if (mm != m1_win) { m1_win = mm; m1_key = 1; }
+        }
     }
     return ((volatile unsigned long *)v)[18] != 0;
 }
@@ -360,6 +370,9 @@ static int p05_input_poll_stop(void)
             /* v96.83: S = next subtitle file */
             if ((code == 's' || code == 'S') && !(qual & IEQUALIFIER_REPEAT))
                 s3_key = 1;
+            /* v96.87: M = mute on/off */
+            if ((code == 'm' || code == 'M') && !(qual & IEQUALIFIER_REPEAT))
+                m1_key = 1;
         }
     }
     if (!stop && s4_dir && s4_check()) stop = 1;   /* v96.85: Tab */
@@ -1556,10 +1569,34 @@ static void s3_next_file(void)
     }
 }
 
+/* v96.87: M = mute.  HDMI: the library sends zeros instead of the sound
+ * (the Pi audio clock keeps running, picture timing stays the same).
+ * Paula: volume 0 / 64.  With subtitles (OSD) a short banner is shown. */
+static void m1_toggle(void)
+{
+    LONG rc = -1;
+    m1_muted = !m1_muted;
+    if (p67_pa) mrb_paula_set_mute(p67_pa, m1_muted);
+    else if (g_bvp.lib) rc = bvp_call_control2(g_bvp.lib, 14, m1_muted ? 1UL : 0UL);
+    if (s1_on && !s1_user_off && g_bvp.lib) {
+        mrb_sub_banner(m1_muted ? "Mute" : "Sound on");
+        if (bvp_call_control2(g_bvp.lib, 12, (unsigned long)mrb_sub_pixels()) == 0) {
+            (void)bvp_call_control2(g_bvp.lib, 11, 1);
+            s3_banner_until = (uint32_t)ac309i_read_sys_us() + 2000000u;
+            s3_banner_on = 1;
+        }
+    }
+    if (n76_hostlog) {
+        fprintf(n76_hostlog, "M1_KEY_M mute=%d paula=%d rc=%ld\n", m1_muted, p67_pa != NULL, (long)rc);
+        fflush(n76_hostlog);
+    }
+}
+
 static void p70_apply_keys(void)
 {
     long d;
     if (s3_key) { s3_key = 0; s3_next_file(); }
+    if (m1_key) { m1_key = 0; m1_toggle(); }
     s1_tick();
     if (o2_key_osd && s1_on) {
         /* S1: key O = subtitles off / on */
@@ -2068,10 +2105,33 @@ static int p56_info(const char *film)
         printf("AUDIO_RATE=%lu\nAUDIO_CH=%u\n",
                (unsigned long)ai->sample_rate, (unsigned)ai->channels);
         if (mka_hdmi_ok(ai, &why)) sound = "HDMI";
-        else if (ai->format_tag == MR_AUDIO_FORMAT_AAC || ai->format_tag == MR_AUDIO_FORMAT_EAC3)
-            reason = reason ? reason : why;     /* as before MKA1: these stop the film */
+        else if (why) printf("AUDIO_WHY=%s\n", why);
+        /* v96.87: the sound is no longer a REASON here - MintVID-pi decides
+         * with AUDIO_HAS / AUDIO_PAULA / SOUND for the chosen display */
     }
     printf("SOUND=%s\n", sound);
+    {
+        /* v96.87: AUDIO_HAS = the film has any audio track (also one we
+         * cannot play), AUDIO_NAME = short codec name for the hint */
+        char nm[48];
+        int has = (ai && ai->valid) || mr_mkv_atrack_count > 0;
+        nm[0] = 0;
+        if (ai && ai->valid) {
+            char *q;
+            strncpy(nm, text, sizeof nm - 1); nm[sizeof nm - 1] = 0;
+            q = strstr(nm, " (fourcc");
+            if (q) *q = 0;
+        } else if (mr_mkv_atrack_count > 0) {
+            unsigned i;
+            for (i = 0; i < mr_mkv_atrack_count && i < 4; i++) {
+                size_t l = strlen(nm);
+                snprintf(nm + l, sizeof nm - l, "%s%s", i ? ", " : "",
+                         mka_codec_short(&mr_mkv_atracks[i]));
+            }
+        }
+        printf("AUDIO_HAS=%d\nAUDIO_PAULA=%d\nAUDIO_NAME=%s\n", has,
+               mka_paula_ok(ai) ? 1 : 0, nm);
+    }
     printf("SEEK=%d\n", mr_demux_can_seek(d) ? 1 : 0);
     mka_info_tracks();                          /* MKA1 */
     {

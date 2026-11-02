@@ -90,6 +90,21 @@ of the chapter (or the previous one). Films without chapters jump 10 minutes
 forward / back. Works in full screen and in the window when the film was
 started from MintVID-pi (the film restarts at the new spot).
 
+**M** switches the sound off / on (mute), in full screen and in the window.
+Over HDMI the sound keeps running silently (picture and sound stay in sync),
+with Paula the volume goes to 0. Films with subtitles show "Mute" /
+"Sound on" for two seconds.
+
+MintVID-pi refuses films whose sound cannot be played with the chosen
+output and says why (e.g. "Not playable: audio format DTS is not
+supported" - DTS, Opus, FLAC, Vorbis; MP3/MP2/PCM only with Paula; E-AC3
+only over HDMI). With several audio tracks it is refused only if none of
+them fits. Films without any audio track play without sound.
+
+Small films (below 1280x720) are upscaled by the Pi to the real size of
+the HDMI screen (since v96.88; before always 1920x1080, which drew green
+lines on screens smaller than 1080p, e.g. 1280x1024).
+
 MKV films with several audio tracks: the "Audio" chooser in MintVID-pi
 lists every track (language, format, name). Without a choice the track
 marked as default in the MKV plays. The chosen track is remembered in
@@ -168,7 +183,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.86
+This builds all runtime files and compares them with the released v96.88
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

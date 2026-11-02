@@ -395,6 +395,11 @@ void mrb_paula_set_offset(mrb_paula *p, int32_t offset_us)
     p->next_check = p->clock_us;
 }
 
+void mrb_paula_set_mute(mrb_paula *p, int mute)
+{
+    if (p && p->out) audio_set_volume(p->out, mute ? 0 : 64);
+}
+
 void mrb_paula_pause(mrb_paula *p, int paused)
 {
     if (!p) return;
