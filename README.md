@@ -22,17 +22,25 @@ includes it in full (MIT licence). MintVID's own README is in
 [`docs/MintVID-README.md`](docs/MintVID-README.md).
 
 > [!IMPORTANT]
-> **HDMI sound needs the patched Emu68 kernel `Emu68-pistorm-BerryCore`.** The
-> unmodified Emu68 kernel has no BerryCore service on CPU1, so the AAC/AC3/E-AC3
-> decoders for HDMI cannot run. Video with Paula sound (`PAULA`) also works with
-> the original Emu68 1.0.7 kernel (tested on hardware, 23.10.2026).
+> **Supported boards (Emu68 1.0.7):**
 >
-> **Currently supported: only PiStorm Classic with a Raspberry Pi 3A+ and
-> Emu68 version 1.0.7.** The patch is made for exactly that kernel. Other Pi
-> models, other PiStorm boards and newer Emu68 versions are not supported yet.
+> | Board | Pi | HDMI-sound kernel | Tested |
+> |---|---|---|---|
+> | PiStorm Classic (A500/A600/A2000) | Raspberry Pi 3A+ | `Emu68-pistorm-BerryCore` | up to v96.88 (A2000); v96.97 not yet re-tested |
+> | **PiStorm32 lite (A1200)** | **Compute Module 4** | `Emu68-pistorm32lite-BerryCore` | **v96.97, A1200, CM4 1 GB** |
 >
-> **`config.txt` on the SD card must contain `gpu_mem=64`.** The VideoCore
-> needs this memory for hardware decoding. Add the line if it is not there.
+> **HDMI sound needs the patched kernel for your board.** The unmodified Emu68
+> kernel has no BerryCore service on CPU1, so the AAC/AC3/E-AC3 decoders for
+> HDMI cannot run. Video with Paula sound (`PAULA`) also works with the
+> original Emu68 1.0.7 kernels. Each patch is made for exactly one kernel file;
+> other PiStorm boards (e.g. PiStorm16) and newer Emu68 versions are not
+> supported yet.
+>
+> **`config.txt` on the SD card must contain `gpu_mem=64` or more on the
+> Pi 3A+, and `gpu_mem=128` or more on the CM4** (CM4 tested with 128 and 256).
+> USB on the CM4 under Emu68 1.0.7: [berrypi4cm.device](https://github.com/MichiB210/berryPi4CM.device)
+> (Pi 3A+: [berrypi3ap.device](https://github.com/MichiB210/berryPi3Ap.device)). The VideoCore needs this memory for
+> hardware decoding.
 
 ## What it plays
 
@@ -47,7 +55,10 @@ includes it in full (MIT licence). MintVID's own README is in
 | Container | MKV, MP4/MOV, MPEG-TS | mrberry (68k) | |
 | Subtitles | **SRT** (file or MKV track), ASS/SSA in MKV as plain text | drawn by the Amiga (mrberry) | second picture layer of the Pi above the film, full screen only |
 
-The Pi 3A+ decodes H.264 up to 1080p at 30 fps (Raspberry Pi product brief).
+The Pi 3A+ decodes H.264 up to 1080p at 30 fps, the Pi 4 / CM4 up to 1080p
+at 60 fps (Raspberry Pi product briefs). H.265/HEVC and 4K are not possible:
+the Pi 4's HEVC block is not reachable through the firmware (MMAL), and its
+H.264 decoder also stops at 1080p.
 For smooth playback use up to 1080p25/30 or 720p up to 60 fps with a moderate
 bitrate. Films smaller than 1280x720 are upscaled by the Pi's ISP to the full
 1080 lines before they reach the screen (16:9 to exactly 1920x1080, 4:3 with
@@ -56,7 +67,13 @@ stripes when it had to enlarge a picture, even by a few lines.
 
 Multichannel E-AC3 (5.1) is refused, because the CPU1 decoder is not fast
 enough for it in real time yet. Tested on PiStorm Classic with a Raspberry Pi 3A+
-and the patched Emu68 1.0.7 kernel.
+and on PiStorm32 lite with a CM4, each with its patched Emu68 1.0.7 kernel.
+
+**Pi 4 / CM4 (since v96.97):** berryvp.library asks the firmware which board it
+runs on. On the BCM2711 it writes the VideoCore data addresses in the Pi 4 form
+("36-bit pagelists", as the Linux driver does), reads the Workbench picture
+from the Pi 4 display list and asks the firmware for the screen size. On the
+Pi 3 nothing changes.
 
 ## How to use it
 
@@ -149,11 +166,14 @@ modes work as in upstream MintVID.
 
 1. Copy `mrberry`, `berryvp.library`, `berry_faad03.module`, `berry_ac3.module` and `berry_eac3.module` into the same drawer.
    - Add `MintVID-pi` too if you want the GUI.
-2. **For HDMI sound:** replace the Emu68 kernel on the PiStorm's SD card (`Emu68-pistorm`) with the patched `Emu68-pistorm-BerryCore`.
-   - This is Emu68 1.0.7 for PiStorm Classic / Raspberry Pi 3A+, with the BerryCore service on CPU1.
+   - Copy `berryvp.library` to `LIBS:` too if an older one is there, and reboot.
+2. **For HDMI sound:** put the patched kernel for your board into the folder `KERNEL` of the SD card and enter it in `config.txt`:
+   - PiStorm Classic / Pi 3A+: `kernel=kernel/Emu68-pistorm-BerryCore` instead of `Emu68-pistorm`.
+   - PiStorm32 lite / CM4: `kernel=kernel/Emu68-pistorm32lite-BerryCore` instead of `Emu68-pistorm32lite` (CaffeineOS has two such lines, `[gpio4=0]` and `[gpio24=0]`; change both).
+   - Both are Emu68 1.0.7 with the BerryCore service on CPU1. Keep the old kernel to go back.
+   - Other way, without touching `config.txt`: rename the original kernel in `KERNEL` (e.g. `Emu68-pistorm32lite` → `Emu68-pistorm32lite_ori`) and copy the BerryCore kernel under the original name (`Emu68-pistorm32lite-BerryCore` → `Emu68-pistorm32lite`; Pi 3A+: `Emu68-pistorm-BerryCore` → `Emu68-pistorm`). To go back, rename `_ori` back.
    - Without it there is no HDMI sound. Video with Paula sound works with the original kernel.
-   - It only exists for this Emu68 version and this hardware.
-3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64`. If the line is missing, add it.
+3. **Required:** in `config.txt` on the SD card, set `gpu_mem=64` or more (CM4: `gpu_mem=128` or more, tested with 128 and 256). If the line is missing, add it.
 
 Ready-made files are under **Releases**.
 
@@ -178,12 +198,12 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 | VPberry (old window player, not needed since v96.76) | `pistorm/vpberry` |
 | berryvp.library (68k assembler) | `pistorm/berryvp_library` |
 | CPU1 audio modules | `pistorm/modules` |
-| Emu68 BerryCore kernel patch | `pistorm/emu68_berrycore` |
+| Emu68 BerryCore kernel patches (Pi 3 and PiStorm32 lite) | `pistorm/emu68_berrycore` |
 | GUI changes ("PiStorm / VC Hard Fullscreen" / "Fenster") | `player/amiga/mrgui*.c`, `player/core/mr_play_options.*` |
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the released v96.88
+This builds all runtime files and compares them with the v96.99
 binaries. Tools needed:
 
 - m68k-amigaos-gcc
@@ -220,9 +240,11 @@ synchron auf einem Amiga mit PiStorm ab:
 - Im Vollbild kann der Ton auch über Paula laufen (Paula-Player von Darren 'boingball' Banfi).
 - Den Ton in AAC, AC3 oder E-AC3 entschlüsselt der zweite ARM-Kern des Pi.
 
-**Wichtig:** Für den Ton über HDMI braucht es den gepatchten Emu68-Kern `Emu68-pistorm-BerryCore`. Bild mit Ton über Paula läuft auch mit dem Original-Kern Emu68 1.0.7. Zur Zeit läuft alles nur auf dem PiStorm Classic mit Raspberry Pi 3A+ und Emu68 1.0.7.
+**Unterstützt (Emu68 1.0.7):** PiStorm Classic mit Raspberry Pi 3A+ und – neu seit v96.97 – **PiStorm32 lite mit Compute Module 4** (getestet im A1200, CM4 1 GB). Die berryvp.library erkennt selbst, auf welchem Pi sie läuft. v96.97 ist auf dem PiStorm Classic noch nicht neu getestet.
 
-Außerdem muss in der `config.txt` auf der SD-Karte `gpu_mem=64` stehen. Fehlt die Zeile, bitte ergänzen.
+**Wichtig:** Für den Ton über HDMI braucht es den gepatchten Kern für die eigene Karte: `Emu68-pistorm-BerryCore` (PiStorm Classic) bzw. `Emu68-pistorm32lite-BerryCore` (PiStorm32 lite). In der `config.txt` die `kernel=`-Zeile(n) darauf umstellen, den alten Kern aufheben. Bild mit Ton über Paula läuft auch mit den Original-Kernen.
+
+Außerdem muss in der `config.txt` auf der SD-Karte `gpu_mem=64` oder mehr stehen (CM4: `gpu_mem=128` oder mehr, getestet mit 128 und 256). USB auf dem CM4 unter Emu68 1.0.7: [berrypi4cm.device](https://github.com/MichiB210/berryPi4CM.device). Fehlt die Zeile, bitte ergänzen. H.265 und 4K gehen nicht, auch der Pi 4 decodiert H.264 nur bis 1080p.
 
 Start aus der Shell mit `mrberry film.mkv` oder bequem über MintVID mit
 „PiStorm / VC Hard Fullscreen“. Grundlage ist MintVID von Darren Banfi. Der PiStorm läuft mit Emu68 von Michal Schulz (michalsc). Die PiStorm-Hardware stammt von Claude Schwarz.

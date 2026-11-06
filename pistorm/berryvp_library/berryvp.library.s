@@ -330,6 +330,7 @@ BVP_SV_StateOK:
         andi.l  #BVP_PKT_CONFIG,d0
         beq.s   BVP_SV_Data
         clr.l   n11_video_returns
+        clr.l   v93_event_count          ; v96.93
         move.l  a0,bvp_pending_ptr
         move.l  d4,bvp_pending_len
         bsr     bvp_backend_init_from_config
@@ -496,6 +497,7 @@ N69_SV_SendMaxOK:
         jsr     n12_log
         move.l  #2,n79_first_video_trace_state
 n79_no_v15:
+        jsr     v90_hvs_probe
         moveq   #BVP_OK,d0
         bra.w   BVP_SV_Done
 BVP_SV_BadState:
@@ -1627,7 +1629,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 M N88 (02.11.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 M N88 CM4 N97 A99 (06.11.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -1946,6 +1948,8 @@ HDMI_V18_HVS_DLIST0_PTR     equ $F2400020
 HDMI_V14_HVS_DLIST_PTR      equ $F2400024
 HDMI_V18_HVS_DLIST2_PTR     equ $F2400028
 HDMI_V14_HVS_DLIST_BASE     equ $F2402000
+V89_HVS5_DLIST_BASE         equ $F2404000 ; v96.89: Pi 4 / CM4 list memory
+V97_HVS_PROBE               equ 0         ; v96.97: 1 = V90-V94 HVS/MMAL diagnostic in N79_TRACE.TXT
 HDMI_V14_DUMP_WORDS         equ 32
 ; v10 no longer owns a third active display-list pointer. The two MMAL
 ; renderer list buffers discovered at runtime are prepared in-place while
@@ -3771,6 +3775,394 @@ v10l_q_done:
         rts
 
 ; --------------------------------------------------------------------
+; v96.89 (05.11.2026): PiStorm32 lite / CM4 (BCM2711, VideoCore VI).
+;
+; v89_query_tag: like v10l_query_one_memory_tag (same prop_ptr buffer, same
+; CachePreDMA/PostDMA and exact reply-word match), but the firmware may
+; answer with 4 or 8 value bytes.  D0 = tag.  Returns D0=0 ok, D1/D2 = the
+; two value words (D2 = 0 for a 4-byte answer); D0<>0 on failure.
+; --------------------------------------------------------------------
+v89_query_tag:
+        movem.l d3-d7/a0-a2/a6,-(sp)
+        move.l  d0,d3
+        clr.l   d1
+        clr.l   d2
+        move.l  prop_alloc,d0
+        beq.w   v89_q_fail
+        move.l  prop_ptr,a2
+        cmpa.l  #0,a2
+        beq.w   v89_q_fail
+
+        move.l  a2,a0
+        move.l  #32,d0
+        jsr     store_le32
+        lea     4(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+        lea     8(a2),a0
+        move.l  d3,d0
+        jsr     store_le32
+        lea     12(a2),a0
+        moveq   #8,d0
+        jsr     store_le32
+        lea     16(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+        lea     20(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+        lea     24(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+        lea     28(a2),a0
+        moveq   #0,d0
+        jsr     store_le32
+
+        move.l  #32,prop_len
+        move.l  a2,a0
+        lea     prop_len,a1
+        moveq   #0,d0
+        move.l  4.w,a6
+        jsr     CachePreDMA(a6)
+        cmp.l   prop_ptr,d0
+        bne.w   v89_q_post_fail
+
+        and.l   #$fffffff0,d0
+        or.l    #MBOX_PROPERTY,d0
+        move.l  d0,d6
+
+        move.l  #TIMEOUT,d7
+v89_q_tx_wait:
+        move.l  MBOX_STATUS,d0
+        jsr     bswap32
+        and.l   #MBOX_TX_FULL,d0
+        beq.s   v89_q_tx_ready
+        subq.l  #1,d7
+        bne.s   v89_q_tx_wait
+        bra.w   v89_q_post_fail
+v89_q_tx_ready:
+        move.l  d6,d0
+        jsr     bswap32
+        move.l  d0,MBOX_WRITE
+
+        move.l  #TIMEOUT,d7
+v89_q_rx_wait:
+        move.l  MBOX_STATUS,d0
+        jsr     bswap32
+        and.l   #MBOX_RX_EMPTY,d0
+        beq.s   v89_q_rx_ready
+        subq.l  #1,d7
+        bne.s   v89_q_rx_wait
+        bra.w   v89_q_post_fail
+v89_q_rx_ready:
+        move.l  MBOX_READ,d0
+        jsr     bswap32
+        cmp.l   d6,d0
+        beq.s   v89_q_got
+        subq.l  #1,d7
+        bne.s   v89_q_rx_wait
+        bra.w   v89_q_post_fail
+
+v89_q_got:
+        move.l  #32,prop_len
+        move.l  prop_ptr,a0
+        lea     prop_len,a1
+        moveq   #0,d0
+        move.l  4.w,a6
+        jsr     CachePostDMA(a6)
+
+        move.l  prop_ptr,a2
+        lea     4(a2),a0
+        jsr     load_le32
+        cmp.l   #$80000000,d0
+        bne.s   v89_q_fail
+        lea     8(a2),a0
+        jsr     load_le32
+        cmp.l   d3,d0
+        bne.s   v89_q_fail
+        lea     16(a2),a0
+        jsr     load_le32
+        cmp.l   #$80000004,d0
+        beq.s   v89_q_len_ok
+        cmp.l   #$80000008,d0
+        bne.s   v89_q_fail
+v89_q_len_ok:
+        move.l  d0,d4
+        lea     20(a2),a0
+        jsr     load_le32
+        move.l  d0,d1
+        cmp.l   #$80000008,d4
+        bne.s   v89_q_ok
+        lea     24(a2),a0
+        jsr     load_le32
+        move.l  d0,d2
+v89_q_ok:
+        moveq   #0,d0
+        bra.s   v89_q_done
+
+v89_q_post_fail:
+        move.l  #32,prop_len
+        move.l  prop_ptr,a0
+        lea     prop_len,a1
+        moveq   #0,d0
+        move.l  4.w,a6
+        jsr     CachePostDMA(a6)
+v89_q_fail:
+        moveq   #1,d0
+v89_q_done:
+        movem.l (sp)+,d3-d7/a0-a2/a6
+        rts
+
+; v96.99 (06.11.2026): the attach path (VCHIQ already running) never asked
+; the firmware for the board, so v89_vc6 kept whatever an earlier session of
+; this library instance left behind - 0 after the library was reloaded, or
+; when another program (e.g. ami264test) started VCHIQ first.  On the CM4
+; that selected the Pi 3 HVS/pagelist layout and the start failed after
+; "N79 OUT PRE".  Allocate the property buffer if needed (freed at close as
+; before) and run the same board detection as the first start.
+v9699_attach_board:
+        movem.l d0-d1/a0-a1/a6,-(sp)
+        tst.l   prop_alloc
+        bne.s   v9699_ab_have_prop
+        move.l  a4,a6
+        move.l  #$200,d0
+        move.l  #MEMF_FASTCLEAR,d1
+        jsr     AllocMem(a6)
+        tst.l   d0
+        beq.s   v9699_ab_done
+        move.l  d0,prop_alloc
+        add.l   #127,d0
+        and.l   #$ffffff80,d0
+        move.l  d0,prop_ptr
+v9699_ab_have_prop:
+        jsr     v89_detect_board
+v9699_ab_done:
+        movem.l (sp)+,d0-d1/a0-a1/a6
+        rts
+
+; v89_detect_board: GET_BOARD_REVISION ($00010002).  New-style revision
+; codes (bit 23) carry the SoC in bits 15..12: 3 = BCM2711 (Pi 4, Pi 400,
+; CM4).  Sets v89_vc6 = 1 only then; on any failure the Pi 3 behaviour stays.
+v89_detect_board:
+        movem.l d0-d2/a1,-(sp)
+        move.l  #$00010002,d0
+        jsr     v89_query_tag
+        tst.l   d0
+        bne.s   v89_db_done
+        move.l  d1,v89_board_rev
+        clr.l   v89_vc6
+        btst    #23,d1
+        beq.s   v89_db_log
+        move.l  d1,d0
+        lsr.l   #8,d0
+        lsr.l   #4,d0
+        andi.l  #$0000000f,d0
+        cmpi.l  #3,d0
+        bne.s   v89_db_log
+        move.l  #1,v89_vc6
+v89_db_log:
+        move.l  v89_board_rev,d0
+        lea     v89_pfx_board_rev,a1
+        jsr     n15_log_hex32
+        move.l  v89_vc6,d0
+        lea     v89_pfx_vc6,a1
+        jsr     n15_log_hex32
+v89_db_done:
+        movem.l (sp)+,d0-d2/a1
+        rts
+
+; v96.90 diagnostic: HVS state during playback (read only).  Logged after
+; the 2nd, 50th, 200th and 500th video packet: active list pointers of all
+; three channels, DISPCTRL0..2 and DISPSTAT0..2.
+; v96.91: firmware display number for video_render.  Pi 3: 0 (main
+; display, as before).  Pi 4 / CM4: 2 = HDMI0 (on the Pi 4 the firmware
+; counts its displays as 0 = DSI LCD, 2 = HDMI0, 7 = HDMI1).
+v91_display_num:
+        tst.l   v89_vc6
+        beq.s   v91_dn_done
+        moveq   #2,d0
+v91_dn_done:
+        rts
+
+; v96.93: MMAL events from the VideoCore (format changed, errors, EOS ...)
+; into N79_TRACE.TXT.  The first 24 are written in full (A2 = message).
+v93_log_event:
+        movem.l d0/a0-a1,-(sp)
+        addq.l  #1,v93_event_count
+        cmpi.l  #24,v93_event_count
+        bhi.s   v93_le_done
+        move.l  v93_event_count,d0
+        lea     v93_pfx_ev_no,a1
+        jsr     n15_log_hex32
+        move.l  event_port_type,d0
+        lea     v93_pfx_ev_ptype,a1
+        jsr     n15_log_hex32
+        move.l  event_port_num,d0
+        lea     v93_pfx_ev_pnum,a1
+        jsr     n15_log_hex32
+        move.l  buffer_event_cmd,d0
+        lea     v93_pfx_ev_cmd,a1
+        jsr     n15_log_hex32
+        move.l  buffer_event_length,d0
+        lea     v93_pfx_ev_len,a1
+        jsr     n15_log_hex32
+        move.l  bulk_rx_size,d0
+        cmpi.l  #56,d0
+        bcs.s   v93_le_done
+        lea     52(a2),a0
+        jsr     load_le32
+        lea     v93_pfx_ev_data,a1
+        jsr     n15_log_hex32
+v93_le_done:
+        movem.l (sp)+,d0/a0-a1
+        rts
+
+; --------------------------------------------------------------------
+; v96.94 (05.11.2026): VCHIQ pagelist addresses on the BCM2711.
+; Pi 3: addrs[k] = bus page ($C0000000 alias) | (pages - 1), up to 4096
+; pages per entry.  Pi 4 / CM4: the firmware expects the 36-bit form
+; (Linux vchiq_arm.c, bcm2711_drvdata.use_36bit_addrs):
+;   addrs[k] = ((phys >> 4) & ~$FF) | (pages - 1), at most 256 pages each.
+; The old form made the VideoCore read far outside the RAM (all ones):
+; white subtitle box, no decoded picture on the CM4.
+; A0 = &addrs[0], D0 = entry in the Pi 3 form.  Writes one or more
+; entries.  D0 is destroyed (like store_le32), all else kept.
+; --------------------------------------------------------------------
+v94_pl_store:
+        tst.l   v89_vc6
+        bne.s   v94_ps_vc6
+        jmp     store_le32
+v94_ps_vc6:
+        movem.l d1-d3/a0,-(sp)
+        move.l  d0,d1
+        andi.l  #$00000fff,d1
+        addq.l  #1,d1                    ; pages
+        move.l  d0,d2
+        andi.l  #$3ffff000,d2            ; physical page (no bus alias)
+        lsr.l   #4,d2                    ; page id << 8
+v94_ps_loop:
+        move.l  d1,d3
+        cmpi.l  #256,d3
+        bls.s   v94_ps_n_ok
+        move.l  #256,d3
+v94_ps_n_ok:
+        move.l  d3,d0
+        subq.l  #1,d0
+        or.l    d2,d0
+        jsr     store_le32
+        addq.l  #4,a0
+        addq.l  #1,v94_pl_entries
+        sub.l   d3,d1
+        move.l  d3,d0
+        lsl.l   #8,d0
+        add.l   d0,d2
+        tst.l   d1
+        bne.s   v94_ps_loop
+        movem.l (sp)+,d1-d3/a0
+        rts
+
+v90_hvs_probe:
+        ifeq    V97_HVS_PROBE
+        rts                              ; v96.97: probe switched off
+        endc
+        movem.l d0-d1/a0-a2,-(sp)
+        ; v96.96: only once (2nd packet).  The long dumps at packet 50/200/
+        ; 500 wrote ~70 trace lines during playback; with HDMI sound the
+        ; picture froze right after the one at packet 500.
+        move.l  n11_video_returns,d0
+        cmpi.l  #2,d0
+        bne.w   v90_hp_done
+v90_hp_go:
+        lea     v90_pfx_count,a1
+        jsr     n15_log_hex32
+        move.l  v93_event_count,d0
+        lea     v93_pfx_ev_total,a1
+        jsr     n15_log_hex32
+        move.l  v94_pl_entries,d0
+        lea     v94_pfx_pl,a1
+        jsr     n15_log_hex32
+        lea     v90_hvs_regs,a2
+v90_hp_loop:
+        move.l  (a2)+,d1
+        beq.s   v90_hp_regs_done
+        move.l  (a2)+,a1
+        move.l  d1,a0
+        jsr     load_le32
+        jsr     n15_log_hex32
+        bra.s   v90_hp_loop
+v90_hp_regs_done:
+        ; v96.92: on the CM4 also dump the active list and look for other
+        ; planes (the video) anywhere in the HVS5 list memory.
+        tst.l   v89_vc6
+        beq.s   v90_hp_done
+        jsr     v92_dlist_dump
+v90_hp_done:
+        movem.l (sp)+,d0-d1/a0-a2
+        rts
+
+; v96.92: dump 24 words at the active channel-1 list and scan the whole
+; HVS5 list memory (4096 words) for valid plane control words that are not
+; RGBA8888 (format 7).  Logs at most 8 hits (index, word).  Read only.
+v92_dlist_dump:
+        movem.l d0-d7/a0-a1,-(sp)
+        move.l  #$F2400024,a0
+        jsr     load_le32
+        move.l  d0,d6
+        cmpi.l  #$00000fe0,d6
+        bcc.s   v92_dd_scan
+        lea     v92_pfx_dl_at,a1
+        jsr     n15_log_hex32
+        move.l  #V89_HVS5_DLIST_BASE,a0
+        move.l  d6,d1
+        lsl.l   #2,d1
+        adda.l  d1,a0
+        moveq   #23,d7
+v92_dd_word:
+        jsr     load_le32
+        lea     v92_pfx_dl_word,a1
+        jsr     n15_log_hex32
+        addq.l  #4,a0
+        dbra    d7,v92_dd_word
+v92_dd_scan:
+        move.l  #V89_HVS5_DLIST_BASE,a0
+        moveq   #0,d6                    ; index
+        moveq   #0,d5                    ; hits
+v92_dd_scan_loop:
+        jsr     load_le32
+        move.l  d0,d1
+        andi.l  #$C0000000,d1
+        cmpi.l  #$40000000,d1            ; VALID, not END
+        bne.s   v92_dd_next
+        move.l  d0,d1
+        andi.l  #$3F000000,d1            ; words 1..63
+        beq.s   v92_dd_next
+        move.l  d0,d1
+        andi.l  #$0000001f,d1
+        cmpi.l  #7,d1
+        beq.s   v92_dd_next
+        move.l  d0,d7
+        move.l  d6,d0
+        lea     v92_pfx_hit_idx,a1
+        jsr     n15_log_hex32
+        move.l  d7,d0
+        lea     v92_pfx_hit_word,a1
+        jsr     n15_log_hex32
+        addq.l  #1,d5
+        cmpi.l  #8,d5
+        bcc.s   v92_dd_done
+v92_dd_next:
+        addq.l  #4,a0
+        addq.l  #1,d6
+        cmpi.l  #4096,d6
+        bcs.s   v92_dd_scan_loop
+v92_dd_done:
+        move.l  d5,d0
+        lea     v92_pfx_hits,a1
+        jsr     n15_log_hex32
+        movem.l (sp)+,d0-d7/a0-a1
+        rts
+
+; --------------------------------------------------------------------
 ; V14 - shell-local Ctrl-C stop support.
 ;
 ; AmigaDOS sends SIGBREAKF_CTRL_C to the running CLI process.  Poll it with
@@ -4977,6 +5369,7 @@ vpv01_vchiq_entry:
         beq.s   v40c_attach_second
         jmp     v9d_attach_exit
 v40c_attach_second:
+        jsr     v9699_attach_board       ; v96.99: Pi 3 or CM4 also on attach
         jsr     v9d_second_start_probe
         tst.l   bvp_library_mode
         beq.s   v40c_attach_second_legacy
@@ -5373,6 +5766,8 @@ mbox_got_prop:
         ; V10P: only now, after the exact same property-mailbox path has
         ; demonstrably succeeded, query ARM and VC memory one tag at a time.
         jsr     v10l_query_firmware_memory_after_init
+        ; v96.89: Pi 3 (VC4) or Pi 4 / CM4 (VC6)? Board revision via mailbox.
+        jsr     v89_detect_board
 
         ; N16: persist the *actual* firmware ARM/VC split reported by mailbox.
         ; This is directly relevant to MMAL_ENOSPC and survives a hard reset.
@@ -10213,7 +10608,7 @@ h19a_send_eos:
         clr.b   7(a0)
         lea     8(a0),a0
         move.l  bulk_data_bus,d0
-        bsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         ; Enter DMA ownership for the dedicated EOS data + pagelist pages.
         move.l  #BULK_DMA_SIZE,bulk_dma_len
@@ -10632,6 +11027,10 @@ hdmi_v40o_capture_wb_fb:
         clr.l   hdmi_v40o_wb_valid
         clr.l   hdmi_v40o_rtg_frames
 
+        ; v96.89: Pi 4 / CM4 (HVS5) has its own list layout and list memory.
+        tst.l   v89_vc6
+        bne.w   v89_wb_vc6
+
         move.l  #HDMI_V14_HVS_DLIST_PTR,a0
         jsr     load_le32
         move.l  d0,d6                    ; DWORD list offset
@@ -10700,6 +11099,14 @@ hdmi_v40o_wb_fields:
         and.l   #$3fffffff,d3
         tst.l   d3
         beq.w   hdmi_v40o_wb_capture_fail
+        ; v96.89: on the Pi 4 / CM4 the VC-reserved RAM lies below 1 GiB
+        ; (CM4 1 GB: VC at $3C000000), the Pi 3 bound stays 512 MiB.
+        tst.l   v89_vc6
+        beq.s   v89_wb_bound_pi3
+        cmp.l   #$40000000,d3
+        bcc.w   hdmi_v40o_wb_capture_fail
+        bra.s   v89_wb_bound_ok
+v89_wb_bound_pi3:
         ; Stage 4K / Caffeine: VideoCore.card may place the live RTG framebuffer
         ; inside the 64-MiB VC-reserved RAM window.  On this Pi 3A+ the probe
         ; reports bus $DD001580 -> physical $1D001580.  Keep the original
@@ -10707,6 +11114,7 @@ hdmi_v40o_wb_fields:
         ; physical-RAM bound from $1C000000 to the 512-MiB end $20000000.
         cmp.l   #$20000000,d3
         bcc.w   hdmi_v40o_wb_capture_fail
+v89_wb_bound_ok:
         cmpi.l  #$00000400,d4
         bcs.w   hdmi_v40o_wb_capture_fail
         move.l  hdmi_v40o_wb_width,d0
@@ -10742,6 +11150,69 @@ hdmi_v40o_wb_fields:
         jsr     newline
         moveq   #0,d0
         bra.s   hdmi_v40o_wb_capture_done
+
+; v96.89: VideoCore.card VC6 plane (VideoCore.card src/vc6.c):
+;   +0 control: bits 4..0 format, bit 15 unity, bits 29..24 words
+;   unity : +12 size (H 29..16, W 13..0), +20 pointer, +28 pitch
+;   scaled: +12 scaled size, +16 size, +24 pointer, +32 pitch
+; list memory at HVS + $4000 ($F2404000); active offset still at $F2400024.
+v89_wb_vc6:
+        move.l  #HDMI_V14_HVS_DLIST_PTR,a0
+        jsr     load_le32
+        move.l  d0,d6
+        cmpi.l  #$00001000,d6
+        bcc.w   hdmi_v40o_wb_capture_fail
+        move.l  #V89_HVS5_DLIST_BASE,a2
+        move.l  d6,d1
+        lsl.l   #2,d1
+        adda.l  d1,a2
+
+        move.l  a2,a0
+        jsr     load_le32
+        move.l  d0,hdmi_v40o_wb_control
+        move.l  d0,v89_wb_control
+        move.l  d0,d1
+        and.l   #$0000001f,d1
+        cmpi.l  #7,d1                    ; HVS_PIXEL_FORMAT_RGBA8888
+        bne.w   v89_wb_vc6_fail
+        btst    #15,d0                   ; VC6_CONTROL_UNITY
+        beq.s   v89_wb_vc6_scaled
+        lea     12(a2),a0
+        jsr     load_le32
+        move.l  d0,d5
+        lea     20(a2),a0
+        jsr     load_le32
+        move.l  d0,d3
+        lea     28(a2),a0
+        jsr     load_le32
+        move.l  d0,d4
+        bra.s   v89_wb_vc6_size
+v89_wb_vc6_scaled:
+        lea     16(a2),a0
+        jsr     load_le32
+        move.l  d0,d5
+        lea     24(a2),a0
+        jsr     load_le32
+        move.l  d0,d3
+        lea     32(a2),a0
+        jsr     load_le32
+        move.l  d0,d4
+v89_wb_vc6_size:
+        move.l  d5,d2
+        and.l   #$00003fff,d2
+        move.l  d2,hdmi_v40o_wb_width
+        move.l  d5,d2
+        swap    d2
+        and.l   #$00003fff,d2
+        move.l  d2,hdmi_v40o_wb_height
+        move.l  d3,d0
+        lea     v89_pfx_wb_ptr,a1
+        jsr     n15_log_hex32
+        bra.w   hdmi_v40o_wb_fields
+v89_wb_vc6_fail:
+        move.l  v89_wb_control,d0
+        lea     v89_pfx_wb_ctl,a1
+        jsr     n15_log_hex32
 
 hdmi_v40o_wb_capture_fail:
         lea     msg_hdmi_v40o_wb_fail,a1
@@ -13035,6 +13506,7 @@ h19_event:
         lea     48(a2),a0
         bsr     load_le32
         move.l  d0,buffer_event_length
+        jsr     v93_log_event            ; v96.93: every MMAL event to the trace
 
         lea     msg19_event,a1
         move.l  #msg19_event_end-msg19_event,d3
@@ -13300,7 +13772,7 @@ h19_queue_bulk_rx:
         move.l  output_pagelist_ptr,a0
         lea     8(a0),a0
         move.l  d1,d0
-        bsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         ; Pagelist is read FROM RAM by VideoCore.
         move.l  #12,output_pagelist_dma_len
@@ -16834,7 +17306,7 @@ vpv139_input_peak_ok:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        bsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         ; Give this slot's data page + pagelist page to DMA.
         move.l  #BULK_DMA_SIZE,bulk_dma_len
@@ -49740,6 +50212,7 @@ hdmi_v40o_param_clear:
         ; +52 display_num = 1, explicitly selected by DISPLAY_SET_NUM.
         lea     52(a2),a0
         move.l  #HDMI_V18_DISPLAY_NUM,d0
+        jsr     v91_display_num          ; v96.91: CM4 -> 2 (HDMI0)
         jsr     store_le32
         lea     56(a2),a0
         moveq   #1,d0                   ; renderer owns full HDMI display region
@@ -51711,7 +52184,7 @@ o1_copy:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
         ; push picture + pagelist out of the CPU cache
         move.l  4.w,a6
         move.l  #O1_ALLOC_SIZE-$1000,o1_dma_len
@@ -51950,6 +52423,7 @@ o1_df_clear:
         ; +52 display_num = 1, explicitly selected by DISPLAY_SET_NUM.
         lea     52(a2),a0
         move.l  #HDMI_V18_DISPLAY_NUM,d0
+        jsr     v91_display_num          ; v96.91: CM4 -> 2 (HDMI0)
         jsr     store_le32
         lea     56(a2),a0
         moveq   #0,d0                   ; O1: not fullscreen, own dest_rect
@@ -51992,6 +52466,24 @@ O2_HVS_DISPCTRL1    equ $F2400050       ; channel 1 (DISPLIST1 $F2400024)
 
 o2_read_display_size:
         movem.l d0-d1/a0,-(sp)
+        ; v96.89: Pi 4 / CM4: HVS5 DISPCTRL has another bit layout; ask the
+        ; firmware for the physical display size (tag $00040003, as the
+        ; VideoCore.card does) instead.
+        tst.l   v89_vc6
+        beq.s   v89_rds_pi3
+        movem.l d2,-(sp)
+        move.l  #$00040003,d0
+        jsr     v89_query_tag
+        tst.l   d0
+        bne.s   v89_rds_fail
+        move.l  d2,d0                     ; height (d1 = width)
+        movem.l (sp)+,d2                  ; movem keeps the flags/values
+        move.l  d1,o2_dispctrl            ; (width, for the trace)
+        bra.s   v89_rds_check
+v89_rds_fail:
+        movem.l (sp)+,d2
+        bra.s   o2_rds_default
+v89_rds_pi3:
         move.l  #O2_HVS_DISPCTRL1,a0
         jsr     load_le32
         move.l  d0,o2_dispctrl
@@ -52000,6 +52492,7 @@ o2_read_display_size:
         lsr.l   #4,d1
         andi.l  #$00000fff,d1             ; width  bits 23..12
         andi.l  #$00000fff,d0             ; height bits 11..0
+v89_rds_check:
         cmpi.l  #640,d1
         bcs.s   o2_rds_default
         cmpi.l  #4096,d1
@@ -58539,7 +59032,7 @@ vpv01_tone_phase_ok:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         lea     msg_vpv01_pcm_ready,a1
         move.l  #msg_vpv01_pcm_ready_end-msg_vpv01_pcm_ready,d3
@@ -59483,7 +59976,7 @@ vpv18_make_pagelist:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
         moveq   #0,d0
         bra.s   vpv18_pagelist_done
 vpv18_pagelist_fail:
@@ -62829,7 +63322,7 @@ vpv38_copy_loop:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
         moveq   #0,d0
         bra.s   vpv38_load_done
 vpv38_load_fail:
@@ -62914,7 +63407,7 @@ vpv41_live_swap_loop:
         or.l    d0,d3
         lea     8(a0),a0
         move.l  d3,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
         addq.l  #1,vpv41_live_decode_blocks
         moveq   #0,d0
         bra.w   vpv41_live_done
@@ -63039,7 +63532,7 @@ vpv45_load_prefetch_copy:
         or.l    d0,d1
         lea     8(a0),a0
         move.l  d1,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
         clr.l   vpv45_prefetch_ready
         clr.l   vpv45_prefetch_bytes
         clr.l   vpv45_prefetch_samples
@@ -66310,7 +66803,7 @@ vpv53_load_copy:
         or.l    d0,d3
         lea     8(a0),a0
         move.l  d3,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         move.l  d7,d0
         lsl.l   #2,d0
@@ -66401,7 +66894,7 @@ m1_load_done:
         or.l    d0,d3
         lea     8(a0),a0
         move.l  d3,d0
-        jsr     store_le32
+        jsr     v94_pl_store             ; v96.94: CM4 = 36-bit pagelist
 
         move.l  d7,d0
         lsl.l   #2,d0
@@ -69329,6 +69822,48 @@ n15_pfx_in_flags:         dc.b "N79 INPUT FLAGS=",0
 n15_pfx_in_num:           dc.b "N79 INPUT CUR_NUM=",0
 n15_pfx_in_size:          dc.b "N79 INPUT CUR_SIZE=",0
 n15_pfx_out_pre_enc:      dc.b "N79 OUT PRE ENC=",0
+v89_pfx_board_rev:        dc.b "V89 BOARD_REV=",0
+v90_pfx_count:            dc.b "V90 HVS_PROBE_AT_PACKET=",0
+v90_pfx_dl0:              dc.b "V90 DISPLIST0=",0
+v90_pfx_dl1:              dc.b "V90 DISPLIST1=",0
+v90_pfx_dl2:              dc.b "V90 DISPLIST2=",0
+v90_pfx_ctl0:             dc.b "V90 DISPCTRL0=",0
+v90_pfx_ctl1:             dc.b "V90 DISPCTRL1=",0
+v90_pfx_ctl2:             dc.b "V90 DISPCTRL2=",0
+v90_pfx_st0:              dc.b "V90 DISPSTAT0=",0
+v90_pfx_st1:              dc.b "V90 DISPSTAT1=",0
+v90_pfx_st2:              dc.b "V90 DISPSTAT2=",0
+v92_pfx_dl_at:            dc.b "V92 DLIST_AT=",0
+v93_pfx_ev_no:            dc.b "V93 EVENT_NO=",0
+v93_pfx_ev_ptype:         dc.b "V93 EVENT_PORT_TYPE=",0
+v93_pfx_ev_pnum:          dc.b "V93 EVENT_PORT_NUM=",0
+v93_pfx_ev_cmd:           dc.b "V93 EVENT_CMD=",0
+v93_pfx_ev_len:           dc.b "V93 EVENT_LEN=",0
+v93_pfx_ev_data:          dc.b "V93 EVENT_DATA0=",0
+v93_pfx_ev_total:         dc.b "V93 EVENTS_SO_FAR=",0
+v94_pfx_pl:               dc.b "V94 PAGELIST36_ENTRIES=",0
+v92_pfx_dl_word:          dc.b "V92 W=",0
+v92_pfx_hit_idx:          dc.b "V92 PLANE_IDX=",0
+v92_pfx_hit_word:         dc.b "V92 PLANE_CTL=",0
+v92_pfx_hits:             dc.b "V92 PLANES_FOUND=",0
+v92_pfx_act0:             dc.b "V92 DISPLACT0=",0
+v92_pfx_act1:             dc.b "V92 DISPLACT1=",0
+v92_pfx_act2:             dc.b "V92 DISPLACT2=",0
+v92_pfx_pv_ctl:           dc.b "V92 PV2_CONTROL=",0
+v92_pfx_pv_inten:         dc.b "V92 PV2_INTEN=",0
+v92_pfx_pv_stat:          dc.b "V92 PV2_INTSTAT=",0
+        even
+v90_hvs_regs:                dc.l $F2400020,v90_pfx_dl0,$F2400024,v90_pfx_dl1
+                             dc.l $F2400028,v90_pfx_dl2,$F2400040,v90_pfx_ctl0
+                             dc.l $F2400050,v90_pfx_ctl1,$F2400060,v90_pfx_ctl2
+                             dc.l $F2400048,v90_pfx_st0,$F2400058,v90_pfx_st1
+                             dc.l $F2400068,v90_pfx_st2,$F2400030,v92_pfx_act0
+                             dc.l $F2400034,v92_pfx_act1,$F2400038,v92_pfx_act2
+                             dc.l $F220A000,v92_pfx_pv_ctl,$F220A024,v92_pfx_pv_inten
+                             dc.l $F220A028,v92_pfx_pv_stat,0,0
+v89_pfx_vc6:              dc.b "V89 VC6=",0
+v89_pfx_wb_ptr:           dc.b "V89 WB_PTR=",0
+v89_pfx_wb_ctl:           dc.b "V89 WB_BAD_CONTROL=",0
 n15_pfx_out_pre_min_num:  dc.b "N79 OUT PRE MIN_NUM=",0
 n15_pfx_out_pre_rec_num:  dc.b "N79 OUT PRE REC_NUM=",0
 n15_pfx_out_pre_cur_num:  dc.b "N79 OUT PRE CUR_NUM=",0
@@ -72314,6 +72849,11 @@ o2_show_alpha:               ds.l 1
 o2_disp_w:                   ds.l 1
 o2_disp_h:                   ds.l 1
 o2_dispctrl:                 ds.l 1
+v89_vc6:                     ds.l 1   ; v96.89: 1 = Pi 4 / CM4 (BCM2711)
+v89_board_rev:               ds.l 1
+v93_event_count:             ds.l 1
+v94_pl_entries:              ds.l 1
+v89_wb_control:              ds.l 1
 o2_reply_pending:            ds.l 1
 o2_requests:                 ds.l 1
 o2_sends:                    ds.l 1
