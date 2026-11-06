@@ -322,8 +322,8 @@ void mr_gui_show_about(struct Window *window, const char *edition)
         request.es_Flags = 0;
         request.es_Title = (UBYTE *)"About MintVID-pi";
         request.es_TextFormat = (UBYTE *)
-            "MintVID-pi - H.264 video for PiStorm (Raspberry Pi 3A+)\n"
-            "Version v96.88 (02.11.2026)\n\n"
+            "MintVID-pi - H.264 video for PiStorm (Raspberry Pi 3A+ / CM4)\n"
+            "Version v96.98 (05.11.2026)\n\n"
             "PiStorm player (mrberry, berryvp.library):\n"
             "H.264 on the Pi's VideoCore, AAC/AC3/E-AC3 sound\n"
             "modules on the Pi's second core, HDMI output\n"

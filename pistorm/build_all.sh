@@ -1,7 +1,7 @@
 #!/bin/sh
-# Builds all PiStorm/BerryCore runtime files of MintVID-PiStorm v96.88 into
-# pistorm/out/v96.88 and compares them with the released binaries
-# (pistorm/v96.88_SHA256SUMS).
+# Builds all PiStorm/BerryCore runtime files of MintVID-PiStorm v96.98 into
+# pistorm/out/v96.98 and compares them with the released binaries
+# (pistorm/v96.98_SHA256SUMS).
 #
 # Tools (in PATH):
 #   m68k-amigaos-gcc (bebbo, 16.2)      MintVID, mrberry
@@ -11,7 +11,7 @@
 #   python3, tar, patch, make
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT="$HERE/out"; DIST="$OUT/v96.88"
+OUT="$HERE/out"; DIST="$OUT/v96.98"
 rm -rf "$OUT"; mkdir -p "$DIST"
 
 echo "== MintVID-pi (GUI)"
@@ -42,6 +42,10 @@ cp "$OUT/eac3/berry_eac3.module" "$DIST/"
 echo "== Emu68-pistorm-BerryCore"
 python3 "$HERE/emu68_berrycore/build_berrycore.py" "$DIST/Emu68-pistorm-BerryCore" >/dev/null
 
+echo "== Emu68-pistorm32lite-BerryCore"
+python3 "$HERE/emu68_berrycore/build_berrycore32.py" "$HERE/emu68_berrycore/upstream32/Emu68-pistorm32lite" \
+        "$DIST/Emu68-pistorm32lite-BerryCore" >/dev/null
+
 echo
 echo "Result in $DIST:"
 cd "$DIST"
@@ -50,4 +54,4 @@ while read -r sum name; do
   now=$(sha256sum "$name" | cut -d' ' -f1)
   if [ "$now" = "$sum" ]; then echo "  IDENTICAL   $name"
   else echo "  REBUILT     $name ($(wc -c < "$name") bytes, compiler differs from the release)"; fi
-done < "$HERE/v96.88_SHA256SUMS"
+done < "$HERE/v96.98_SHA256SUMS"
