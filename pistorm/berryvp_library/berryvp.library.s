@@ -1629,7 +1629,7 @@ bvp_prepare_second_stream:
 BVPL_LibName:
         dc.b    "berryvp.library",0
 BVPL_IdString:
-        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 M N88 CM4 N97 (05.11.2026) BerryVP 9.2 H264/HVS",13,10,0
+        dc.b    "berryvp.library 3.2 N79 + P96 WINDOW W49 + CLK81 HB CS ISP82 N83 N84 O3 S1 F TAB2 M N88 CM4 N97 A99 (06.11.2026) BerryVP 9.2 H264/HVS",13,10,0
         cnop    0,2
 
         section bss,bss
@@ -3913,6 +3913,33 @@ v89_q_done:
         movem.l (sp)+,d3-d7/a0-a2/a6
         rts
 
+; v96.99 (06.11.2026): the attach path (VCHIQ already running) never asked
+; the firmware for the board, so v89_vc6 kept whatever an earlier session of
+; this library instance left behind - 0 after the library was reloaded, or
+; when another program (e.g. ami264test) started VCHIQ first.  On the CM4
+; that selected the Pi 3 HVS/pagelist layout and the start failed after
+; "N79 OUT PRE".  Allocate the property buffer if needed (freed at close as
+; before) and run the same board detection as the first start.
+v9699_attach_board:
+        movem.l d0-d1/a0-a1/a6,-(sp)
+        tst.l   prop_alloc
+        bne.s   v9699_ab_have_prop
+        move.l  a4,a6
+        move.l  #$200,d0
+        move.l  #MEMF_FASTCLEAR,d1
+        jsr     AllocMem(a6)
+        tst.l   d0
+        beq.s   v9699_ab_done
+        move.l  d0,prop_alloc
+        add.l   #127,d0
+        and.l   #$ffffff80,d0
+        move.l  d0,prop_ptr
+v9699_ab_have_prop:
+        jsr     v89_detect_board
+v9699_ab_done:
+        movem.l (sp)+,d0-d1/a0-a1/a6
+        rts
+
 ; v89_detect_board: GET_BOARD_REVISION ($00010002).  New-style revision
 ; codes (bit 23) carry the SoC in bits 15..12: 3 = BCM2711 (Pi 4, Pi 400,
 ; CM4).  Sets v89_vc6 = 1 only then; on any failure the Pi 3 behaviour stays.
@@ -5342,6 +5369,7 @@ vpv01_vchiq_entry:
         beq.s   v40c_attach_second
         jmp     v9d_attach_exit
 v40c_attach_second:
+        jsr     v9699_attach_board       ; v96.99: Pi 3 or CM4 also on attach
         jsr     v9d_second_start_probe
         tst.l   bvp_library_mode
         beq.s   v40c_attach_second_legacy

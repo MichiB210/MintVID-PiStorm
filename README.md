@@ -203,7 +203,7 @@ Everything is in [`pistorm/`](pistorm/README.md), with build scripts for each pa
 
     sh pistorm/build_all.sh
 
-This builds all runtime files and compares them with the v96.98
+This builds all runtime files and compares them with the v96.99
 binaries. Tools needed:
 
 - m68k-amigaos-gcc

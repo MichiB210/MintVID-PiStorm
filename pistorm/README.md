@@ -1,4 +1,4 @@
-# MintVID for PiStorm – BerryVP / BerryCore (v96.98)
+# MintVID for PiStorm – BerryVP / BerryCore (v96.99)
 
 Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (PiStorm Classic with Raspberry Pi 3A+ / BCM2837, and since v96.97 PiStorm32 lite with Compute Module 4 / BCM2711):
 
@@ -24,7 +24,7 @@ Hardware-accelerated playback for MintVID on a **PiStorm with Emu68** (PiStorm C
 > **`config.txt` on the SD card must contain `gpu_mem=64` or more** (CM4:
 > `gpu_mem=128` or more, tested with 128 and 256). The VideoCore needs this memory for hardware decoding.
 
-This directory holds the complete source of all PiStorm parts of the v96.98 release (v96.98 = v96.97 with "3A+ / CM4" in the About text of MintVID-pi; all other files unchanged). The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
+This directory holds the complete source of all PiStorm parts of the v96.99 release (v96.98 = v96.97 with "3A+ / CM4" in the About text of MintVID-pi; v96.99 = v96.98 with the CM4 attach fix in berryvp.library, all other files unchanged). The MintVID-pi GUI changes themselves live in `player/` (see the commit history of this fork). VPberry (`vpberry/`) is kept as source only; since v96.76 the window mode is played by mrberry.
 
 > Deutsch: siehe [unten](#deutsch).
 
@@ -40,6 +40,8 @@ green stripes). Films more than 2 % wider than 16:9 (cinema format) are not
 upscaled yet (old N79J path). mrberry's test switches: `ISP` = every
 full-screen film through the ISP, `ISPOUT=OFF` = no upscale, `ISPOUT=WxH` =
 fixed ISP output size.
+
+**v96.99 (06.11.2026):** when VCHIQ was already running (MintVID-pi quit and started again after the library was reloaded, or another program such as the FFmpeg test tool `ami264test` started VCHIQ first), berryvp.library skipped the board query and fell back to the Pi 3 layout; on the CM4 the start stopped after `N79 OUT PRE`. The attach path now runs the same board detection. Tested on the A1200 / CM4.
 
 **Pi 4 / CM4 (BCM2711, v96.89-v96.97):** berryvp.library reads the board
 revision from the firmware (mailbox tag `$00010002`, SoC 3 = BCM2711). On the
@@ -74,7 +76,7 @@ MintVID-pi (GUI, 68k) --starts--> mrberry (68k) --uses--> berryvp.library (68k)
 | MintVID-pi GUI | `../player/amiga/mrgui*.c`, `mr_gui_menu.c` | C (68k) | byte-identical to v96.98 |
 | mrberry | `mrberry/` | C (68k) | byte-identical to v96.88 / v96.97 (unchanged) |
 | VPberry (VPr8 P48, old window player, not in the release since v96.76) | `vpberry/` | 68k assembler (vasm) | byte-identical to P35 |
-| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.97 |
+| berryvp.library | `berryvp_library/` | 68k assembler (vasm) | byte-identical to v96.99 (v96.99: board detection also when VCHIQ is already running) |
 | berry_ac3.module | `modules/ac3/` | C, liba52 (AArch64 BE) | same size, codegen differs, hardware-tested * |
 | berry_faad03.module | `modules/aac_faad03/` | C, FAAD2 2.11.2 (AArch64 BE) | byte-identical to v96.88 / v96.97 (5.1 mixed down to stereo) |
 | berry_eac3.module | `modules/eac3/` | C, FFmpeg 9.0.2 (AArch64 BE) | same size, codegen differs, hardware-tested * |
@@ -96,7 +98,7 @@ Tools (in `PATH`):
 sh pistorm/build_all.sh
 ```
 
-Everything ends up in `pistorm/out/v96.98/`, and each file is compared against `v96.98_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
+Everything ends up in `pistorm/out/v96.99/`, and each file is compared against `v96.99_SHA256SUMS` (berry_ac3/berry_eac3 in the release are still the P35 binaries, see * above). Every part also has its own `build.sh`.
 
 ## Installation (Amiga side)
 
@@ -147,10 +149,10 @@ Hardware-beschleunigte Wiedergabe für MintVID auf einem **PiStorm mit Emu68** �
 
 **Pi 4 / CM4:** Die berryvp.library fragt die Firmware, auf welcher Platine sie läuft. Auf dem CM4 schreibt sie die Adressen für die Datenübertragung zur VideoCore im Pi-4-Format („36-Bit-Pagelists“, ohne das gab es kein Bild), liest das Workbench-Bild aus der Pi-4-Bildliste und fragt die Firmware nach der Bildschirmgröße. Auf dem Pi 3 bleibt alles wie vorher. H.265 und 4K gehen nicht: Auch der Pi 4 decodiert H.264 nur bis 1080p, und sein H.265-Baustein ist über die Firmware nicht erreichbar.
 
-**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.98/`.
+**Bauen:** `sh pistorm/build_all.sh`. Benötigt werden m68k-amigaos-gcc, vasm, clang/LLVM 17 oder 18 und python3. Das Ergebnis liegt in `pistorm/out/v96.99/`.
 
 **Ergebnis der Neubauten:**
-- exakt gleich (bytegleich) zu v96.98: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und beide Emu68-BerryCore-Kerne
+- exakt gleich (bytegleich) zu v96.99: MintVID-pi, mrberry, berryvp.library, berry_faad03.module und beide Emu68-BerryCore-Kerne
 - berry_ac3 und berry_eac3 (im Release weiterhin die P35-Dateien) funktionieren gleich, ihr Maschinencode ist aber etwas anders, weil damals clang 17 statt clang 18 benutzt wurde. Die Neubauten wurden am 14.10.2026 auf der Hardware getestet: AAC, AC3 und E-AC3 laufen genau wie die P32-Originale.
 
 **Wichtig:** Ohne den gepatchten Kern für die eigene Karte gibt es keinen Ton über HDMI: `Emu68-pistorm-BerryCore` (PiStorm Classic / Pi 3A+) bzw. `Emu68-pistorm32lite-BerryCore` (PiStorm32 lite / CM4), beide Emu68 1.0.7. Bild mit Ton über Paula läuft auch mit den Original-Kernen.
